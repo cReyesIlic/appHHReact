@@ -1,4 +1,19 @@
-const API_BASE = import.meta.env.VITE_API_BASE || "http://127.0.0.1:8010";
+function resolveApiBase() {
+  if (import.meta.env.VITE_API_BASE !== undefined) {
+    return import.meta.env.VITE_API_BASE;
+  }
+
+  if (typeof window !== "undefined") {
+    const host = window.location.hostname;
+    if (host === "localhost" || host === "127.0.0.1") {
+      return "http://127.0.0.1:8010";
+    }
+  }
+
+  return "";
+}
+
+const API_BASE = resolveApiBase();
 
 async function jsonFetch(path, options = {}) {
   const response = await fetch(`${API_BASE}${path}`, options);
