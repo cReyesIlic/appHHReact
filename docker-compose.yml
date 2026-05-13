@@ -1,0 +1,43 @@
+services:
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    image: shimin-backend:latest
+    container_name: shimin-backend
+    env_file:
+      - ./.env
+    environment:
+      DATABASE_DIR: "database/proyectos 9.db"
+    volumes:
+      # Mismo layout que el host: project_root = /srv/app_principal
+      - ./database:/srv/app_principal/database
+      - ./storage:/srv/app_principal/storage
+      # Código va dentro de la imagen (no bind-mount). Para cambios: docker compose build backend
+    working_dir: /srv/app_principal/backend
+    # El servicio espera la red interna
+    expose:
+      - "8010"
+    ports:
+      - "8010:8010"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8010/api/config/status')"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+      args:
+        # En producción el frontend habla con backend via /api (nginx proxy interno)
+        VITE_API_BASE: ""
+    image: shimin-frontend:latest
+    container_name: shimin-frontend
+    depends_on:
+      - backend
+    ports:
+      - "5180:80"
+    restart: unless-stopped

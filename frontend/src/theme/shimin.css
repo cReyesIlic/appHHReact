@@ -1,0 +1,82 @@
+/* SHIMIN design tokens — paleta corporativa.
+   Cobre + dorado sobre azul-profundo y blanco lechoso. Inspirado en minerales. */
+
+:root {
+  /* Paleta SHIMIN base */
+  --shimin-ink: #182b36;        /* azul-noche, textos primarios */
+  --shimin-deep: #223f4d;       /* azul-acero, fondos oscuros */
+  --shimin-steel: #5f747d;      /* gris-acero, textos muted */
+  --shimin-copper: #c8863b;     /* cobre, acento principal */
+  --shimin-gold: #e1b35f;       /* dorado, acentos cálidos */
+  --shimin-mist: #eef3f4;       /* blanco lechoso, fondo app */
+  --shimin-line: #d7e0e2;       /* bordes suaves */
+  --shimin-sand: #f7f3eb;       /* arena cálida, surfaces alternos */
+  --shimin-red: #b54708;        /* alertas/perdidas */
+  --shimin-green: #047857;      /* éxito/ganadas */
+  --shimin-warn: #d97706;       /* warning/en proceso */
+
+  /* Tokens semánticos */
+  --bg-app: var(--shimin-mist);
+  --bg-surface: #ffffff;
+  --bg-elevated: #ffffff;
+  --bg-alt: var(--shimin-sand);
+  --bg-inverse: var(--shimin-ink);
+
+  --text-primary: var(--shimin-ink);
+  --text-secondary: #354853;
+  --text-muted: var(--shimin-steel);
+  --text-inverse: #f7faf9;
+  --text-accent: var(--shimin-copper);
+
+  --accent: var(--shimin-copper);
+  --accent-strong: #a96a23;
+  --accent-soft: rgba(200, 134, 59, 0.12);
+  --accent-warm: var(--shimin-gold);
+
+  --border: var(--shimin-line);
+  --border-strong: #b5c1c4;
+  --border-focus: var(--shimin-copper);
+
+  --status-ganada-bg: #dcfce7;
+  --status-ganada-fg: #065f46;
+  --status-perdida-bg: #fee2e2;
+  --status-perdida-fg: #991b1b;
+  --status-proceso-bg: #fef3c7;
+  --status-proceso-fg: #92400e;
+  --status-otro-bg: #e2e8f0;
+  --status-otro-fg: #334155;
+
+  /* Sombras y radios */
+  --shadow-sm: 0 1px 2px rgba(24, 43, 54, 0.08);
+  --shadow-md: 0 4px 12px rgba(24, 43, 54, 0.10);
+  --shadow-lg: 0 12px 32px rgba(24, 43, 54, 0.14);
+  --radius-xs: 4px;
+  --radius-sm: 6px;
+  --radius-md: 10px;
+  --radius-lg: 14px;
+  --radius-xl: 22px;
+
+  /* Tipografía */
+  --font-sans: "Inter", "Segoe UI", system-ui, -apple-system, sans-serif;
+  --font-mono: "JetBrains Mono", "SF Mono", Menlo, monospace;
+  --font-heading: "Inter", "Segoe UI", system-ui, sans-serif;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg-app: #0f1c23;
+    --bg-surface: #182b36;
+    --bg-elevated: #1f3540;
+    --bg-alt: #243d49;
+    --text-primary: #f1f5f4;
+    --text-secondary: #d4dde0;
+    --text-muted: #95a8b0;
+    --text-inverse: #182b36;
+    --border: #2c424d;
+    --border-strong: #3a5260;
+    --status-ganada-bg: rgba(4, 120, 87, 0.25);
+    --status-ganada-fg: #6ee7b7;
+    --status-perdida-bg: rgba(181, 71, 8, 0.25);
+    --status-perdida-fg: #fecaca;
+  }
+}

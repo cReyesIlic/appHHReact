@@ -1,0 +1,74 @@
+# Secrets — NUNCA commitear
+.env
+.env.*
+!.env.example
+deploy/env.sh
+backend/.env
+**/local.settings.json
+
+# Python
+.venv/
+**/__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+.mypy_cache/
+*.egg-info/
+
+# Node / frontend
+node_modules/
+frontend/dist/
+frontend/.vite/
+.npm
+.yarn
+
+# SQLite + backups
+database/*.db
+database/*.db-shm
+database/*.db-wal
+database/*.db.backup-*
+database/*.db.corrupted-*
+database/*.db.cleaned
+*.sqlite
+*.sqlite3
+
+# Datos generados (no se versionan; se regeneran desde sync)
+exports/
+storage/llm_wiki/index.md
+storage/llm_wiki/proposals/
+storage/llm_wiki/entries/
+storage/llm_wiki.md
+storage/commercial_offers_latest/
+storage/emitted_offer_assets/
+storage/emitted_offer_assets_*/
+storage/hh_excel_ingestion/
+storage/hybrid_rag_embeddings/
+storage/hybrid_rag_embeddings_azure/
+storage/proposals/
+storage/rag_parent_child_emitted/
+storage/audit_*.json
+storage/wiki_ingestion.log
+storage/*_manifest.csv
+
+# Builds + cache
+dist/
+build/
+.next/
+.cache/
+
+# Editores
+.claude/
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+logs/
+backend/logs/
+
+# Path absolutos accidentales (Windows)
+C:/Users/

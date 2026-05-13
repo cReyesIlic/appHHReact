@@ -1,0 +1,17 @@
+**/node_modules
+**/.venv
+**/__pycache__
+**/*.pyc
+**/.pytest_cache
+**/dist
+**/build
+**/.git
+**/.idea
+**/.vscode
+**/*.log
+**/database/*.db.backup-*
+**/storage/commercial_offers_latest
+**/storage/emitted_offer_assets*
+docs/
+exports/
+source/

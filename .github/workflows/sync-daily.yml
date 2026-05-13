@@ -1,0 +1,33 @@
+name: SHIMIN daily sync (RAG + Wiki + Master)
+on:
+  schedule:
+    - cron: '0 5 * * *'   # 05:00 UTC = 02:00 hora Chile
+  workflow_dispatch: {}
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Trigger sync de propuestas nuevas en SharePoint
+        run: |
+          curl -sS -X POST "https://apphhshimin.azurewebsites.net/api/sync/new?limit=50" \
+            -H "x-user-email: cron@shimin.cl" \
+            --max-time 1800 || echo "sync-new failed (puede ser timeout normal)"
+
+      - name: Refrescar Master desde Excel
+        run: |
+          curl -sS -X POST "https://apphhshimin.azurewebsites.net/api/master/refresh" \
+            -H "x-user-email: cron@shimin.cl" \
+            --max-time 300
+
+      - name: Backfill wiki para propuestas sin página
+        run: |
+          curl -sS -X POST "https://apphhshimin.azurewebsites.net/api/sync/backfill-wiki" \
+            -H "Content-Type: application/json" \
+            -H "x-user-email: cron@shimin.cl" \
+            -d '{"limit": 30}' \
+            --max-time 1800 || echo "backfill failed"
+
+      - name: Verificar status
+        run: |
+          curl -sS "https://apphhshimin.azurewebsites.net/api/sync/status"
