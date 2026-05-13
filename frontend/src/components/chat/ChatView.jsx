@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { Sparkles } from "lucide-react";
+import { Sparkles, PanelLeftClose, PanelLeftOpen, PanelRightClose, PanelRightOpen } from "lucide-react";
 import { sendChat, getSession } from "../../lib/api.js";
 import { EMPTY_FILTERS, compactFilters, parseFiltersFromText } from "../../lib/filters.js";
 import { Card } from "../shared/Card.jsx";
@@ -22,6 +22,9 @@ export function ChatView() {
   const [workingContext, setWorkingContext] = useState({});
   const [sessionId, setSessionId] = useState(() => localStorage.getItem("shimin_session_id") || null);
   const [sessionsRefreshKey, setSessionsRefreshKey] = useState(0);
+  // Toggle paneles (persistido en localStorage)
+  const [showSessions, setShowSessions] = useState(() => localStorage.getItem("shimin_show_sessions") !== "0");
+  const [showProcess, setShowProcess] = useState(() => localStorage.getItem("shimin_show_process") !== "0");
 
   // Cargar mensajes de sesión activa al cambiar
   useEffect(() => {
@@ -52,6 +55,20 @@ export function ChatView() {
   const handleSelectSession = (id) => {
     setSessionId(id);
     if (!id) localStorage.removeItem("shimin_session_id");
+  };
+
+  const toggleSessions = () => {
+    setShowSessions((v) => {
+      localStorage.setItem("shimin_show_sessions", v ? "0" : "1");
+      return !v;
+    });
+  };
+
+  const toggleProcess = () => {
+    setShowProcess((v) => {
+      localStorage.setItem("shimin_show_process", v ? "0" : "1");
+      return !v;
+    });
   };
 
   const handleSend = async (text) => {
@@ -92,12 +109,36 @@ export function ChatView() {
     }
   };
 
+  const gridTemplate = `${showSessions ? "260px" : "0px"} 1fr`;
+  const chatGrid = `1fr ${showProcess ? "320px" : "0px"}`;
+
   return (
     <div className="view-body" style={{ height: "100%", paddingBottom: 0 }}>
-      <div className="chat-view-with-sessions">
-        <SessionsSidebar activeId={sessionId} onSelect={handleSelectSession} refreshKey={sessionsRefreshKey} />
-        <div className="chat-view">
+      <div className="chat-view-with-sessions" style={{ gridTemplateColumns: gridTemplate }}>
+        {showSessions && (
+          <SessionsSidebar activeId={sessionId} onSelect={handleSelectSession} refreshKey={sessionsRefreshKey} />
+        )}
+        <div className="chat-view" style={{ gridTemplateColumns: chatGrid }}>
           <div className="chat-main">
+            <div className="chat-toolbar">
+              <button
+                type="button"
+                className="btn-icon"
+                title={showSessions ? "Ocultar conversaciones" : "Mostrar conversaciones"}
+                onClick={toggleSessions}
+              >
+                {showSessions ? <PanelLeftClose size={16} /> : <PanelLeftOpen size={16} />}
+              </button>
+              <div className="chat-toolbar-spacer" />
+              <button
+                type="button"
+                className="btn-icon"
+                title={showProcess ? "Ocultar proceso del agente" : "Mostrar proceso del agente"}
+                onClick={toggleProcess}
+              >
+                {showProcess ? <PanelRightClose size={16} /> : <PanelRightOpen size={16} />}
+              </button>
+            </div>
             {messages.length === 0 ? (
               <EmptyState
                 icon={Sparkles}
@@ -126,14 +167,16 @@ export function ChatView() {
             )}
             <Composer filters={filters} onFiltersChange={setFilters} onSend={handleSend} busy={busy} />
           </div>
-          <aside className="chat-side">
-            <Card title="Proceso del agente" subtitle="trace de tool calls">
-              {trace.length === 0 ? <small className="dim">Sin actividad aún.</small> : <TraceView trace={trace} />}
-            </Card>
-            <Card title="Fuentes" subtitle={`${sources.length} referencias`}>
-              {sources.length === 0 ? <small className="dim">Las fuentes aparecerán aquí.</small> : <SourcesView sources={sources} />}
-            </Card>
-          </aside>
+          {showProcess && (
+            <aside className="chat-side">
+              <Card title="Proceso del agente" subtitle="trace de tool calls">
+                {trace.length === 0 ? <small className="dim">Sin actividad aún.</small> : <TraceView trace={trace} />}
+              </Card>
+              <Card title="Fuentes" subtitle={`${sources.length} referencias`}>
+                {sources.length === 0 ? <small className="dim">Las fuentes aparecerán aquí.</small> : <SourcesView sources={sources} />}
+              </Card>
+            </aside>
+          )}
         </div>
       </div>
     </div>
