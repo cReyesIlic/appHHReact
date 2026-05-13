@@ -1,7 +1,7 @@
 ---
 name: armar_propuesta
 description: Úsala cuando el usuario está preparando o armando una NUEVA propuesta y necesita referencias, alcance sugerido, HH estimadas y exclusiones. Triggers típicos: "estoy armando", "preparar propuesta", "base para", "alcance similar", "experiencia previa", "qué propuestas sirven", "draft de propuesta", "mi propuesta nueva".
-allowed-tools: search_wiki_entries, compute_proposal_support, search_master, search_rag, compute_economics, get_proposal_detail, save_library_entry, search_entregables_hh, get_proyecto_staffing, list_my_drafts, get_draft_context, search_draft_chunks
+allowed-tools: search_wiki_entries, compute_proposal_support, search_master, search_rag, compute_economics, get_proposal_detail, save_library_entry, search_entregables_hh, get_proyecto_staffing, list_my_drafts, get_draft_context, search_draft_chunks, import_draft_from_sharepoint
 ---
 
 # Armar una nueva propuesta SHIMIN

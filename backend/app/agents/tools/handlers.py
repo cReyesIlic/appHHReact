@@ -575,3 +575,16 @@ async def search_draft_chunks(ctx: ToolContext, slug: str, query: str, limit: in
         return {"error": f"draft '{slug}' no encontrado"}
     hits = ctx.drafts.search_chunks(slug, query, limit=limit)
     return {"count": len(hits), "hits": hits}
+
+
+async def import_draft_from_sharepoint(ctx: ToolContext, slug: str, codigo: str) -> dict:
+    """Importa antecedentes (PDF/DOCX) desde la carpeta '01 Informacion Cliente' de la oferta
+    O-XXXX en SharePoint al draft del usuario. Úsala cuando el usuario diga 'trae los antecedentes
+    de O-XXXX', 'descarga lo que el cliente subió a SharePoint', 'importa la información del
+    cliente de la carpeta'.
+    """
+    user = get_current_user()
+    try:
+        return await ctx.drafts.import_from_sharepoint(user.id, slug, codigo)
+    except KeyError:
+        return {"error": f"draft '{slug}' no encontrado o no es tuyo"}

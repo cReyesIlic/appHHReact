@@ -246,6 +246,20 @@ export function getDraftFileUrl(slug, filename) {
   return `${API_BASE}/api/drafts/${encodeURIComponent(slug)}/files/${encodeURIComponent(filename)}`;
 }
 
+export function previewSharepointAntecedentes(codigo) {
+  return jsonFetch(`/api/drafts/sharepoint-preview/${encodeURIComponent(codigo)}`);
+}
+
+export function importDraftFromSharepoint(slug, codigo, filenames = null) {
+  const payload = { codigo };
+  if (filenames && filenames.length) payload.filenames = filenames;
+  return jsonFetch(`/api/drafts/${encodeURIComponent(slug)}/import-sharepoint`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+}
+
 export async function exportAnswer(kind, payload) {
   const response = await fetch(`${API_BASE}/api/exports/${kind}`, {
     method: "POST",

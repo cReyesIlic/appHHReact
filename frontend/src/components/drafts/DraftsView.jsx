@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
-import { FilePlus, Trash2, Upload, Sparkles, FileText, File as FileIcon, Loader2 } from "lucide-react";
+import { FilePlus, Trash2, Upload, Sparkles, FileText, File as FileIcon, Loader2, Cloud, Search } from "lucide-react";
 import {
   listDrafts,
   createDraft,
@@ -10,6 +10,8 @@ import {
   uploadDraftFile,
   buildDraftGuide,
   getDraftFileUrl,
+  previewSharepointAntecedentes,
+  importDraftFromSharepoint,
 } from "../../lib/api.js";
 import { Button } from "../shared/Button.jsx";
 import { Card } from "../shared/Card.jsx";
@@ -24,6 +26,8 @@ export function DraftsView() {
   const [busy, setBusy] = useState(null);
   const [newTitle, setNewTitle] = useState("");
   const [newCliente, setNewCliente] = useState("");
+  const [spCode, setSpCode] = useState("");
+  const [spPreview, setSpPreview] = useState(null);
   const fileInputRef = useRef(null);
 
   const reload = async () => {
@@ -94,6 +98,45 @@ export function DraftsView() {
       await reload();
     } catch (exc) {
       alert(`Error subiendo: ${exc.message}`);
+    } finally {
+      setBusy(null);
+    }
+  };
+
+  const handleSpPreview = async () => {
+    const code = (spCode || "").trim().toUpperCase();
+    if (!code) return;
+    setBusy("sp-preview");
+    try {
+      const r = await previewSharepointAntecedentes(code);
+      setSpPreview(r);
+    } catch (exc) {
+      alert(`Error consultando SharePoint: ${exc.message}`);
+      setSpPreview(null);
+    } finally {
+      setBusy(null);
+    }
+  };
+
+  const handleSpImport = async () => {
+    const code = (spCode || "").trim().toUpperCase();
+    if (!activeSlug || !code) return;
+    if (!confirm(`Descargar TODOS los antecedentes de ${code} desde SharePoint a este draft?`)) return;
+    setBusy("sp-import");
+    try {
+      const r = await importDraftFromSharepoint(activeSlug, code);
+      if (r.error) {
+        alert(`Error: ${r.error}`);
+      } else if (r.imported === 0) {
+        alert(r.note || `No se encontraron archivos en '01 Informacion Cliente' de ${code}.`);
+      } else {
+        alert(`Importados ${r.imported} de ${r.found} archivos. ${r.errors ? `(${r.errors} errores)` : ""}`);
+      }
+      setSpPreview(null);
+      setSpCode("");
+      await reload();
+    } catch (exc) {
+      alert(`Error importando: ${exc.message}`);
     } finally {
       setBusy(null);
     }
@@ -223,6 +266,73 @@ export function DraftsView() {
                   >
                     {busy === "guide" ? "Generando guía…" : "Generar guía con LLM"}
                   </Button>
+                </div>
+
+                {/* Sección: importar desde SharePoint */}
+                <div
+                  style={{
+                    marginTop: 14,
+                    padding: 12,
+                    background: "var(--bg-alt)",
+                    borderRadius: 8,
+                    border: "1px dashed var(--border)",
+                  }}
+                >
+                  <div className="card-title" style={{ fontSize: 13, marginBottom: 6, display: "flex", alignItems: "center", gap: 6 }}>
+                    <Cloud size={14} style={{ color: "var(--accent)" }} />
+                    Importar antecedentes desde SharePoint
+                  </div>
+                  <small className="dim" style={{ display: "block", marginBottom: 8 }}>
+                    Carpeta <code>GerenciaComercial → 01 Ofertas → O-XXXX → 01 Informacion Cliente</code> (PDFs y DOCX del cliente).
+                  </small>
+                  <div className="flex-row" style={{ gap: 8, alignItems: "stretch", flexWrap: "wrap" }}>
+                    <Input
+                      placeholder="O-XXXX (ej. O-1376)"
+                      value={spCode}
+                      onChange={(e) => setSpCode(e.target.value)}
+                      onKeyDown={(e) => e.key === "Enter" && handleSpPreview()}
+                      style={{ maxWidth: 200 }}
+                    />
+                    <Button
+                      variant="ghost"
+                      icon={Search}
+                      onClick={handleSpPreview}
+                      disabled={busy === "sp-preview" || !spCode.trim()}
+                    >
+                      {busy === "sp-preview" ? "Buscando…" : "Ver archivos"}
+                    </Button>
+                    {spPreview && spPreview.count > 0 && (
+                      <Button
+                        variant="accent"
+                        icon={busy === "sp-import" ? Loader2 : Cloud}
+                        onClick={handleSpImport}
+                        disabled={busy === "sp-import"}
+                      >
+                        {busy === "sp-import" ? "Importando…" : `Importar ${spPreview.count} archivo(s)`}
+                      </Button>
+                    )}
+                  </div>
+                  {spPreview && (
+                    <div style={{ marginTop: 10 }}>
+                      {spPreview.error ? (
+                        <small className="dim">⚠️ {spPreview.error}</small>
+                      ) : spPreview.count === 0 ? (
+                        <small className="dim">
+                          La carpeta <code>01 Informacion Cliente</code> de <b>{spPreview.codigo}</b> está vacía o no existe.
+                        </small>
+                      ) : (
+                        <div className="flex-col" style={{ gap: 4 }}>
+                          {spPreview.files.map((f) => (
+                            <small key={f.name} className="dim" style={{ display: "flex", gap: 6, alignItems: "center" }}>
+                              <FileIcon size={11} style={{ color: "var(--accent)" }} />
+                              <span style={{ color: "var(--text-primary)" }}>{f.name}</span>
+                              <span>· {f.kind.toUpperCase()} · {formatBytes(f.size)}</span>
+                            </small>
+                          ))}
+                        </div>
+                      )}
+                    </div>
+                  )}
                 </div>
 
                 <div style={{ marginTop: 16 }}>

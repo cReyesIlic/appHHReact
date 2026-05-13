@@ -225,6 +225,64 @@ class ProposalDraftService:
     def file_path(self, owner_id: str, slug: str, filename: str) -> Path:
         return self._antecedentes_dir(owner_id, slug) / re.sub(r"[^A-Za-z0-9._-]+", "_", filename)
 
+    async def import_from_sharepoint(
+        self,
+        owner_id: str,
+        slug: str,
+        codigo: str,
+        filenames: list[str] | None = None,
+    ) -> dict:
+        """Descarga PDFs/DOCX de la carpeta '01 Informacion Cliente' de una oferta O-XXXX
+        y los agrega al draft. Estos son los ANTECEDENTES del cliente (RFP, bases técnicas).
+        """
+        self.get_draft(owner_id, slug)  # ownership check
+        from app.services.sharepoint_client import SharePointClient
+        sp = SharePointClient()
+        if not sp._configured():
+            return {"error": "SharePoint no configurado (faltan TENANT_ID/CLIENT_ID/CLIENT_SECRET)"}
+        items = await sp.list_offer_antecedentes(codigo)
+        if not items:
+            return {
+                "codigo": codigo, "found": 0, "imported": 0, "files": [],
+                "note": f"No hay archivos en '01 Informacion Cliente' de {codigo} (vacía o no existe).",
+            }
+        if filenames:
+            wanted = [f.lower() for f in filenames]
+            items = [i for i in items if any(w in i["name"].lower() for w in wanted)]
+        imported: list[dict] = []
+        for item in items:
+            try:
+                content = await sp.download_file(item)
+                if not content:
+                    continue
+                result = self.add_file(owner_id, slug, item["name"], content)
+                imported.append({**result, "source": "sharepoint", "codigo_origen": codigo})
+            except Exception as exc:  # noqa: BLE001
+                imported.append({"filename": item.get("name"), "error": str(exc), "codigo_origen": codigo})
+        return {
+            "codigo": codigo,
+            "found": len(items),
+            "imported": sum(1 for f in imported if not f.get("error")),
+            "errors": sum(1 for f in imported if f.get("error")),
+            "files": imported,
+        }
+
+    async def preview_sharepoint(self, codigo: str) -> dict:
+        """Lista (sin descargar) los archivos antecedentes disponibles en SharePoint para una oferta."""
+        from app.services.sharepoint_client import SharePointClient
+        sp = SharePointClient()
+        if not sp._configured():
+            return {"error": "SharePoint no configurado"}
+        items = await sp.list_offer_antecedentes(codigo)
+        return {
+            "codigo": codigo,
+            "count": len(items),
+            "files": [
+                {"name": i["name"], "size": i.get("size", 0), "kind": i.get("kind"), "webUrl": i.get("webUrl")}
+                for i in items
+            ],
+        }
+
     # ---- Search dentro del draft ----
 
     def search_chunks(self, slug: str, query: str, limit: int = 8) -> list[dict]:

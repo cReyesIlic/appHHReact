@@ -389,6 +389,27 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
     {
         "type": "function",
         "function": {
+            "name": "import_draft_from_sharepoint",
+            "description": (
+                "Descarga los ANTECEDENTES del cliente (PDFs/DOCX) desde la carpeta "
+                "'01 Informacion Cliente' de la oferta O-XXXX en SharePoint y los agrega al draft "
+                "del usuario. Úsala cuando el usuario diga: 'trae los antecedentes de O-XXXX', "
+                "'descarga del SharePoint', 'importa lo que el cliente subió', 'carga la "
+                "información del cliente'. Devuelve cuántos archivos se encontraron e importaron."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "slug": {"type": "string", "description": "Slug del draft destino"},
+                    "codigo": {"type": "string", "description": "Código de oferta O-XXXX"},
+                },
+                "required": ["slug", "codigo"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "search_draft_chunks",
             "description": (
                 "Busca DENTRO de los antecedentes (PDFs/DOCX que subió el usuario) de un draft. "
@@ -515,6 +536,7 @@ class ToolDispatcher:
             "list_my_drafts": handlers.list_my_drafts,
             "get_draft_context": handlers.get_draft_context,
             "search_draft_chunks": handlers.search_draft_chunks,
+            "import_draft_from_sharepoint": handlers.import_draft_from_sharepoint,
             "load_skill": self._load_skill,
         }
 

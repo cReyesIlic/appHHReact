@@ -688,6 +688,31 @@ def drafts_download_file(slug: str, filename: str, http_request: Request) -> Fil
     return FileResponse(path, filename=path.name)
 
 
+@router.get("/drafts/sharepoint-preview/{codigo}")
+async def drafts_sharepoint_preview(codigo: str, http_request: Request) -> dict:
+    """Lista (sin descargar) los archivos antecedentes en SharePoint de una oferta O-XXXX."""
+    user_from_request(http_request)  # solo verifica auth
+    try:
+        return await ProposalDraftService().preview_sharepoint(codigo)
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+
+@router.post("/drafts/{slug}/import-sharepoint")
+async def drafts_import_sharepoint(slug: str, payload: dict, http_request: Request) -> dict:
+    """Descarga los antecedentes desde la carpeta '01 Informacion Cliente' de SharePoint
+    al draft. Body: {codigo: 'O-XXXX', filenames: [opcional]}."""
+    user = user_from_request(http_request)
+    codigo = (payload.get("codigo") or "").strip().upper()
+    if not codigo:
+        raise HTTPException(status_code=400, detail="codigo requerido (ej. O-1376)")
+    filenames = payload.get("filenames") or None
+    try:
+        return await ProposalDraftService().import_from_sharepoint(user.id, slug, codigo, filenames)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="Draft no encontrado") from exc
+
+
 @router.post("/drafts/{slug}/build-guide")
 async def drafts_build_guide(slug: str, http_request: Request) -> dict:
     """Genera la guía .md sintética con los puntos principales (LLM)."""

@@ -70,11 +70,57 @@ class SharePointClient:
         return folders
 
     async def download_pdf(self, pdf: dict) -> bytes:
-        download_url = pdf.get("@microsoft.graph.downloadUrl")
+        return await self.download_file(pdf)
+
+    async def download_file(self, item: dict) -> bytes:
+        """Descarga cualquier archivo (PDF, DOCX, etc.) desde el downloadUrl de Graph."""
+        download_url = item.get("@microsoft.graph.downloadUrl")
         if not download_url:
-            raise RuntimeError("El PDF no trae downloadUrl de Microsoft Graph")
-        async with httpx.AsyncClient(timeout=90) as client:
+            raise RuntimeError("El archivo no trae downloadUrl de Microsoft Graph")
+        async with httpx.AsyncClient(timeout=120) as client:
             return await self._request_content(client, download_url)
+
+    async def list_offer_antecedentes(self, code: str, kinds: tuple[str, ...] = (".pdf", ".docx")) -> list[dict]:
+        """Lista PDFs y DOCX dentro de la carpeta '01 Informacion Cliente' de una oferta O-XXXX.
+
+        Busca recursivamente en subcarpetas (hasta profundidad 4). Devuelve metadata de cada archivo.
+        Estos son los ANTECEDENTES del cliente: RFP, bases técnicas, especificaciones, etc.
+        """
+        if not self._configured():
+            return []
+        headers = self._headers()
+        site_url = settings.site_url_ofertas or settings.site_url_proyectos
+        if not site_url:
+            return []
+        async with httpx.AsyncClient(timeout=90) as client:
+            drive_id = await self._default_drive_id(client, headers, site_url)
+            root = await self._item_by_path(client, headers, drive_id, "01 Ofertas")
+            offer = await self._find_child_by_code(
+                client, headers, drive_id, root["id"], normalize_offer_code(code)
+            )
+            if not offer:
+                return []
+            ant = await self._find_child_by_names(
+                client, headers, drive_id, offer["id"],
+                ["01 Informacion Cliente", "01 Información Cliente",
+                 "Informacion Cliente", "Información Cliente",
+                 "01 Antecedentes", "Antecedentes"],
+            )
+            if not ant:
+                return []
+            files = await self._files_descendants(client, headers, drive_id, ant["id"], kinds=kinds, max_depth=4)
+        return [
+            {
+                "name": f.get("name"),
+                "size": (f.get("size") or 0),
+                "webUrl": f.get("webUrl"),
+                "id": f.get("id"),
+                "kind": (f.get("name", "").lower().rsplit(".", 1)[-1] if "." in f.get("name", "") else ""),
+                "downloadUrl": f.get("@microsoft.graph.downloadUrl"),
+                "@microsoft.graph.downloadUrl": f.get("@microsoft.graph.downloadUrl"),
+            }
+            for f in files
+        ]
 
     async def _find_pdfs(self, client: httpx.AsyncClient, headers: dict[str, str], code: str) -> list[dict]:
         normalized = code.strip().upper()
@@ -204,6 +250,35 @@ class SharePointClient:
             if child.get("folder"):
                 pdfs.extend(await self._pdf_descendants(client, headers, drive_id, child["id"], max_depth, depth + 1))
         return pdfs
+
+    async def _files_descendants(
+        self,
+        client: httpx.AsyncClient,
+        headers: dict[str, str],
+        drive_id: str,
+        parent_id: str,
+        kinds: tuple[str, ...] = (".pdf", ".docx"),
+        max_depth: int = 4,
+        depth: int = 0,
+    ) -> list[dict]:
+        """Variante genérica que acepta múltiples extensiones."""
+        if depth > max_depth:
+            return []
+        children = await self._children(client, headers, drive_id, parent_id)
+        kinds = tuple(k.lower() for k in kinds)
+        files = [
+            child for child in children
+            if child.get("file") and child["name"].lower().endswith(kinds)
+        ]
+        for child in children:
+            if child.get("folder"):
+                files.extend(
+                    await self._files_descendants(
+                        client, headers, drive_id, child["id"],
+                        kinds=kinds, max_depth=max_depth, depth=depth + 1,
+                    )
+                )
+        return files
 
     def _extract_pdf_text(self, content: bytes) -> str:
         reader = PdfReader(BytesIO(content))
