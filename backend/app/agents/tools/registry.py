@@ -246,6 +246,169 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
     {
         "type": "function",
         "function": {
+            "name": "search_entregables_hh",
+            "description": (
+                "Busca ENTREGABLES con HH REALES cargadas en el sistema de Staffing SHIMIN. "
+                "Es la fuente de verdad de HH consumidas por entregable (no estimaciones). "
+                "Úsala cuando: el usuario pregunta sobre HH reales de un entregable, "
+                "carga histórica por disciplina/cliente, '¿cuánto tomó hacer X tipo de entregable?', "
+                "'memoria de cálculo hidráulica en Caserones', 'planos de piping para Vale', "
+                "estimar HH para una propuesta nueva basándose en datos reales. "
+                "Devuelve resumen + distribución por disciplina/cliente/servicio + detalle con personas."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "q": {"type": "string", "description": "Concepto o alias de entregable. Ej: 'memoria de calculo', 'MDC', 'plano', 'informe', 'piping isométricos'"},
+                    "disciplina": {"type": "string", "description": "Código o nombre disciplina: HI (Hidráulica), PI (Piping), ME (Mecánica), EL, CI, ES..."},
+                    "contexto": {"type": "string", "description": "Proyecto/cliente/servicio/título. Ej: 'Caserones', 'Vale', 'Codelco'"},
+                    "proyecto_codigo": {"type": "string", "description": "Código exacto staffing, ej: SH-0392"},
+                    "ano": {"type": "integer", "description": "Año de carga HH (default todos)"},
+                    "top": {"type": "integer", "default": 30, "description": "Máximo de entregables 20-200"},
+                    "incluir_personas": {"type": "boolean", "default": True, "description": "Incluye top personas por entregable"},
+                },
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_horas_detalle",
+            "description": (
+                "Detalle AUDITABLE de HH cargadas: quién (persona), cuándo (año/semana), "
+                "qué (entregable), cuántas horas. Úsala para preguntas tipo: 'quién trabajó en X', "
+                "'desglose semanal de HH', '¿cuántas horas cargó Fulano en Y proyecto?'. "
+                "Requiere AL MENOS uno de: q, proyecto_codigo, entregable_id, persona_id o contexto."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "q": {"type": "string"},
+                    "proyecto_codigo": {"type": "string"},
+                    "entregable_id": {"type": "string"},
+                    "persona_id": {"type": "string"},
+                    "disciplina": {"type": "string"},
+                    "contexto": {"type": "string"},
+                    "ano": {"type": "integer"},
+                    "semana_desde": {"type": "integer"},
+                    "semana_hasta": {"type": "integer"},
+                    "limit": {"type": "integer", "default": 300},
+                },
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_proyecto_staffing",
+            "description": (
+                "Datos completos de un proyecto SHIMIN del sistema de staffing: entregables, "
+                "personas asignadas, HH totales. Diferente a get_proposal_detail (que mira propuestas/PDFs). "
+                "Aquí ve el lado de EJECUCIÓN del proyecto adjudicado. Usa código SH-XXXX (proyecto), "
+                "no O-XXXX (oferta)."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "codigo": {"type": "string", "description": "Código staffing del proyecto: SH-XXXX"},
+                    "ano": {"type": "integer"},
+                },
+                "required": ["codigo"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_persona_historial",
+            "description": (
+                "Historial de un colaborador SHIMIN: en qué proyectos y entregables cargó HH. "
+                "Útil para preguntas tipo 'experiencia de Fulano', 'en qué ha trabajado X persona', "
+                "'quién tiene experiencia en piping'."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "usuario_id": {"type": "string", "description": "Usuario_id del colaborador (ej. fespinoza)"},
+                    "ano": {"type": "integer"},
+                },
+                "required": ["usuario_id"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "listar_proyectos_staffing",
+            "description": "Lista proyectos del staffing app (SH-XXXX). Útil para preguntas tipo 'qué proyectos están activos'.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "activo": {"type": "boolean", "default": True},
+                    "limit": {"type": "integer", "default": 50},
+                },
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "list_my_drafts",
+            "description": (
+                "Lista los drafts (propuestas en armado) del usuario actual. Útil cuando el "
+                "usuario menciona 'mi draft', 'estoy armando X propuesta', 'la propuesta nueva' "
+                "y necesitas saber qué está trabajando."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {"limit": {"type": "integer", "default": 20}},
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_draft_context",
+            "description": (
+                "Trae la guía LLM, lista de archivos y opcionalmente un preview de los chunks de "
+                "antecedentes de un draft específico. Úsala cuando el usuario te pida trabajar "
+                "sobre una propuesta en armado y necesites su contexto. Si include_chunks_preview=true, "
+                "trae texto inicial de los PDFs/DOCX subidos."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "slug": {"type": "string", "description": "Slug del draft (de list_my_drafts)"},
+                    "include_guide": {"type": "boolean", "default": True},
+                    "include_chunks_preview": {"type": "boolean", "default": False},
+                },
+                "required": ["slug"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "search_draft_chunks",
+            "description": (
+                "Busca DENTRO de los antecedentes (PDFs/DOCX que subió el usuario) de un draft. "
+                "Útil para citas literales del cliente: 'qué dice el RFP sobre X', 'cuál es el plazo', "
+                "'qué exclusiones marca el cliente'. Devuelve fragmentos con la fuente."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "slug": {"type": "string"},
+                    "query": {"type": "string"},
+                    "limit": {"type": "integer", "default": 6},
+                },
+                "required": ["slug", "query"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "load_skill",
             "description": (
                 "Carga el playbook (SKILL.md) de una skill SHIMIN por nombre. Las skills definen flujos "
@@ -344,6 +507,14 @@ class ToolDispatcher:
             "read_pdf_deep": handlers.read_pdf_deep,
             "save_library_entry": handlers.save_library_entry,
             "generate_document": handlers.generate_document,
+            "search_entregables_hh": handlers.search_entregables_hh,
+            "get_horas_detalle": handlers.get_horas_detalle,
+            "get_proyecto_staffing": handlers.get_proyecto_staffing,
+            "get_persona_historial": handlers.get_persona_historial,
+            "listar_proyectos_staffing": handlers.listar_proyectos_staffing,
+            "list_my_drafts": handlers.list_my_drafts,
+            "get_draft_context": handlers.get_draft_context,
+            "search_draft_chunks": handlers.search_draft_chunks,
             "load_skill": self._load_skill,
         }
 

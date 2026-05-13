@@ -20,9 +20,12 @@ from app.services.master_repository import MasterRepository
 from app.services.master_stats_analyst import MasterStatsAnalyst
 from app.services.proposal_index import ProposalIndexService
 from app.services.proposal_support_advisor import ProposalSupportAdvisor
+from app.services.proposal_drafts import ProposalDraftService
 from app.services.search_filters import SearchFilters
 from app.services.sharepoint_client import SharePointClient
+from app.services.staffing_client import StaffingClient
 from app.services.structured_wiki import StructuredWikiService
+from app.services.user_context import get_current_user
 
 
 @dataclass
@@ -37,6 +40,8 @@ class ToolContext:
     proposal_support: ProposalSupportAdvisor
     wiki: StructuredWikiService
     sharepoint: SharePointClient
+    staffing: StaffingClient
+    drafts: ProposalDraftService
 
     @classmethod
     def build(cls) -> "ToolContext":
@@ -51,6 +56,8 @@ class ToolContext:
             proposal_support=ProposalSupportAdvisor(),
             wiki=StructuredWikiService(),
             sharepoint=SharePointClient(),
+            staffing=StaffingClient(),
+            drafts=ProposalDraftService(),
         )
 
 
@@ -317,6 +324,184 @@ async def generate_document(
     }
 
 
+def _compact_entregable(row: dict) -> dict:
+    """Compactar una fila de entregable de la API staffing para no inflar contexto."""
+    return {
+        "entregable_id": row.get("entregable_id"),
+        "entregable_nombre": str(row.get("entregable_nombre") or "")[:160],
+        "proyecto_codigo": row.get("proyecto_codigo"),
+        "horas_totales": row.get("horas_totales") or row.get("hh_totales"),
+        "personas_count": row.get("personas_count") or row.get("n_personas"),
+        "disciplina": row.get("disciplina") or row.get("disciplina_nombre"),
+        "cliente_resuelto": row.get("cliente_resuelto") or row.get("cliente"),
+        "codigo_prop": row.get("codigo_prop"),
+        "servicio": row.get("servicio") or row.get("tipo_servicio"),
+        "personas_detalle": [
+            {
+                "usuario_id": p.get("usuario_id"),
+                "nombre": p.get("nombre"),
+                "horas": p.get("horas") or p.get("hh"),
+            }
+            for p in (row.get("personas_detalle") or [])[:6]
+        ] if row.get("personas_detalle") else None,
+    }
+
+
+async def search_entregables_hh(
+    ctx: ToolContext,
+    q: str | None = None,
+    disciplina: str | None = None,
+    contexto: str | None = None,
+    proyecto_codigo: str | None = None,
+    ano: int | None = None,
+    top: int = 30,
+    incluir_personas: bool = True,
+) -> dict:
+    """Búsqueda de entregables con HH REALES cargadas (no estimadas).
+
+    Llama al endpoint /external/entregables/analisis-hh del staffing app.
+    Útil para responder preguntas tipo "memoria de cálculo hidráulica en Caserones",
+    "planos de piping para Vale", "informes de hidráulica con Codelco".
+    """
+    if not ctx.staffing.available:
+        return {"error": "STAFFING_API_KEY no configurada — agrégalo al .env / App Settings"}
+    result = await ctx.staffing.analisis_hh(
+        q=q, disciplina=disciplina, contexto=contexto,
+        proyecto_codigo=proyecto_codigo, ano=ano,
+        top=min(top, 200), incluir_personas=incluir_personas,
+    )
+    if "error" in result:
+        return result
+    detalle = result.get("detalle") or []
+    return {
+        "resumen": result.get("resumen") or {},
+        "distribucion_disciplina": result.get("distribucion_disciplina") or {},
+        "distribucion_cliente": result.get("distribucion_cliente") or {},
+        "distribucion_servicio": result.get("distribucion_servicio") or {},
+        "count": len(detalle),
+        "entregables": [_compact_entregable(row) for row in detalle[:top]],
+    }
+
+
+async def get_horas_detalle(
+    ctx: ToolContext,
+    q: str | None = None,
+    proyecto_codigo: str | None = None,
+    entregable_id: str | None = None,
+    persona_id: str | None = None,
+    disciplina: str | None = None,
+    contexto: str | None = None,
+    ano: int | None = None,
+    semana_desde: int | None = None,
+    semana_hasta: int | None = None,
+    limit: int = 300,
+) -> dict:
+    """Detalle auditable: quién cargó qué HH en qué semana en qué entregable.
+
+    Llama /external/entregables/horas-detalle. Requiere al menos uno de:
+    q, proyecto_codigo, entregable_id, persona_id, contexto.
+    """
+    if not ctx.staffing.available:
+        return {"error": "STAFFING_API_KEY no configurada"}
+    if not any([q, proyecto_codigo, entregable_id, persona_id, contexto]):
+        return {"error": "Debes pasar al menos uno: q, proyecto_codigo, entregable_id, persona_id o contexto"}
+    result = await ctx.staffing.horas_detalle(
+        q=q, proyecto_codigo=proyecto_codigo, entregable_id=entregable_id,
+        persona_id=persona_id, disciplina=disciplina, contexto=contexto, ano=ano,
+        semana_desde=semana_desde, semana_hasta=semana_hasta, limit=min(limit, 1500),
+    )
+    if "error" in result:
+        return result
+    detalle = result.get("detalle") or []
+    return {
+        "count": len(detalle),
+        "filas": [
+            {
+                "usuario_id": r.get("usuario_id"),
+                "nombre": r.get("nombre"),
+                "ano": r.get("ano"),
+                "semana": r.get("semana"),
+                "horas": r.get("horas"),
+                "entregable_id": r.get("entregable_id"),
+                "proyecto_codigo": r.get("proyecto_codigo"),
+                "cliente_resuelto": r.get("cliente_resuelto"),
+            }
+            for r in detalle[:limit]
+        ],
+    }
+
+
+async def get_proyecto_staffing(ctx: ToolContext, codigo: str, ano: int | None = None) -> dict:
+    """Devuelve proyecto + entregables + personas en un solo call.
+
+    Llama /external/proyectos/{codigo}/completo.
+    `codigo` es el código de proyecto staffing (ej. SH-0392).
+    """
+    if not ctx.staffing.available:
+        return {"error": "STAFFING_API_KEY no configurada"}
+    result = await ctx.staffing.proyecto_completo(codigo, ano=ano)
+    if "error" in result:
+        return result
+    proyecto = result.get("proyecto") or {}
+    entregables = result.get("entregables") or []
+    personas = result.get("personas") or []
+    return {
+        "proyecto": {
+            "codigo": proyecto.get("codigo") or codigo,
+            "nombre": proyecto.get("nombre"),
+            "cliente": proyecto.get("cliente"),
+            "jp": proyecto.get("jp_nombre") or proyecto.get("jp_id"),
+            "horas_totales": proyecto.get("horas_totales"),
+        },
+        "entregables_count": len(entregables),
+        "entregables": [_compact_entregable(e) for e in entregables[:30]],
+        "personas_count": len(personas),
+        "personas": [
+            {
+                "usuario_id": p.get("usuario_id"),
+                "nombre": p.get("nombre"),
+                "disciplina": p.get("disciplina"),
+                "cargo": p.get("cargo"),
+                "horas_totales": p.get("horas_totales") or p.get("hh"),
+            }
+            for p in personas[:30]
+        ],
+    }
+
+
+async def get_persona_historial(ctx: ToolContext, usuario_id: str, ano: int | None = None) -> dict:
+    """Historial de una persona: proyectos y entregables donde cargó HH.
+
+    Llama /external/personas/{usuario_id}.
+    """
+    if not ctx.staffing.available:
+        return {"error": "STAFFING_API_KEY no configurada"}
+    return await ctx.staffing.historial_persona(usuario_id, ano=ano)
+
+
+async def listar_proyectos_staffing(ctx: ToolContext, activo: bool = True, limit: int = 50) -> dict:
+    """Lista proyectos del staffing app (SH-XXXX) con su jefe de proyecto y estado."""
+    if not ctx.staffing.available:
+        return {"error": "STAFFING_API_KEY no configurada"}
+    result = await ctx.staffing.listar_proyectos(activo=activo, limit=min(limit, 500))
+    if "error" in result:
+        return result
+    proyectos = result.get("proyectos") or result.get("data") or []
+    return {
+        "count": len(proyectos),
+        "proyectos": [
+            {
+                "codigo": p.get("codigo"),
+                "nombre": p.get("nombre"),
+                "cliente": p.get("cliente"),
+                "activo": p.get("activo"),
+                "jp": p.get("jp_nombre") or p.get("jp_id"),
+            }
+            for p in proyectos[:limit]
+        ],
+    }
+
+
 async def save_library_entry(
     ctx: ToolContext,
     title: str,
@@ -336,3 +521,57 @@ async def save_library_entry(
         propuestas_referenciadas=propuestas_referenciadas or [],
     )
     return {"saved": True, "entry": _compact_wiki_entry(entry)}
+
+
+async def list_my_drafts(ctx: ToolContext, limit: int = 20) -> dict:
+    """Lista los drafts (propuestas en armado) del usuario actual.
+
+    Cada draft tiene: slug, title, cliente, status, files_count, fechas.
+    """
+    user = get_current_user()
+    rows = ctx.drafts.list_drafts(user.id, limit=limit)
+    return {"count": len(rows), "drafts": rows}
+
+
+async def get_draft_context(ctx: ToolContext, slug: str, include_guide: bool = True, include_chunks_preview: bool = False) -> dict:
+    """Trae todo el contexto de un draft: metadata, archivos subidos y la GUÍA generada por LLM.
+
+    Si `include_chunks_preview=True`, agrega un preview de los primeros chunks de los antecedentes.
+    Útil cuando el usuario está chateando dentro del contexto de una propuesta y quieres traer
+    su info para usarla en las respuestas.
+    """
+    user = get_current_user()
+    try:
+        draft = ctx.drafts.get_draft(user.id, slug)
+    except KeyError:
+        return {"error": f"draft '{slug}' no encontrado o no es tuyo"}
+    out = {
+        "slug": draft["slug"],
+        "title": draft["title"],
+        "cliente": draft["cliente"],
+        "status": draft["status"],
+        "files_count": len(draft.get("files") or []),
+        "files": [
+            {"filename": f["filename"], "kind": f["kind"], "chars_extracted": f["chars_extracted"]}
+            for f in draft.get("files") or []
+        ],
+    }
+    if include_guide and draft.get("guide_exists"):
+        out["guide"] = ctx.drafts.get_guide(user.id, slug)
+    if include_chunks_preview:
+        out["chunks_preview"] = ctx.drafts.all_text(slug, max_chars=6000)
+    return out
+
+
+async def search_draft_chunks(ctx: ToolContext, slug: str, query: str, limit: int = 6) -> dict:
+    """Busca dentro de los antecedentes (PDFs/DOCX subidos) de un draft específico.
+
+    Devuelve los chunks de texto más relevantes con la fuente (qué archivo) y un snippet.
+    """
+    user = get_current_user()
+    try:
+        ctx.drafts.get_draft(user.id, slug)
+    except KeyError:
+        return {"error": f"draft '{slug}' no encontrado"}
+    hits = ctx.drafts.search_chunks(slug, query, limit=limit)
+    return {"count": len(hits), "hits": hits}

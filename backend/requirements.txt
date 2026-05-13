@@ -14,3 +14,4 @@ PyPDF2==3.0.1
 rapidfuzz==3.11.0
 openai==1.58.1
 azure-storage-blob==12.24.0
+python-multipart==0.0.20

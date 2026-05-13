@@ -11,12 +11,14 @@ import { ChatView } from "./components/chat/ChatView.jsx";
 import { MasterView } from "./components/master/MasterView.jsx";
 import { LibraryView } from "./components/library/LibraryView.jsx";
 import { OpsView } from "./components/ops/OpsView.jsx";
+import { DraftsView } from "./components/drafts/DraftsView.jsx";
 
 const VIEW_META = {
   chat: { title: "Agente SHIMIN", subtitle: "tool calling + filtros estructurados" },
   master: { title: "Planilla Master", subtitle: "datos tabulares de propuestas" },
   library: { title: "Wiki / Librería curada", subtitle: "espacio entre Master y RAG" },
-  ops: { title: "Operación", subtitle: "estado del sistema e índices" },
+  drafts: { title: "Propuestas en armado", subtitle: "antecedentes del cliente + guía LLM" },
+  ops: { title: "Ajustes", subtitle: "estado del sistema, índices y operación" },
 };
 
 function App() {
@@ -29,6 +31,7 @@ function App() {
       {view === "chat" && <ChatView />}
       {view === "master" && <MasterView />}
       {view === "library" && <LibraryView />}
+      {view === "drafts" && <DraftsView />}
       {view === "ops" && <OpsView />}
     </Shell>
   );

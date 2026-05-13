@@ -61,7 +61,11 @@ Min 5 filas, max 10. Ordena por relevancia descendente (directas primero).
 
 - **El "por qué" debe ser específico**, no genérico. NO digas "es relevante porque trata el tema". SÍ di "incluye dimensionamiento de bombas para impulsión de relaves a 6 km, mismo orden de magnitud que tu necesidad".
 - **Cita la fuente del por qué**: wiki (si la entrada lo describe) / master (si solo es título+metadata) / RAG (si es evidencia textual del PDF).
-- **Marca ganadas y perdidas explícitamente** con emoji o tag `✅ PG` / `❌ PP`. Las ganadas tienen más valor comercial; las perdidas pueden tener buenos alcances de igual modo.
+- **Marca ganadas y perdidas explícitamente** con `✅ PG` / `❌ PP`.
+- **Jerarquía Ganada/Perdida** (importante para propuestas comerciales):
+  - **Ganadas (PG)**: tienen valor pleno — fueron adjudicadas, tienen HH reales en staffing (SH-XXXX), monto defendible.
+  - **Perdidas (PP)**: sirven para alcance/ideas de metodología, **pero NO para benchmark de HH ni monto**. Su cotización fue rechazada, así que no es referencia comercial defendible.
+  - Si el usuario pregunta sobre "experiencia SHIMIN" o "qué propuestas sirven de base", **prioriza explícitamente las ganadas** y márcalo en la respuesta.
 - **Si el tema es muy amplio** (ej: "agua"), pide al usuario un sub-foco antes de listar 20 propuestas inútiles.
 - **Si la búsqueda devuelve cero**, dilo claramente y propone variantes del término.
 - **No inventes códigos**. Solo cita propuestas que aparecieron en las tools.

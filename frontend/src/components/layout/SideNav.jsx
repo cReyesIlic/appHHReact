@@ -1,11 +1,11 @@
-import { MessageSquare, Table, BookOpen, BarChart3, Settings as Cog } from "lucide-react";
+import { MessageSquare, Table, BookOpen, FilePlus, Settings as Cog } from "lucide-react";
 import { Brand } from "./Brand.jsx";
 
 const ITEMS = [
   { key: "chat", label: "Chat", icon: MessageSquare },
   { key: "master", label: "Master", icon: Table },
   { key: "library", label: "Wiki / Librería", icon: BookOpen },
-  { key: "ops", label: "Operación", icon: BarChart3 },
+  { key: "drafts", label: "Propuestas en armado", icon: FilePlus },
 ];
 
 export function SideNav({ active, onChange, onOpenSettings }) {
@@ -30,7 +30,11 @@ export function SideNav({ active, onChange, onOpenSettings }) {
         })}
       </nav>
       <div className="nav-footer">
-        <button type="button" className="nav-item" onClick={onOpenSettings}>
+        <button
+          type="button"
+          className={`nav-item${active === "ops" ? " active" : ""}`}
+          onClick={onOpenSettings}
+        >
           <Cog size={18} />
           <span>Ajustes</span>
         </button>

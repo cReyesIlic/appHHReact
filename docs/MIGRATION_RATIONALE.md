@@ -183,3 +183,22 @@ Por **$20 USD/mes más** se obtiene:
 - `deploy/01-storage.sh`, `02-build-push.sh`, `03-app-service.sh`, `04-static-web-app.sh` — scripts idempotentes.
 - `.github/workflows/sync-daily.yml` — cron diario.
 - `frontend/staticwebapp.config.json` — config OAuth Entra (a commitear).
+
+---
+
+## Integración Staffing API (entregables HH reales)
+
+Nuevas variables en `.env`:
+```
+STAFFING_API_URL=https://staffing-shimin-dgedc6cachagg8fx.eastus2-01.azurewebsites.net
+STAFFING_API_KEY=<pegar EXTERNAL_API_KEY del staffing app>
+```
+
+Nuevas tools del agente:
+- `search_entregables_hh` — HH reales por concepto/disciplina/cliente
+- `get_horas_detalle` — auditoría por persona/semana
+- `get_proyecto_staffing` — proyecto + entregables + personas
+- `get_persona_historial` — historial de un colaborador
+- `listar_proyectos_staffing` — proyectos activos SH-XXXX
+
+Nueva skill: `analizar_entregables_hh`. Las skills `armar_propuesta` y `datos_economicos` ya saben usarlas para comparar HH licitadas vs reales.

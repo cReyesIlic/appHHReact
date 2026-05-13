@@ -1,4 +1,4 @@
-from fastapi import APIRouter, HTTPException, Request
+from fastapi import APIRouter, File, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse
 
 from app.agents.orchestrator import AgentOrchestrator
@@ -13,6 +13,7 @@ from app.services.sharepoint_client import SharePointClient
 from app.services.proposal_index import ProposalIndexService
 from app.services.structured_wiki import StructuredWikiService
 from app.services.wiki_auto_compiler import WikiAutoCompiler
+from app.services.proposal_drafts import ProposalDraftService
 from app.services.proposal_ingestion import ProposalIngestionService
 from app.services.proposal_sync_service import ProposalSyncService
 from app.rag.parent_child import ParentChildIndexer
@@ -619,3 +620,152 @@ def export(kind: str, request: ExportRequest) -> FileResponse:
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     return FileResponse(path, filename=path.name)
+
+
+# ---- Proposal drafts: cargar antecedentes + guía LLM ----
+
+@router.get("/drafts")
+def drafts_list(http_request: Request, limit: int = 50) -> dict:
+    user = user_from_request(http_request)
+    rows = ProposalDraftService().list_drafts(user.id, limit=limit)
+    return {"drafts": rows, "count": len(rows)}
+
+
+@router.post("/drafts")
+def drafts_create(payload: dict, http_request: Request) -> dict:
+    user = user_from_request(http_request)
+    title = (payload.get("title") or "").strip()
+    if not title:
+        raise HTTPException(status_code=400, detail="title requerido")
+    cliente = (payload.get("cliente") or "").strip() or None
+    return ProposalDraftService().create_draft(user.id, title, cliente)
+
+
+@router.get("/drafts/{slug}")
+def drafts_get(slug: str, http_request: Request) -> dict:
+    user = user_from_request(http_request)
+    try:
+        draft = ProposalDraftService().get_draft(user.id, slug)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="Draft no encontrado") from exc
+    draft["guide_markdown"] = ProposalDraftService().get_guide(user.id, slug) if draft.get("guide_exists") else ""
+    return draft
+
+
+@router.delete("/drafts/{slug}")
+def drafts_delete(slug: str, http_request: Request) -> dict:
+    user = user_from_request(http_request)
+    return ProposalDraftService().delete_draft(user.id, slug)
+
+
+@router.post("/drafts/{slug}/upload")
+async def drafts_upload(slug: str, http_request: Request, file: UploadFile = File(...)) -> dict:
+    user = user_from_request(http_request)
+    content = await file.read()
+    if not content:
+        raise HTTPException(status_code=400, detail="archivo vacío")
+    if len(content) > 50 * 1024 * 1024:  # 50 MB max
+        raise HTTPException(status_code=413, detail="archivo > 50 MB")
+    try:
+        return ProposalDraftService().add_file(user.id, slug, file.filename or "archivo", content)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="Draft no encontrado") from exc
+
+
+@router.get("/drafts/{slug}/files/{filename}")
+def drafts_download_file(slug: str, filename: str, http_request: Request) -> FileResponse:
+    user = user_from_request(http_request)
+    # Verifica ownership
+    try:
+        ProposalDraftService().get_draft(user.id, slug)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="Draft no encontrado") from exc
+    path = ProposalDraftService().file_path(user.id, slug, filename)
+    if not path.exists():
+        raise HTTPException(status_code=404, detail="archivo no encontrado")
+    return FileResponse(path, filename=path.name)
+
+
+@router.post("/drafts/{slug}/build-guide")
+async def drafts_build_guide(slug: str, http_request: Request) -> dict:
+    """Genera la guía .md sintética con los puntos principales (LLM)."""
+    user = user_from_request(http_request)
+    service = ProposalDraftService()
+    try:
+        draft = service.get_draft(user.id, slug)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="Draft no encontrado") from exc
+    if not draft["files"]:
+        raise HTTPException(status_code=400, detail="No hay archivos subidos. Sube PDF/DOCX antes.")
+
+    from app.services.llm import LlmService
+    import json as _json
+
+    llm = LlmService()
+    text = service.all_text(slug, max_chars=80000)
+    if not text.strip():
+        raise HTTPException(status_code=400, detail="No se extrajo texto de los archivos")
+
+    system = (
+        "Eres un analista senior de propuestas SHIMIN. El usuario te entrega los antecedentes "
+        "técnicos (PDFs/DOCX del cliente) para preparar una propuesta nueva. Tu objetivo es "
+        "generar una GUÍA en MARKDOWN con los puntos clave que el equipo SHIMIN debe considerar "
+        "para responder esta licitación o propuesta.\n\n"
+        "Estructura obligatoria de la guía:\n"
+        "## 1. Identidad del trabajo\n"
+        "Cliente, sitio, tipo de obra, etapa de ingeniería, plazo, monto referencial si aparece.\n"
+        "## 2. Alcance solicitado por el cliente\n"
+        "Lista en bullets de lo que SHIMIN debe entregar. Cita textual cuando sea posible.\n"
+        "## 3. Disciplinas involucradas\n"
+        "Hidráulica, mecánica, civil, geotecnia, instrumentación, etc.\n"
+        "## 4. Entregables esperados\n"
+        "Lista de entregables (MDC, planos, P&ID, informes, etc.) con la disciplina responsable.\n"
+        "## 5. Criterios de evaluación / requisitos\n"
+        "Si el cliente especifica criterios técnicos, comerciales, de plazo.\n"
+        "## 6. Restricciones, supuestos, exclusiones\n"
+        "Lo que el cliente no incluye o asume aparte.\n"
+        "## 7. Riesgos detectados\n"
+        "Lo que SHIMIN debe validar antes de cotizar (ambigüedades, gaps en la información).\n"
+        "## 8. Propuestas SHIMIN históricas que pueden servir de base\n"
+        "Si en los antecedentes aparecen códigos O-XXXX o nombres de proyectos similares, listarlos.\n"
+        "## 9. Próximos pasos para armar la propuesta\n"
+        "Acciones concretas: buscar referencias, validar HH típicas, definir equipo, etc.\n\n"
+        "Reglas: cita textual cuando ayude; sé conciso; si algo no aparece en los antecedentes, "
+        "márcalo como 'no especificado en antecedentes'. Markdown limpio con headings ## y bullets."
+    )
+
+    user_payload = (
+        f"Trabajo: {draft['title']}\n"
+        f"Cliente: {draft['cliente'] or 'no especificado'}\n\n"
+        f"Antecedentes (texto extraído de {len(draft['files'])} archivos):\n\n{text}"
+    )
+
+    if not llm.client:
+        guide = (
+            f"# Guía generada (sin LLM disponible)\n\nTítulo: {draft['title']}\n\n"
+            f"Antecedentes extraídos: {len(draft['files'])} archivos, {len(text)} caracteres.\n\n"
+            f"(Configura Azure OpenAI para generar la guía completa.)"
+        )
+    else:
+        try:
+            deployment = settings.answer_deployment if llm.azure else "gpt-4o-mini"
+            guide = await llm._chat(
+                deployment=deployment,
+                messages=[
+                    {"role": "system", "content": system},
+                    {"role": "user", "content": user_payload[:120000]},
+                ],
+                max_completion_tokens=4096,
+            )
+        except Exception as exc:  # noqa: BLE001
+            raise HTTPException(status_code=502, detail=f"LLM falló: {exc}") from exc
+
+    path = service.save_guide(user.id, slug, guide or "(sin contenido)")
+    return {
+        "slug": slug,
+        "guide_path": str(path),
+        "guide_chars": len(guide or ""),
+        "files_used": len(draft["files"]),
+    }

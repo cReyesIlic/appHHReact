@@ -109,8 +109,8 @@ export function ChatView() {
     }
   };
 
-  const gridTemplate = `${showSessions ? "260px" : "0px"} 1fr`;
-  const chatGrid = `1fr ${showProcess ? "320px" : "0px"}`;
+  const gridTemplate = showSessions ? "260px 1fr" : "1fr";
+  const chatGrid = showProcess ? "1fr 320px" : "1fr";
 
   return (
     <div className="view-body" style={{ height: "100%", paddingBottom: 0 }}>

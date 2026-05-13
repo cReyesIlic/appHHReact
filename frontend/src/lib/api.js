@@ -205,6 +205,47 @@ export function validateLibraryEntry(id) {
   return jsonFetch(`/api/wiki/entries/${id}/validate`, { method: "POST" });
 }
 
+// ---- Drafts (propuestas en armado con antecedentes) ----
+
+export function listDrafts(limit = 50) {
+  return jsonFetch(`/api/drafts?limit=${limit}`);
+}
+
+export function createDraft(payload) {
+  return jsonFetch("/api/drafts", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+}
+
+export function getDraft(slug) {
+  return jsonFetch(`/api/drafts/${encodeURIComponent(slug)}`);
+}
+
+export function deleteDraft(slug) {
+  return jsonFetch(`/api/drafts/${encodeURIComponent(slug)}`, { method: "DELETE" });
+}
+
+export async function uploadDraftFile(slug, file) {
+  const form = new FormData();
+  form.append("file", file);
+  const response = await fetch(`${API_BASE}/api/drafts/${encodeURIComponent(slug)}/upload`, {
+    method: "POST",
+    body: form,
+  });
+  if (!response.ok) throw new Error(await response.text());
+  return response.json();
+}
+
+export function buildDraftGuide(slug) {
+  return jsonFetch(`/api/drafts/${encodeURIComponent(slug)}/build-guide`, { method: "POST" });
+}
+
+export function getDraftFileUrl(slug, filename) {
+  return `${API_BASE}/api/drafts/${encodeURIComponent(slug)}/files/${encodeURIComponent(filename)}`;
+}
+
 export async function exportAnswer(kind, payload) {
   const response = await fetch(`${API_BASE}/api/exports/${kind}`, {
     method: "POST",
