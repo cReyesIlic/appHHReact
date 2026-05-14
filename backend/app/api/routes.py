@@ -287,6 +287,20 @@ def sync_status() -> dict:
     }
 
 
+@router.get("/sync/ganadas-pendientes")
+def sync_ganadas_pendientes() -> dict:
+    """Lista propuestas ganadas (PG) en master que aún NO están indexadas en RAG/Wiki.
+    Es el listado que alimenta el botón 'Sincronizar ganadas nuevas'."""
+    return ProposalSyncService().discover_ganadas_pendientes()
+
+
+@router.post("/sync/ganadas")
+async def sync_ganadas(limit: int = 10) -> dict:
+    """Para cada propuesta ganada (PG) sin RAG, descarga PDFs/Excel de SharePoint
+    y la alimenta al sistema (RAG + Wiki). Bajo demanda, no automático."""
+    return await ProposalSyncService().sync_ganadas(limit=limit)
+
+
 @router.get("/sync/discover-new")
 async def sync_discover_new(limit: int = 200) -> dict:
     svc = ProposalSyncService()

@@ -193,6 +193,14 @@ export function syncBackfillWiki(payload = {}) {
   });
 }
 
+export function discoverGanadasPendientes() {
+  return jsonFetch("/api/sync/ganadas-pendientes");
+}
+
+export function syncGanadas(limit = 10) {
+  return jsonFetch(`/api/sync/ganadas?limit=${limit}`, { method: "POST" });
+}
+
 export function librarySearch(payload) {
   return jsonFetch("/api/library/search", {
     method: "POST",

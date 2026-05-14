@@ -80,6 +80,43 @@ class SharePointClient:
         async with httpx.AsyncClient(timeout=120) as client:
             return await self._request_content(client, download_url)
 
+    async def list_emitido_files(self, code: str, kinds: tuple[str, ...] = (".pdf", ".docx", ".xlsx")) -> list[dict]:
+        """Lista archivos emitidos (PDF/DOCX/XLSX) de la carpeta '03 Oferta/02 Emitido' de O-XXXX.
+
+        A diferencia de `list_pdfs` (que solo trae PDFs), este método trae cualquier formato
+        ofimático en la carpeta emitida. Útil cuando la propuesta SHIMIN se envió como Excel
+        (ODS) o Word, no PDF.
+        """
+        if not self._configured():
+            return []
+        headers = self._headers()
+        site_url = settings.site_url_ofertas or settings.site_url_proyectos
+        if not site_url:
+            return []
+        async with httpx.AsyncClient(timeout=90) as client:
+            drive_id = await self._default_drive_id(client, headers, site_url)
+            root = await self._item_by_path(client, headers, drive_id, "01 Ofertas")
+            offer = await self._find_child_by_code(client, headers, drive_id, root["id"], normalize_offer_code(code))
+            if not offer:
+                return []
+            proposal = await self._find_child_by_names(client, headers, drive_id, offer["id"], ["03 Oferta", "Oferta"])
+            if not proposal:
+                return []
+            final = await self._find_child_by_names(client, headers, drive_id, proposal["id"], ["02 Emitido", "02 Emitidos", "Emitido", "Emitidos", "Enviado"])
+            if not final:
+                return []
+            files = await self._files_descendants(client, headers, drive_id, final["id"], kinds=kinds, max_depth=4)
+        return [
+            {
+                "name": f.get("name"),
+                "size": f.get("size") or 0,
+                "webUrl": f.get("webUrl"),
+                "kind": (f.get("name", "").lower().rsplit(".", 1)[-1] if "." in f.get("name", "") else ""),
+                "@microsoft.graph.downloadUrl": f.get("@microsoft.graph.downloadUrl"),
+            }
+            for f in files
+        ]
+
     async def list_offer_antecedentes(self, code: str, kinds: tuple[str, ...] = (".pdf", ".docx")) -> list[dict]:
         """Lista PDFs y DOCX dentro de la carpeta '01 Informacion Cliente' de una oferta O-XXXX.
 

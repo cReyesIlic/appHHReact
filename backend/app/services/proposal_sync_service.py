@@ -82,8 +82,100 @@ class ProposalSyncService:
 
     # ---- discovery ----
 
+    def discover_ganadas_pendientes(self, include_excel: bool = True) -> dict:
+        """Detecta propuestas GANADAS (PG) en master que aún NO están indexadas en RAG.
+
+        Este es el flujo correcto post-adjudicación:
+        - Master se actualiza con el estado PG cuando SHIMIN gana una propuesta.
+        - Para esas ganadas hay que traer los PDFs (y opcionalmente Excel) desde SharePoint
+          e indexarlos para que el agente las use como referencias confiables.
+
+        NO mira todo SharePoint, solo lo que el master marcó como ganado.
+        """
+        from app.services.proposal_taxonomy import status_category
+        all_rows = self.master.all_offers()
+        ganadas = []
+        for row in all_rows:
+            estado = str(row.get("estado") or "").strip().upper()
+            if status_category(estado) != "ganada":
+                continue
+            codigo = str(row.get("codigo") or "").strip().upper()
+            if not codigo or not codigo.startswith("O-"):
+                continue
+            ganadas.append({
+                "codigo": codigo,
+                "titulo": str(row.get("titulo") or "")[:160],
+                "cliente": row.get("cliente_directo") or row.get("cliente_final"),
+                "fecha_recep": row.get("fecha_recep") or row.get("fecha_recepcion"),
+                "estado": estado,
+                "monto": row.get("monto"),
+                "horas_lic": row.get("horas_lic"),
+                "cod_proy": row.get("cod_proy"),
+            })
+
+        already = self._codigos_with_rag()
+        proposals_dir = settings.resolve_path("storage/llm_wiki/proposals")
+        wiki_existing = {p.stem.upper() for p in proposals_dir.glob("O-*.md")} if proposals_dir.exists() else set()
+
+        pendientes_rag = [g for g in ganadas if g["codigo"] not in already]
+        pendientes_wiki = [g for g in ganadas if g["codigo"] not in wiki_existing]
+        total_ganadas = len(ganadas)
+
+        return {
+            "total_ganadas_master": total_ganadas,
+            "ya_indexadas_rag": total_ganadas - len(pendientes_rag),
+            "ya_compiladas_wiki": total_ganadas - len(pendientes_wiki),
+            "pendientes_rag_count": len(pendientes_rag),
+            "pendientes_wiki_count": len(pendientes_wiki),
+            "pendientes_rag": pendientes_rag[:200],
+            "pendientes_wiki": pendientes_wiki[:200],
+        }
+
+    async def sync_ganadas(self, limit: int = 20, include_excel: bool = True) -> dict:
+        """Para cada propuesta ganada (PG) en master sin RAG indexado, descarga PDFs y Excel
+        de SharePoint y la alimenta al sistema (RAG + Wiki + embeddings).
+
+        Idempotente. Apto para uso bajo demanda (botón UI o cron manual cuando se confirme).
+        """
+        gap = self.discover_ganadas_pendientes(include_excel=include_excel)
+        pendientes = gap["pendientes_rag"][:limit]
+        counters = SyncCounters(discovered=len(pendientes))
+        for ganada in pendientes:
+            codigo = ganada["codigo"]
+            outcome = await self.sync_code(codigo, force_wiki=False)
+            counters.by_code.append({**outcome, "titulo": ganada.get("titulo"), "cliente": ganada.get("cliente")})
+            if outcome["status"] == "ok":
+                counters.ingested += 1
+            elif outcome["status"] in {"skipped", "no_pdf"}:
+                counters.skipped += 1
+            else:
+                counters.errors += 1
+            if outcome.get("wiki_status") == "ok":
+                counters.wiki_ok += 1
+            elif outcome.get("wiki_status") == "no_rag":
+                counters.wiki_no_rag += 1
+            elif outcome.get("wiki_status") == "error":
+                counters.wiki_error += 1
+        return {
+            "scope": "ganadas_master_pendientes",
+            "total_ganadas_master": gap["total_ganadas_master"],
+            "ya_indexadas": gap["ya_indexadas_rag"],
+            "objetivo_corrida": len(pendientes),
+            "ingested": counters.ingested,
+            "skipped": counters.skipped,
+            "errors": counters.errors,
+            "wiki_ok": counters.wiki_ok,
+            "wiki_no_rag": counters.wiki_no_rag,
+            "wiki_error": counters.wiki_error,
+            "details": counters.by_code,
+        }
+
     async def discover_new(self, limit: int = 200) -> dict:
-        """Lista códigos en SharePoint que aún NO están indexados en RAG parent_child."""
+        """Lista códigos en SharePoint que aún NO están indexados en RAG parent_child.
+
+        (Legacy — barre TODO SharePoint, no discrimina por estado. Para uso normal,
+        prefiere `discover_ganadas_pendientes()` que es más certero.)
+        """
         folders = await self.sharepoint.list_offer_folders(limit=limit)
         already = self._codigos_with_rag()
         new = [f for f in folders if f.get("codigo", "").upper() not in already]
@@ -119,19 +211,44 @@ class ProposalSyncService:
             "wiki_status": "skipped",
         }
 
-        # 1-3. Descargar y parsear
+        # 1-3. Descargar y parsear (PDF, DOCX, XLSX)
         try:
-            pdfs = await self.sharepoint.list_pdfs(codigo)
-            latest = self.sharepoint.select_latest_pdf(pdfs)
-            if not latest:
-                result.update({"status": "no_pdf"})
-                self._record_manifest(result)
-                return result
-            content = await self.sharepoint.download_pdf(latest)
-            local_path = self.sharepoint.save_pdf_locally(codigo, latest.get("name", "proposal.pdf"), content)
-            first_pages = self.sharepoint.extract_first_pages_text(content, pages=5)
-            full_text = self.sharepoint.extract_full_text(content)
-            result["pdf_name"] = latest.get("name")
+            files = await self.sharepoint.list_emitido_files(codigo)
+            if not files:
+                # Fallback: intentar la lógica antigua que solo busca PDFs
+                pdfs = await self.sharepoint.list_pdfs(codigo)
+                latest = self.sharepoint.select_latest_pdf(pdfs)
+                if not latest:
+                    result.update({"status": "no_files", "note": "carpeta '03 Oferta/02 Emitido' vacía o sin PDF/DOCX/XLSX"})
+                    self._record_manifest(result)
+                    return result
+                files = [latest]
+            # Procesar todos los archivos emitidos → concatenar texto
+            full_text_parts = []
+            first_pages_text = ""
+            primary_name = None
+            primary_path = None
+            for f in files:
+                content = await self.sharepoint.download_file(f)
+                local_path = self.sharepoint.save_pdf_locally(codigo, f.get("name", "doc.bin"), content)
+                kind = (f.get("name", "").lower().rsplit(".", 1)[-1] if "." in f.get("name", "") else "")
+                file_text = self._extract_text_any(content, kind, f.get("name", ""))
+                if file_text:
+                    full_text_parts.append(f"\n\n## Fuente: {f.get('name')}\n\n{file_text}")
+                # primer archivo procesable = "primario" (para metadata + name)
+                if primary_name is None:
+                    primary_name = f.get("name")
+                    primary_path = str(local_path)
+                    if kind == "pdf":
+                        first_pages_text = self.sharepoint.extract_first_pages_text(content, pages=5)
+                    else:
+                        first_pages_text = file_text[:8000]
+            full_text = "\n".join(full_text_parts)
+            latest = {"name": primary_name, "webUrl": (files[0] or {}).get("webUrl")}
+            local_path = primary_path or ""
+            result["pdf_name"] = primary_name
+            result["files_processed"] = len(files)
+            result["kinds_processed"] = sorted(set(f.get("name", "").lower().rsplit(".", 1)[-1] for f in files if "." in f.get("name", "")))
         except Exception as exc:  # noqa: BLE001
             result.update({"status": "error", "error": f"sharepoint: {exc}"})
             self._record_manifest(result)
@@ -140,7 +257,7 @@ class ProposalSyncService:
         # 4. Indexar en parent_child (tabla híbrida)
         metadata = self._metadata(codigo, latest, str(local_path))
         try:
-            knowledge = await self.extractor.extract(metadata, first_pages, full_text)
+            knowledge = await self.extractor.extract(metadata, first_pages_text, full_text)
             raw_metadata = {**metadata.model_dump(), **knowledge.model_dump()}
             enriched = enrich_metadata(raw_metadata)
             parse_result = {"text": full_text, "pages": []}
@@ -324,6 +441,39 @@ class ProposalSyncService:
         vectors = await self.hybrid.embeddings.embed_texts([r["embedding_text"] for r in rows])
         self.hybrid._save_batch(rows, vectors)
         return {"selected": len(rows), "processed": len(rows)}
+
+    def _extract_text_any(self, content: bytes, kind: str, filename: str) -> str:
+        """Extrae texto de PDF, DOCX o XLSX. Devuelve texto plano concatenado."""
+        from io import BytesIO
+        try:
+            if kind == "pdf":
+                from PyPDF2 import PdfReader
+                reader = PdfReader(BytesIO(content))
+                return "\n".join(p.extract_text() or "" for p in reader.pages)
+            if kind == "docx":
+                from docx import Document
+                doc = Document(BytesIO(content))
+                blocks = [p.text.strip() for p in doc.paragraphs if p.text.strip()]
+                for table in doc.tables:
+                    for row in table.rows:
+                        cells = [c.text.strip() for c in row.cells if c.text.strip()]
+                        if cells:
+                            blocks.append(" | ".join(cells))
+                return "\n".join(blocks)
+            if kind in {"xlsx", "xls"}:
+                import openpyxl
+                wb = openpyxl.load_workbook(BytesIO(content), data_only=True, read_only=True)
+                blocks = []
+                for ws in wb.worksheets:
+                    blocks.append(f"## Hoja: {ws.title}")
+                    for row in ws.iter_rows(values_only=True):
+                        cells = [str(c).strip() for c in row if c is not None and str(c).strip()]
+                        if cells:
+                            blocks.append(" | ".join(cells))
+                return "\n".join(blocks)
+        except Exception as exc:  # noqa: BLE001
+            return f"[error extrayendo {filename}: {exc}]"
+        return ""
 
     def _metadata(self, codigo: str, pdf: dict, local_path: str) -> ProposalMetadata:
         master = self.master.search(codigo=codigo, limit=1)

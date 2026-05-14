@@ -1,33 +1,59 @@
-name: SHIMIN daily sync (RAG + Wiki + Master)
+name: SHIMIN sync ganadas (cada 2 días)
+# Detecta propuestas ganadas (PG) en master que aún NO están indexadas en RAG/Wiki,
+# descarga sus PDFs/DOCX/XLSX desde SharePoint (03 Oferta/02 Emitido) y las alimenta al sistema.
+#
+# Periodicidad: cada 2 días a las 02:00 hora Chile (05:00 UTC).
+# Puede dispararse manualmente desde la UI de GitHub Actions también.
+
 on:
   schedule:
-    - cron: '0 5 * * *'   # 05:00 UTC = 02:00 hora Chile
-  workflow_dispatch: {}
+    - cron: '0 5 */2 * *'   # cada 2 días, 05:00 UTC = 02:00 hora Chile
+  workflow_dispatch:
+    inputs:
+      limit:
+        description: 'Máximo de propuestas a sincronizar esta corrida'
+        required: false
+        default: '20'
 
 jobs:
-  sync:
+  sync_ganadas:
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     steps:
-      - name: Trigger sync de propuestas nuevas en SharePoint
+      - name: Preview cuántas ganadas pendientes hay
+        id: preview
         run: |
-          curl -sS -X POST "https://apphhshimin.azurewebsites.net/api/sync/new?limit=50" \
+          curl -sS "https://apphhshimin-awabbnayfbawf2b5.chilecentral-01.azurewebsites.net/api/sync/ganadas-pendientes" \
             -H "x-user-email: cron@shimin.cl" \
-            --max-time 1800 || echo "sync-new failed (puede ser timeout normal)"
+            -H "x-sync-token: ${{ secrets.SYNC_TOKEN }}" \
+            --max-time 120 | tee preview.json
+          PENDIENTES=$(jq -r '.pendientes_rag_count // 0' preview.json)
+          echo "pendientes=$PENDIENTES" >> $GITHUB_OUTPUT
+          echo "Pendientes a sincronizar: $PENDIENTES"
 
-      - name: Refrescar Master desde Excel
+      - name: Sincronizar ganadas (limit ${{ github.event.inputs.limit || 20 }})
+        if: steps.preview.outputs.pendientes != '0'
         run: |
-          curl -sS -X POST "https://apphhshimin.azurewebsites.net/api/master/refresh" \
+          LIMIT="${{ github.event.inputs.limit || 20 }}"
+          curl -sS -X POST "https://apphhshimin-awabbnayfbawf2b5.chilecentral-01.azurewebsites.net/api/sync/ganadas?limit=${LIMIT}" \
             -H "x-user-email: cron@shimin.cl" \
-            --max-time 300
+            -H "x-sync-token: ${{ secrets.SYNC_TOKEN }}" \
+            --max-time 3000 | tee sync_result.json
+          INGESTED=$(jq -r '.ingested // 0' sync_result.json)
+          ERRORS=$(jq -r '.errors // 0' sync_result.json)
+          WIKI_OK=$(jq -r '.wiki_ok // 0' sync_result.json)
+          echo "Resultado: ingested=$INGESTED · wiki_ok=$WIKI_OK · errors=$ERRORS"
 
-      - name: Backfill wiki para propuestas sin página
+      - name: Refrescar master (por si hubo cambio de estado en Excel)
+        if: steps.preview.outputs.pendientes != '0'
         run: |
-          curl -sS -X POST "https://apphhshimin.azurewebsites.net/api/sync/backfill-wiki" \
-            -H "Content-Type: application/json" \
+          curl -sS -X POST "https://apphhshimin-awabbnayfbawf2b5.chilecentral-01.azurewebsites.net/api/master/refresh" \
             -H "x-user-email: cron@shimin.cl" \
-            -d '{"limit": 30}' \
-            --max-time 1800 || echo "backfill failed"
+            -H "x-sync-token: ${{ secrets.SYNC_TOKEN }}" \
+            --max-time 300 || echo "(master/refresh falló — opcional)"
 
-      - name: Verificar status
+      - name: Status final
         run: |
-          curl -sS "https://apphhshimin.azurewebsites.net/api/sync/status"
+          curl -sS "https://apphhshimin-awabbnayfbawf2b5.chilecentral-01.azurewebsites.net/api/sync/status" \
+            -H "x-user-email: cron@shimin.cl" \
+            --max-time 30 | jq .

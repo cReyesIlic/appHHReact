@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
-import { CloudDownload, BookPlus, RefreshCw, Sparkles } from "lucide-react";
-import { getSyncStatus, syncDiscoverNew, syncNew, syncBackfillWiki } from "../../lib/api.js";
+import { CloudDownload, BookPlus, RefreshCw, Sparkles, Trophy } from "lucide-react";
+import { getSyncStatus, syncDiscoverNew, syncNew, syncBackfillWiki, discoverGanadasPendientes, syncGanadas } from "../../lib/api.js";
 import { Button } from "../shared/Button.jsx";
 import { Card } from "../shared/Card.jsx";
 import { Input } from "../shared/Field.jsx";
@@ -8,9 +8,11 @@ import { Input } from "../shared/Field.jsx";
 export function SyncPanel({ onChanged }) {
   const [status, setStatus] = useState(null);
   const [newPreview, setNewPreview] = useState(null);
+  const [ganadasPreview, setGanadasPreview] = useState(null);
   const [busy, setBusy] = useState(false);
   const [log, setLog] = useState([]);
   const [backfillLimit, setBackfillLimit] = useState("");
+  const [ganadasLimit, setGanadasLimit] = useState("");
 
   const refresh = async () => {
     try {
@@ -35,6 +37,47 @@ export function SyncPanel({ onChanged }) {
       push(`🔎 SharePoint: ${r.sharepoint_total} totales · ${r.new_count} nuevos`);
     } catch (exc) {
       push(`❌ discover: ${exc.message}`);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const handleDiscoverGanadas = async () => {
+    setBusy(true);
+    try {
+      const r = await discoverGanadasPendientes();
+      setGanadasPreview(r);
+      push(`🏆 Ganadas master: ${r.total_ganadas_master} totales · ${r.pendientes_rag_count} sin RAG · ${r.pendientes_wiki_count} sin Wiki`);
+    } catch (exc) {
+      push(`❌ ganadas: ${exc.message}`);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const handleSyncGanadas = async () => {
+    if (!ganadasPreview || ganadasPreview.pendientes_rag_count === 0) return;
+    const total = ganadasPreview.pendientes_rag_count;
+    const limit = parseInt(ganadasLimit || "10", 10) || 10;
+    const target = Math.min(limit, total);
+    const cost = (target * 0.0015).toFixed(2);
+    if (!confirm(
+      `Sincronizar ${target} propuestas GANADAS pendientes?\n\n` +
+      `→ Descargará PDFs desde SharePoint (carpeta 03 Oferta/02 Emitido)\n` +
+      `→ Indexará en RAG\n` +
+      `→ Compilará página Wiki con LLM\n\n` +
+      `Costo estimado: ~$${cost} USD. Tiempo: ~${Math.ceil(target * 25 / 60)} min.`
+    )) return;
+    setBusy(true);
+    push(`🏆 sincronizando ${target} ganadas pendientes…`);
+    try {
+      const r = await syncGanadas(target);
+      push(`✅ ganadas: ingested=${r.ingested} wiki_ok=${r.wiki_ok} no_pdf=${r.skipped} errors=${r.errors}`);
+      setGanadasPreview(null);
+      await refresh();
+      onChanged?.();
+    } catch (exc) {
+      push(`❌ sync-ganadas: ${exc.message}`);
     } finally {
       setBusy(false);
     }
@@ -91,9 +134,53 @@ export function SyncPanel({ onChanged }) {
       }
     >
       <div className="flex-col" style={{ gap: 12 }}>
+        {/* Bloque principal: ganadas nuevas en master */}
+        <div
+          style={{
+            padding: 12,
+            background: "var(--bg-alt)",
+            borderRadius: 8,
+            border: "1px solid var(--accent-soft)",
+            borderLeft: "3px solid var(--accent)",
+          }}
+        >
+          <div className="card-title" style={{ fontSize: 13, marginBottom: 4, display: "flex", alignItems: "center", gap: 6 }}>
+            <Trophy size={14} style={{ color: "var(--accent)" }} />
+            Propuestas ganadas nuevas (recomendado)
+          </div>
+          <small className="dim" style={{ display: "block", marginBottom: 10 }}>
+            Detecta propuestas en estado <b>PG</b> en master que aún no están indexadas, descarga sus PDFs de SharePoint y las alimenta al sistema (RAG + Wiki). Sin cron automático — bajo demanda.
+          </small>
+          <div className="flex-row" style={{ flexWrap: "wrap", gap: 8, alignItems: "center" }}>
+            <Button variant="primary" icon={Trophy} onClick={handleDiscoverGanadas} disabled={busy}>
+              Detectar ganadas pendientes
+            </Button>
+            {ganadasPreview && ganadasPreview.pendientes_rag_count > 0 && (
+              <>
+                <Input
+                  placeholder={`Límite (default 10, total ${ganadasPreview.pendientes_rag_count})`}
+                  value={ganadasLimit}
+                  onChange={(e) => setGanadasLimit(e.target.value)}
+                  style={{ width: 240 }}
+                />
+                <Button variant="accent" icon={Sparkles} onClick={handleSyncGanadas} disabled={busy}>
+                  Sincronizar {Math.min(parseInt(ganadasLimit || "10", 10) || 10, ganadasPreview.pendientes_rag_count)} ganadas
+                </Button>
+              </>
+            )}
+          </div>
+          {ganadasPreview && (
+            <small className="dim" style={{ display: "block", marginTop: 8 }}>
+              {ganadasPreview.total_ganadas_master} ganadas en master · {ganadasPreview.ya_indexadas_rag} con RAG · {ganadasPreview.ya_compiladas_wiki} con Wiki ·{" "}
+              <b>{ganadasPreview.pendientes_rag_count} pendientes</b>
+            </small>
+          )}
+        </div>
+
+        {/* Bloque legacy: barrido amplio de SharePoint */}
         <div className="flex-row" style={{ flexWrap: "wrap", gap: 8 }}>
-          <Button variant="primary" icon={CloudDownload} onClick={handleDiscover} disabled={busy}>
-            Detectar nuevas en SharePoint
+          <Button variant="ghost" icon={CloudDownload} onClick={handleDiscover} disabled={busy}>
+            Detectar todas las carpetas SharePoint (legacy)
           </Button>
           {newPreview && newPreview.new_count > 0 && (
             <>
