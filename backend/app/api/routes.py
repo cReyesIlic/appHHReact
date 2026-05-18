@@ -222,7 +222,18 @@ def proposal_support_advice(request: ProposalSupportRequest) -> dict:
 def master_refresh() -> dict:
     repo = MasterRepository()
     count = repo.refresh_from_excel()
-    return {"rows_loaded": count}
+    payload: dict = {"rows_loaded": count}
+    # Reporte por email — best effort
+    try:
+        from app.services.email_client import EmailClient
+        from app.services.ingestion_reporter import master_refresh_report
+        email = EmailClient()
+        if email.configured:
+            subject, text, html = master_refresh_report(count)
+            payload["email"] = email.send(subject, text, html)
+    except Exception as exc:  # noqa: BLE001
+        payload["email"] = {"sent": False, "reason": f"{type(exc).__name__}: {exc}"}
+    return payload
 
 
 @router.get("/sharepoint/pdfs/{code}")
@@ -321,11 +332,157 @@ async def sync_new(limit: int = 20, force_wiki: bool = False) -> dict:
 
 @router.post("/sync/code/{codigo}")
 async def sync_code(codigo: str, force_wiki: bool = False) -> dict:
+    codigo = (codigo or "").strip().upper()
+    if not codigo:
+        raise HTTPException(status_code=400, detail="Código vacío")
+    if not codigo.startswith("O-"):
+        raise HTTPException(status_code=400, detail=f"Código '{codigo}' inválido: debe empezar con 'O-' (ej. O-2658)")
     svc = ProposalSyncService()
     try:
-        return await svc.sync_code(codigo, force_wiki=force_wiki)
+        result = await svc.sync_code(codigo, force_wiki=force_wiki)
     except Exception as exc:
-        raise HTTPException(status_code=502, detail=str(exc)) from exc
+        raise HTTPException(status_code=502, detail=f"SharePoint/indexer: {exc}") from exc
+    # Si el sync devolvió error interno (no_files, indexing, etc) lo dejamos como 200 con status,
+    # para que el frontend muestre el detalle estructurado. Solo errores 5xx van como HTTP error.
+    return result
+
+
+# ---- Ingesta puntual + email admin ----
+
+
+@router.post("/ingest/upload")
+async def ingest_upload(
+    file: UploadFile = File(...),
+    kind: str = "pdf",
+    target: str = "rag",
+) -> dict:
+    """Sube un archivo individual (PDF/DOCX/XLSX) y reporta por email.
+
+    `target` puede ser 'rag' (indexa al store), 'master' (recarga master Excel) o 'inspect' (solo extrae texto).
+    """
+    from app.services.email_client import EmailClient
+    from app.services.ingestion_reporter import upload_report
+    from app.services.master_repository import MasterRepository
+
+    raw = await file.read()
+    filename = file.filename or "archivo.bin"
+    kind = (kind or filename.rsplit(".", 1)[-1] if "." in filename else kind).lower()
+
+    chars = 0
+    rows_loaded = None
+    try:
+        svc = ProposalSyncService()
+        text = svc._extract_text_any(raw, kind, filename)
+        chars = len(text or "")
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=400, detail=f"No se pudo extraer texto: {exc}")
+
+    if target == "master" and kind in {"xlsx", "xls"}:
+        master_path = settings.resolve_path(settings.master_path or "storage/master.xlsx")
+        master_path.parent.mkdir(parents=True, exist_ok=True)
+        master_path.write_bytes(raw)
+        rows_loaded = MasterRepository().refresh_from_excel()
+
+    response = {
+        "filename": filename,
+        "kind": kind,
+        "chars_extracted": chars,
+        "target": target,
+    }
+    if rows_loaded is not None:
+        response["rows_loaded"] = rows_loaded
+    try:
+        email = EmailClient()
+        if email.configured:
+            subject, text_body, html = upload_report(filename, kind, chars, target)
+            response["email"] = email.send(subject, text_body, html)
+    except Exception as exc:  # noqa: BLE001
+        response["email"] = {"sent": False, "reason": f"{type(exc).__name__}: {exc}"}
+    return response
+
+
+# ---- Entregables (HH licitadas local + reales staffing) ----
+
+
+@router.get("/entregables/stats")
+def entregables_stats() -> dict:
+    from app.services.entregables_repository import EntregablesRepository
+    return EntregablesRepository().stats()
+
+
+@router.get("/entregables/disciplinas")
+def entregables_disciplinas(limit: int = 50) -> dict:
+    from app.services.entregables_repository import EntregablesRepository
+    return {"disciplinas": EntregablesRepository().list_disciplines(limit=limit)}
+
+
+@router.get("/entregables/aggregate")
+async def entregables_aggregate(
+    fuente: str = "licitadas",
+    view: str = "proyecto",
+    codigo: str | None = None,
+    cliente: str | None = None,
+    disciplina: str | None = None,
+    text: str | None = None,
+    min_hours: float = 0.0,
+    ano: int | None = None,
+    limit: int = 100,
+) -> dict:
+    """Pivot de entregables. fuente=licitadas|reales · view=proyecto|disciplina|role|entregable|persona."""
+    from app.services.entregables_repository import EntregablesRepository
+    repo = EntregablesRepository()
+    if fuente == "reales":
+        return await repo.aggregate_reales(view=view, codigo=codigo, disciplina=disciplina, text=text, ano=ano, top=limit)
+    return repo.aggregate_licitadas(
+        view=view, codigo=codigo, cliente=cliente, disciplina=disciplina, text=text, min_hours=min_hours, limit=limit,
+    )
+
+
+@router.post("/entregables/ask")
+async def entregables_ask(payload: dict) -> dict:
+    """Sub-agente conversacional de entregables. Body: {question, codigo?, tipo_servicio?}."""
+    from app.services.entregables_agent import EntregablesAgent
+    question = (payload.get("question") or "").strip()
+    if not question:
+        raise HTTPException(status_code=400, detail="Falta 'question'")
+    return await EntregablesAgent().ask(
+        question=question,
+        codigo=payload.get("codigo"),
+        tipo_servicio=payload.get("tipo_servicio"),
+    )
+
+
+@router.get("/admin/scheduler/status")
+def admin_scheduler_status() -> dict:
+    """Estado del scheduler embebido (próxima corrida, última ejecución)."""
+    from app.services.scheduler import scheduler_status
+    return scheduler_status()
+
+
+@router.post("/admin/scheduler/trigger")
+async def admin_scheduler_trigger(payload: dict | None = None) -> dict:
+    """Dispara un job ahora (no espera al cron). Body: {job: 'sync_ganadas'|'master_refresh'}."""
+    from app.services.scheduler import trigger_now
+    payload = payload or {}
+    return await trigger_now(payload.get("job", "sync_ganadas"))
+
+
+@router.post("/admin/email-test")
+def admin_email_test(payload: dict | None = None) -> dict:
+    """Envía un email de prueba para verificar ACS. Body opcional: {to: [...], subject: '...', body: '...'}."""
+    from app.services.email_client import EmailClient
+    payload = payload or {}
+    email = EmailClient()
+    if not email.configured:
+        return {
+            "configured": False,
+            "reason": "Define ACS_CONNECTION_STRING y ACS_SENDER_ADDRESS en variables de entorno",
+        }
+    subject = payload.get("subject") or "SHIMIN · Test de Azure Communication Services"
+    body = payload.get("body") or "Este es un email de prueba enviado desde la app SHIMIN (Proposal Intelligence)."
+    html = f"<p>{body}</p><p style='color:#5f747d;font-size:12px;'>Si recibiste este correo, ACS está bien configurado.</p>"
+    result = email.send(subject, body, html, to=payload.get("to"))
+    return {"configured": True, **result}
 
 
 @router.post("/sync/backfill-wiki")

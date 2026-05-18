@@ -32,6 +32,8 @@ from pathlib import Path
 from app.core.config import settings
 from app.rag.hybrid_store import HybridRagStore
 from app.rag.parent_child import ParentChildIndexer
+from app.services.email_client import EmailClient
+from app.services.ingestion_reporter import ganadas_sync_report
 from app.services.knowledge_extractor import KnowledgeExtractor
 from app.services.knowledge_models import ProposalMetadata
 from app.services.master_repository import MasterRepository
@@ -146,7 +148,7 @@ class ProposalSyncService:
             counters.by_code.append({**outcome, "titulo": ganada.get("titulo"), "cliente": ganada.get("cliente")})
             if outcome["status"] == "ok":
                 counters.ingested += 1
-            elif outcome["status"] in {"skipped", "no_pdf"}:
+            elif outcome["status"] in {"skipped", "no_pdf", "no_files"}:
                 counters.skipped += 1
             else:
                 counters.errors += 1
@@ -156,7 +158,7 @@ class ProposalSyncService:
                 counters.wiki_no_rag += 1
             elif outcome.get("wiki_status") == "error":
                 counters.wiki_error += 1
-        return {
+        summary = {
             "scope": "ganadas_master_pendientes",
             "total_ganadas_master": gap["total_ganadas_master"],
             "ya_indexadas": gap["ya_indexadas_rag"],
@@ -169,6 +171,18 @@ class ProposalSyncService:
             "wiki_error": counters.wiki_error,
             "details": counters.by_code,
         }
+        # Reporte por email — best effort, no rompe el sync si falla
+        try:
+            email = EmailClient()
+            if email.configured:
+                subject, text, html = ganadas_sync_report(summary, kind="ganadas")
+                send_result = email.send(subject, text, html)
+                summary["email"] = send_result
+            else:
+                summary["email"] = {"sent": False, "reason": "ACS no configurado"}
+        except Exception as exc:  # noqa: BLE001
+            summary["email"] = {"sent": False, "reason": f"{type(exc).__name__}: {exc}"}
+        return summary
 
     async def discover_new(self, limit: int = 200) -> dict:
         """Lista códigos en SharePoint que aún NO están indexados en RAG parent_child.
@@ -310,7 +324,7 @@ class ProposalSyncService:
             counters.by_code.append(outcome)
             if outcome["status"] == "ok":
                 counters.ingested += 1
-            elif outcome["status"] in {"skipped", "no_pdf"}:
+            elif outcome["status"] in {"skipped", "no_pdf", "no_files"}:
                 counters.skipped += 1
             else:
                 counters.errors += 1

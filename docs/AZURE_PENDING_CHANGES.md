@@ -2,7 +2,7 @@
 
 > Este documento se actualiza CADA VEZ que se agrega una funcionalidad nueva que requiere ajustes en el deploy a Azure (mounts, env vars, endpoints, sync, permisos, dependencias). Usar como checklist al hacer release.
 
-Última actualización: 2026-05-13
+Última actualización: 2026-05-14
 
 ---
 
@@ -12,12 +12,32 @@
 |---|---|---|---|
 | `STAFFING_API_URL` | `https://staffing-shimin-dgedc6cachagg8fx.eastus2-01.azurewebsites.net` | `app/services/staffing_client.py` | **PENDIENTE en Azure** (ya en `.env` local) |
 | `STAFFING_API_KEY` / `EXTERNAL_API_KEY` | (key del staffing app) | tools de staffing | **PENDIENTE en Azure** (ya en `.env` local) |
+| `ACS_CONNECTION_STRING` | `endpoint=https://<acs>.communication.azure.com/;accesskey=...` | `services/email_client.py` (reportes ingesta) | **PENDIENTE** — crear recurso Azure Communication Services |
+| `ACS_SENDER_ADDRESS` | `DoNotReply@<dominio-acs>.azurecomm.net` (o dominio custom verificado) | `services/email_client.py` | **PENDIENTE** |
+| `EMAIL_REPORT_RECIPIENTS` | CSV: `cri.reyes@shimin.cl,otro@shimin.cl` | destinatarios por defecto de reportes | **PENDIENTE** |
+| `HH_EXCEL_SOURCE` | `storage/emitted_offer_assets/excel` (default) o `blob://<container>/<prefix>` | path adaptable de Excels HH licitadas | opcional |
+| `HH_EXCEL_CACHE_DIR` | `storage/hh_excel_ingestion` (default) | cache si HH_EXCEL_SOURCE es blob | opcional |
 
 Comando para aplicar a App Service:
 ```bash
 az webapp config appsettings set -n apphhshimin -g <RG> --settings \
   STAFFING_API_URL="https://staffing-shimin-dgedc6cachagg8fx.eastus2-01.azurewebsites.net" \
-  EXTERNAL_API_KEY="<paste>"
+  EXTERNAL_API_KEY="<paste>" \
+  ACS_CONNECTION_STRING="endpoint=https://<acs>.communication.azure.com/;accesskey=<paste>" \
+  ACS_SENDER_ADDRESS="DoNotReply@<dominio-acs>.azurecomm.net" \
+  EMAIL_REPORT_RECIPIENTS="cri.reyes@shimin.cl"
+```
+
+Crear recurso Azure Communication Services + dominio email:
+```bash
+az communication create -n shimin-acs -g <RG> -l global --data-location southamerica
+az communication email create -n shimin-email -g <RG> -l global --data-location southamerica
+az communication email domain create --domain-name AzureManagedDomain --email-service-name shimin-email -g <RG> --location global --domain-management AzureManaged
+az communication email domain sender-username create --domain-name AzureManagedDomain --email-service-name shimin-email -g <RG> --sender-username DoNotReply
+# Linkear el dominio al ACS:
+az communication linked-domain create --communication-service-name shimin-acs -g <RG> --linked-domain <resource-id-domain>
+# Obtener connection string:
+az communication list-key -n shimin-acs -g <RG>
 ```
 
 > Las credenciales SharePoint (`TENANT_ID`, `CLIENT_ID`, `CLIENT_SECRET`) ya estaban en Azure App Settings de la versión Streamlit y se reutilizan. Verificar que el App Registration `0104b363-...` tenga el permiso `Sites.Read.All` (Graph) consentido por admin del tenant SHIMIN.
@@ -64,6 +84,14 @@ No hace falta crear shares nuevos, pero **asegurar que `storage/proposal_drafts/
 - `POST /api/library/search`, `POST /api/wiki/entries/{id}/validate`
 - `GET /api/exports/file/{filename}` (descarga de archivos generados por agente)
 
+### Ingesta + reportes email (nuevos 2026-05-14) ✅
+| Endpoint | Propósito |
+|---|---|
+| `POST /api/ingest/upload` (multipart) | Sube PDF/DOCX/XLSX individual, extrae texto, envía reporte por email |
+| `POST /api/admin/email-test` | Verifica configuración ACS — envía email de prueba (body opcional `{to,subject,body}`) |
+| `POST /api/master/refresh` | Ahora envía email tras refrescar el Excel master |
+| `POST /api/sync/ganadas` | Ahora envía email con resumen ingestadas/errores tras la corrida |
+
 ---
 
 ## 4. Tablas SQLite nuevas
@@ -88,6 +116,8 @@ Schema generado al arrancar (idempotente, `if not exists`):
 | `python-docx` | 1.1.2 | extraer texto de DOCX | ✅ ya en `requirements.txt` |
 | `PyPDF2` | 3.0.1 | extraer texto de PDF | ✅ |
 | `python-multipart` | 0.0.20 | upload de archivos a FastAPI | ✅ **agregado** |
+| `azure-communication-email` | 1.0.0 | enviar reportes de ingesta por email | ✅ **agregado** |
+| `APScheduler` | 3.10.4 | scheduler embebido (cron sin GitHub Actions) | ✅ **agregado** |
 | `python-docx`, `reportlab`, `xlsxwriter` | varias | exports con formato SHIMIN | ✅ |
 
 Tras agregar deps, rebuild de imagen Docker:
@@ -149,13 +179,32 @@ Total: **8 skills** cargadas. Cualquier `.md` nuevo en `backend/app/skills/<name
 
 ---
 
-## 9. Cron diario (GitHub Actions, gratis)
+## 9. Scheduler embebido (APScheduler dentro del backend) — **app autónoma**
 
-Workflow `.github/workflows/sync-daily.yml` ✅ con cron `0 5 * * *` (02:00 hora Chile). Pasos:
-1. `POST /api/sync/new?limit=50` — detecta + ingesta nuevas propuestas SharePoint
-2. `POST /api/master/refresh` — refresca master desde Excel
-3. `POST /api/sync/backfill-wiki` — completa páginas wiki faltantes
-4. `GET /api/sync/status` — verificación final
+Ya **NO usamos GitHub Actions**. El scheduler corre dentro del mismo proceso uvicorn (`backend/app/services/scheduler.py`), arrancado en el `@app.on_event("startup")` de `main.py`. La app es autónoma: sube a Azure App Service y el cron vive ahí.
+
+Jobs registrados:
+1. **`sync_ganadas_periodic`** — cron `day=*/2 hour=2 minute=15` (cada 2 días, 02:15 hora Chile)
+   → `ProposalSyncService.sync_ganadas(limit=20)` → email de resumen
+2. **`master_refresh_daily`** — cron `hour=2 minute=10` (diario, 02:10 hora Chile)
+   → `MasterRepository.refresh_from_excel()` → email si hubo cambios
+
+Configuración via App Settings (todos opcionales con default razonable):
+
+| Variable | Default | Propósito |
+|---|---|---|
+| `SYNC_SCHEDULE_ENABLED` | `true` | Apagar el scheduler (útil para staging) |
+| `SYNC_SCHEDULE_EVERY_DAYS` | `2` | Cada cuántos días corre `sync_ganadas` |
+| `SYNC_SCHEDULE_HOUR` | `2` | Hora local del trigger |
+| `SYNC_SCHEDULE_MINUTE` | `15` | Minuto local |
+| `SYNC_SCHEDULE_LIMIT` | `20` | Máximo de propuestas por corrida |
+| `SYNC_SCHEDULE_TZ` | `America/Santiago` | Zona horaria IANA |
+
+Control desde la API:
+- `GET /api/admin/scheduler/status` — próxima corrida + última ejecución
+- `POST /api/admin/scheduler/trigger` body `{"job":"sync_ganadas"}` — disparar ahora
+
+> **Importante para Azure App Service**: con plan B1/B2 conviene activar **Always On** en la configuración del App Service (Settings → Configuration → General settings → Always On = ON). Sin eso, el container se duerme tras 20 min de inactividad y el scheduler se detiene hasta el siguiente request. Con Always On, el proceso uvicorn vive 24/7 y el cron dispara aunque nadie use la app.
 
 Política opcional pendiente: limpiar drafts inactivos >90 días (TBD).
 
@@ -229,3 +278,10 @@ Antes de hacer `git push` + `az acr build`:
 | 2026-05-13 | Importación de antecedentes desde SharePoint (`01 Informacion Cliente` de O-XXXX) |
 | 2026-05-13 | Tools del agente para drafts: `list_my_drafts`, `get_draft_context`, `search_draft_chunks`, `import_draft_from_sharepoint` |
 | 2026-05-13 | Skill `armar_propuesta` detecta draft activo y lo combina con master/RAG/staffing |
+| 2026-05-14 | Reportes de ingesta por email via Azure Communication Services (`services/email_client.py` + `ingestion_reporter.py`) |
+| 2026-05-14 | Endpoints `/api/ingest/upload`, `/api/admin/email-test` para ingesta puntual + verificación ACS |
+| 2026-05-14 | `sync_ganadas` y `master/refresh` envían reporte HTML al finalizar (best-effort, no rompen si ACS no está configurado) |
+| 2026-05-14 | **Scheduler embebido APScheduler** dentro del backend — eliminado `sync-daily.yml` (GitHub Actions). App autónoma con cron en mismo proceso uvicorn. Endpoints `/api/admin/scheduler/{status,trigger}` |
+| 2026-05-14 | Vista **Entregables / HH** (sidenav) — pivots por proyecto/disciplina/rol/entregable/persona sobre `hh_estimate_rows` (licitadas locales) + `StaffingClient.analisis_hh` (reales). Filtro plausibilidad (`confidence ≥ 0.65`, `0 < hours ≤ 20000`). |
+| 2026-05-14 | **Sub-agente `EntregablesAgent`** — `/api/entregables/ask` adapta respuesta a tipo_servicio (IP/IC/IB/ID). Detecta código y consulta licitadas + reales según pregunta. |
+| 2026-05-14 | Setting `HH_EXCEL_SOURCE` + `HH_EXCEL_CACHE_DIR` — path adaptable (local hoy, `blob://...` mañana) sin tocar código. |

@@ -47,6 +47,13 @@ class Settings(BaseSettings):
     blob_name: str | None = Field(default=None, alias="BLOB_NAME")
     connection_to_pdf: str | None = Field(default=None, alias="CONNECTION_TO_PDF")
 
+    # Fuente de Excels de HH licitadas. Acepta:
+    #   - path local relativo o absoluto (ej. "storage/emitted_offer_assets/excel")
+    #   - "blob://<container>/<prefix>"  → se baja a cache temporal antes de leer
+    # Por defecto usa el cache local; si en el futuro migran a blob, basta con cambiar el env var.
+    hh_excel_source: str = Field(default="storage/emitted_offer_assets/excel", alias="HH_EXCEL_SOURCE")
+    hh_excel_cache_dir: str = Field(default="storage/hh_excel_ingestion", alias="HH_EXCEL_CACHE_DIR")
+
     liteparse_function_url: str | None = Field(default=None, alias="LITEPARSE_FUNCTION_URL")
     rag_endpoint: str | None = Field(default=None, alias="RAG_ENDPOINT")
     rag_api_key: str | None = Field(default=None, alias="RAG_API_KEY")

@@ -15,9 +15,43 @@ function resolveApiBase() {
 
 const API_BASE = resolveApiBase();
 
+export class ApiError extends Error {
+  constructor(message, { status, detail, path } = {}) {
+    super(message);
+    this.name = "ApiError";
+    this.status = status;
+    this.detail = detail;
+    this.path = path;
+  }
+}
+
 async function jsonFetch(path, options = {}) {
-  const response = await fetch(`${API_BASE}${path}`, options);
-  if (!response.ok) throw new Error(await response.text());
+  let response;
+  try {
+    response = await fetch(`${API_BASE}${path}`, options);
+  } catch (exc) {
+    // Network-level (CORS, offline, DNS)
+    throw new ApiError(`Sin conexión con el backend (${exc.message})`, { status: 0, path });
+  }
+  if (!response.ok) {
+    const raw = await response.text();
+    let detail = raw;
+    try {
+      const parsed = JSON.parse(raw);
+      detail = parsed.detail || parsed.message || parsed.error || raw;
+    } catch {
+      /* texto plano */
+    }
+    const friendly =
+      response.status === 404 ? `No encontrado: ${detail}` :
+      response.status === 401 ? "No autenticado — vuelve a iniciar sesión" :
+      response.status === 403 ? "Sin permisos para esta acción" :
+      response.status === 502 ? `Error del proveedor externo: ${detail}` :
+      response.status === 504 ? "Timeout — el sync tardó demasiado, vuelve a intentar con menos elementos" :
+      response.status >= 500 ? `Error del servidor (${response.status}): ${detail}` :
+      detail;
+    throw new ApiError(friendly, { status: response.status, detail, path });
+  }
   return response.json();
 }
 
@@ -199,6 +233,65 @@ export function discoverGanadasPendientes() {
 
 export function syncGanadas(limit = 10) {
   return jsonFetch(`/api/sync/ganadas?limit=${limit}`, { method: "POST" });
+}
+
+export async function ingestUpload(file, { kind = null, target = "rag" } = {}) {
+  const form = new FormData();
+  form.append("file", file);
+  const inferredKind = kind || (file.name.includes(".") ? file.name.split(".").pop().toLowerCase() : "pdf");
+  const url = `${API_BASE}/api/ingest/upload?kind=${encodeURIComponent(inferredKind)}&target=${encodeURIComponent(target)}`;
+  const response = await fetch(url, { method: "POST", body: form });
+  if (!response.ok) throw new Error(await response.text());
+  return response.json();
+}
+
+export function adminEmailTest(payload = {}) {
+  return jsonFetch("/api/admin/email-test", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+}
+
+export function getSchedulerStatus() {
+  return jsonFetch("/api/admin/scheduler/status");
+}
+
+export function triggerScheduler(job = "sync_ganadas") {
+  return jsonFetch("/api/admin/scheduler/trigger", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ job }),
+  });
+}
+
+// ---- Entregables (HH licitadas + reales) ----
+
+export function getEntregablesStats() {
+  return jsonFetch("/api/entregables/stats");
+}
+
+export function getEntregablesDisciplinas(limit = 50) {
+  return jsonFetch(`/api/entregables/disciplinas?limit=${limit}`);
+}
+
+export function getEntregablesAggregate({ fuente = "licitadas", view = "proyecto", codigo, cliente, disciplina, text, min_hours, ano, limit = 100 } = {}) {
+  const params = new URLSearchParams({ fuente, view, limit: String(limit) });
+  if (codigo) params.set("codigo", codigo);
+  if (cliente) params.set("cliente", cliente);
+  if (disciplina) params.set("disciplina", disciplina);
+  if (text) params.set("text", text);
+  if (min_hours) params.set("min_hours", String(min_hours));
+  if (ano) params.set("ano", String(ano));
+  return jsonFetch(`/api/entregables/aggregate?${params.toString()}`);
+}
+
+export function askEntregablesAgent(payload) {
+  return jsonFetch("/api/entregables/ask", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  });
 }
 
 export function librarySearch(payload) {

@@ -1,9 +1,10 @@
-import { MessageSquare, Table, BookOpen, FilePlus, Settings as Cog } from "lucide-react";
+import { MessageSquare, Table, BookOpen, FilePlus, Clock, Settings as Cog } from "lucide-react";
 import { Brand } from "./Brand.jsx";
 
 const ITEMS = [
   { key: "chat", label: "Chat", icon: MessageSquare },
   { key: "master", label: "Master", icon: Table },
+  { key: "entregables", label: "Entregables / HH", icon: Clock },
   { key: "library", label: "Wiki / Librería", icon: BookOpen },
   { key: "drafts", label: "Propuestas en armado", icon: FilePlus },
 ];
