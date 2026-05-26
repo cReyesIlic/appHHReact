@@ -35,14 +35,17 @@ jobs:
         with:
           creds: ${{ secrets.AZURE_CREDENTIALS }}
 
-      - name: ACR build & push
+      - name: Docker build & push
         run: |
-          az acr build \
-            --registry $ACR_NAME \
-            --image $IMAGE_NAME:${{ steps.tag.outputs.tag }} \
-            --image $IMAGE_NAME:latest \
-            --file $WORKDIR/Dockerfile \
+          az acr login --name $ACR_NAME
+          IMAGE_URI=$ACR_NAME.azurecr.io/$IMAGE_NAME
+          docker build \
+            -t $IMAGE_URI:${{ steps.tag.outputs.tag }} \
+            -t $IMAGE_URI:latest \
+            -f $WORKDIR/Dockerfile \
             $WORKDIR
+          docker push $IMAGE_URI:${{ steps.tag.outputs.tag }}
+          docker push $IMAGE_URI:latest
 
       - name: Update web app to new image
         run: |
