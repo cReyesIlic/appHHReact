@@ -14,6 +14,8 @@ env:
   ACR_NAME: apphshimin
   IMAGE_NAME: shimin-backend
   WORKDIR: backend
+  SMOKE_TEST_CODIGO: O-0274
+  SMOKE_TEST_MIN_FILAS: "1"
 
 jobs:
   build-and-deploy:
@@ -71,6 +73,33 @@ jobs:
           done
           echo "Health check failed after 30 attempts" >&2
           exit 1
+
+      - name: Smoke test extract-budget end-to-end
+        run: |
+          set -eo pipefail
+          HOST=$(az webapp show -g $RG -n $APP_SERVICE --query defaultHostName -o tsv)
+          BACKEND="https://$HOST"
+          CODIGO="${SMOKE_TEST_CODIGO}"
+          echo "POST $BACKEND/api/entregables/extract-budget/$CODIGO (idempotente)"
+          response=$(curl -sS -X POST --max-time 540 "$BACKEND/api/entregables/extract-budget/$CODIGO" -H 'Content-Type: application/json')
+          echo "$response" | python -m json.tool 2>/dev/null | head -80 || echo "$response" | head -800
+          if echo "$response" | grep -qiE '"detail":\s*"[^"]'; then
+            echo "::error::Extract returned an error detail"
+            exit 1
+          fi
+
+          echo ""
+          echo "GET $BACKEND/api/entregables/extracted/$CODIGO"
+          extracted=$(curl -sS --max-time 60 "$BACKEND/api/entregables/extracted/$CODIGO")
+          n_filas=$(echo "$extracted" | python -c "import json,sys; print(len(json.load(sys.stdin).get('filas') or []))")
+          n_gastos=$(echo "$extracted" | python -c "import json,sys; print(len(json.load(sys.stdin).get('gastos') or []))")
+          n_audit=$(echo "$extracted" | python -c "import json,sys; print(len(json.load(sys.stdin).get('audit') or []))")
+          echo "Persisted: $n_filas filas, $n_gastos gastos, $n_audit audit"
+          if [ "$n_filas" -lt "$SMOKE_TEST_MIN_FILAS" ]; then
+            echo "::error::Expected at least $SMOKE_TEST_MIN_FILAS filas but got $n_filas"
+            exit 1
+          fi
+          echo "::notice::Smoke test passed for $CODIGO ($n_filas filas + $n_gastos gastos)"
 
       - name: Azure logout
         if: always()
