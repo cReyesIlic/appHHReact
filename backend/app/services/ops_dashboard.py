@@ -82,6 +82,94 @@ class OpsDashboardService:
             "generated_at": datetime.now().isoformat(timespec="seconds"),
         }
 
+    def build_coverage(self, estado: str | None = "PG", limit: int = 5000) -> dict[str, Any]:
+        master_rows = MasterRepository().all_offers()
+        manifest_rows = self._read_manifest()
+        manifest_by_code = {self._code(row.get("codigo")): row for row in manifest_rows if self._code(row.get("codigo"))}
+
+        codes_in_rag: set[str] = set()
+        codes_with_hh: set[str] = set()
+        if settings.sqlite_path.exists():
+            with sqlite3.connect(settings.sqlite_path) as conn:
+                available = {
+                    row[0]
+                    for row in conn.execute("select name from sqlite_master where type='table'").fetchall()
+                }
+                if "rag_child_chunks" in available:
+                    codes_in_rag = {
+                        self._code(row[0])
+                        for row in conn.execute("select distinct codigo from rag_child_chunks where codigo is not null").fetchall()
+                    }
+                if "hh_estimate_rows" in available:
+                    codes_with_hh = {
+                        self._code(row[0])
+                        for row in conn.execute("select distinct codigo from hh_estimate_rows where codigo is not null").fetchall()
+                    }
+                if "proyectos_extracted" in available:
+                    codes_with_hh |= {
+                        self._code(row[0])
+                        for row in conn.execute("select distinct codigo from proyectos_extracted where codigo is not null").fetchall()
+                    }
+
+        recent_cutoff = datetime.now() - timedelta(days=60)
+        estado_norm = (estado or "").strip().upper()
+        rows: list[dict[str, Any]] = []
+        for row in master_rows:
+            code = self._code(row.get("codigo"))
+            if not code:
+                continue
+            row_estado = str(row.get("estado", "")).strip().upper()
+            if estado_norm and row_estado != estado_norm:
+                continue
+            manifest = manifest_by_code.get(code, {})
+            has_pdf = self._int(manifest.get("pdf_count")) > 0 or bool(manifest.get("selected_pdf_local"))
+            has_excel = self._int(manifest.get("excel_count")) > 0 or bool(manifest.get("selected_excel_local"))
+            for item in self._zip_assets(manifest.get("zip_assets")):
+                lower = str(item).lower()
+                has_pdf = has_pdf or lower.endswith(".pdf")
+                has_excel = has_excel or lower.endswith((".xlsx", ".xls", ".xlsm"))
+            manifest_updated = str(manifest.get("updated_at", "") or "")
+            is_recent = False
+            try:
+                if manifest_updated:
+                    ts = datetime.fromisoformat(manifest_updated[:19])
+                    is_recent = ts >= recent_cutoff
+            except ValueError:
+                is_recent = False
+            rows.append(
+                {
+                    "codigo": code,
+                    "cod_proy": str(row.get("cod_proy", "") or "").strip(),
+                    "titulo": row.get("titulo", ""),
+                    "cliente_final": row.get("cliente_final", ""),
+                    "estado": row_estado,
+                    "fecha_recep": row.get("fecha_recep", ""),
+                    "pdf": has_pdf,
+                    "excel": has_excel,
+                    "excel_parsed": code in codes_with_hh,
+                    "in_db": code in codes_in_rag,
+                    "updated_at": manifest_updated,
+                    "is_recent": is_recent,
+                }
+            )
+
+        rows.sort(key=lambda r: (r.get("updated_at") or "", self._date_key(r.get("fecha_recep")).isoformat()), reverse=True)
+        totals = {
+            "total": len(rows),
+            "with_pdf": sum(1 for r in rows if r["pdf"]),
+            "with_excel": sum(1 for r in rows if r["excel"]),
+            "excel_parsed": sum(1 for r in rows if r["excel_parsed"]),
+            "in_db": sum(1 for r in rows if r["in_db"]),
+            "incomplete": sum(1 for r in rows if not (r["pdf"] and r["excel"] and r["in_db"])),
+            "recent": sum(1 for r in rows if r["is_recent"]),
+        }
+        return {
+            "estado_filter": estado_norm or None,
+            "totals": totals,
+            "rows": rows[:limit],
+            "generated_at": datetime.now().isoformat(timespec="seconds"),
+        }
+
     def _read_manifest(self) -> list[dict[str, str]]:
         if not self.manifest_path.exists():
             return []

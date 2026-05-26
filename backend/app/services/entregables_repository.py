@@ -1,18 +1,13 @@
-"""Repositorio agregador para la vista "Entregables".
+"""Repositorio de entregables — usa la tabla `proyectos` (la real).
 
-Combina dos fuentes:
-  - **Licitadas (local)** — tabla `hh_estimate_rows` (185k filas extraídas de Excels de propuesta)
-  - **Reales (staffing)** — API externa, vía `StaffingClient`
+Esquema (`pragma table_info(proyectos)`):
+  - codigo (O-XXXX) · descripcion · clasificacion ("Actividad"|"Documento") · estado
+  - factor (multiplicador 1-160)
+  - **columnas de cargo con HH licitadas**: dc, pl, gl, jp, ji, jd, abim, cbim, ec,
+    cn, esp, ia, ib, ic, pa, pb, cp, cd, ce, i, c, db, pc
+  - FKs: tipo_id → tipo · id_area → area · id_actividad → actividad_main · categoria_reg_id → categoria_reg
 
-Soporta cuatro modos de pivote:
-  - by_proyecto    — agrupa por código de propuesta
-  - by_disciplina  — agrupa por disciplina
-  - by_role        — agrupa por rol/profesional (solo licitadas — el local NO tiene persona)
-  - by_entregable  — top entregables por horas
-  - by_persona     — solo en modo reales (delegamos a staffing)
-
-Path adaptable: lee `settings.hh_excel_source`. Hoy es path local; si en el futuro
-los Excels viven en blob, el setter solo cambia el env var y el extractor baja a cache.
+Cruzamos con `oferta` por codigo para traer cliente, título, tipo_servicio, estado, monto.
 """
 
 from __future__ import annotations
@@ -23,285 +18,229 @@ from typing import Any
 from app.core.config import settings
 
 
+# Columnas de la tabla `proyectos` que representan HH por cargo profesional.
+# DC/PL/GL están EXCLUIDOS — son flags de tipo de entregable (Documento/Plano/Actividad),
+# no cargos. Sumarlos infla los totales y duplica info de `clasificacion`.
+CARGOS = [
+    "jp", "ji", "jd", "abim", "cbim", "ec", "cn", "esp",
+    "ia", "ib", "ic", "pa", "pb", "cp", "cd", "ce", "i", "c", "db", "pc",
+]
+
+# Flags de tipo de entregable en la tabla `proyectos` (no son HH)
+TIPO_FLAGS = {"dc": "Documento", "pl": "Plano", "gl": "Actividad"}
+
+# Suma SQL de todos los cargos (HH totales de una fila)
+SUM_CARGOS_SQL = " + ".join(f"coalesce({c},0)" for c in CARGOS)
+
+
 class EntregablesRepository:
     def __init__(self) -> None:
         self.sqlite_path = settings.sqlite_path
 
-    # ---- agregaciones licitadas (DB local) ----
+    # ---- 1. Lista de proyectos con HH totales (para el selector) ----
 
-    def aggregate_licitadas(
-        self,
-        view: str = "proyecto",
-        codigo: str | None = None,
-        cliente: str | None = None,
-        disciplina: str | None = None,
-        text: str | None = None,
-        min_hours: float = 0.0,
-        limit: int = 100,
-    ) -> dict:
-        """Pivota `hh_estimate_rows`. `view` ∈ {proyecto, disciplina, role, entregable}."""
-        where, params = self._build_where(codigo=codigo, disciplina=disciplina, text=text, min_hours=min_hours)
-        join = ""
-        if cliente:
-            # Master tiene cliente; lo cruzamos para filtrar
-            join = "join master_offers m on m.codigo = h.codigo"
-            where.append("(m.cliente_directo like ? or m.cliente_final like ?)")
-            cli = f"%{cliente}%"
-            params.extend([cli, cli])
+    def listar_proyectos(self, query: str | None = None, limit: int = 500) -> dict:
+        """Devuelve cada proyecto con total HH, n° de entregables, cliente y servicio.
 
-        where_clause = (" where " + " and ".join(where)) if where else ""
+        Para el dropdown / selector. Filtra por código o texto en descripción si se da.
+        """
+        params: list[Any] = []
+        extra_where = ""
+        if query:
+            extra_where = "where p.codigo like ? or p.descripcion like ? or o.titulo like ? or o.cliente_directo like ?"
+            v = f"%{query}%"
+            params.extend([v, v, v, v])
 
-        if view == "proyecto":
-            sql = f"""
-                select h.codigo as key,
-                       count(*) as rows,
-                       sum(coalesce(h.hours,0)) as total_hours,
-                       sum(coalesce(h.amount,0)) as total_amount,
-                       count(distinct h.discipline) as disciplinas,
-                       count(distinct h.deliverable) as entregables,
-                       group_concat(distinct h.discipline) as disciplina_list
-                from hh_estimate_rows h
-                {join}
-                {where_clause}
-                group by h.codigo
-                order by total_hours desc
-                limit ?
-            """
-        elif view == "disciplina":
-            sql = f"""
-                select coalesce(nullif(h.discipline,''), '(sin disciplina)') as key,
-                       count(*) as rows,
-                       sum(coalesce(h.hours,0)) as total_hours,
-                       sum(coalesce(h.amount,0)) as total_amount,
-                       count(distinct h.codigo) as proyectos,
-                       count(distinct h.deliverable) as entregables
-                from hh_estimate_rows h
-                {join}
-                {where_clause}
-                group by coalesce(nullif(h.discipline,''), '(sin disciplina)')
-                order by total_hours desc
-                limit ?
-            """
-        elif view == "role":
-            sql = f"""
-                select coalesce(nullif(h.role,''), '(sin rol)') as key,
-                       count(*) as rows,
-                       sum(coalesce(h.hours,0)) as total_hours,
-                       sum(coalesce(h.amount,0)) as total_amount,
-                       count(distinct h.codigo) as proyectos
-                from hh_estimate_rows h
-                {join}
-                {where_clause}
-                group by coalesce(nullif(h.role,''), '(sin rol)')
-                order by total_hours desc
-                limit ?
-            """
-        elif view == "entregable":
-            sql = f"""
-                select coalesce(nullif(h.deliverable,''), nullif(h.activity,'')) as key,
-                       h.codigo as proyecto,
-                       h.discipline as disciplina,
-                       count(*) as rows,
-                       sum(coalesce(h.hours,0)) as total_hours,
-                       sum(coalesce(h.amount,0)) as total_amount
-                from hh_estimate_rows h
-                {join}
-                {where_clause}
-                group by h.codigo, coalesce(nullif(h.deliverable,''), nullif(h.activity,''))
-                having total_hours > 0
-                order by total_hours desc
-                limit ?
-            """
-        else:
-            return {"error": f"view '{view}' no soportada (usar proyecto|disciplina|role|entregable)"}
-
+        sql = f"""
+            select p.codigo,
+                   max(o.titulo) as titulo,
+                   max(coalesce(nullif(o.cliente_directo,'No data'), nullif(o.cliente_final,'No data'))) as cliente,
+                   max(nullif(o.tipo_servicio,'No data')) as tipo_servicio,
+                   max(o.estado) as estado,
+                   count(*) as entregables,
+                   sum(case when p.clasificacion='Documento' then 1 else 0 end) as documentos,
+                   sum(case when p.clasificacion='Actividad' then 1 else 0 end) as actividades,
+                   sum({SUM_CARGOS_SQL}) as total_hh
+            from proyectos p
+            left join oferta o on o.codigo = p.codigo
+            {extra_where}
+            group by p.codigo
+            order by total_hh desc
+            limit ?
+        """
         params.append(limit)
-
         with sqlite3.connect(self.sqlite_path, timeout=10) as conn:
             conn.row_factory = sqlite3.Row
             rows = [dict(r) for r in conn.execute(sql, params).fetchall()]
+        return {"rows": rows, "count": len(rows)}
 
-        total_hours = sum(r.get("total_hours") or 0 for r in rows)
-        total_amount = sum(r.get("total_amount") or 0 for r in rows)
-        for r in rows:
-            r["pct_hours"] = round((r.get("total_hours") or 0) * 100.0 / total_hours, 2) if total_hours else 0
-            r["pct_amount"] = round((r.get("total_amount") or 0) * 100.0 / total_amount, 2) if total_amount else 0
+    # ---- 2. Detalle de un proyecto: entregables + HH por cargo ----
 
-        return {
-            "fuente": "licitadas",
-            "view": view,
-            "rows": rows,
-            "totals": {
-                "rows": len(rows),
-                "total_hours": total_hours,
-                "total_amount": total_amount,
-            },
-            "filters_applied": {
+    def detalle_proyecto(self, codigo: str, only: str | None = None) -> dict:
+        """Devuelve los entregables/actividades de un proyecto con HH desglosadas por cargo.
+
+        `only` ∈ {None, 'Actividad', 'Documento'} — filtra por clasificación.
+        Incluye:
+          - meta del proyecto (cliente, título, servicio) desde oferta
+          - filas (cada entregable con sus HH por cargo)
+          - resumen por cargo (suma + % a través del proyecto)
+          - resumen por clasificación
+          - resumen por tipo de documento (JOIN con `tipo`)
+        """
+        codigo = (codigo or "").strip().upper()
+        if not codigo:
+            return {"error": "Código vacío", "codigo": None}
+
+        cargo_cols = ", ".join(f"p.{c}" for c in CARGOS)
+        sql_rows = f"""
+            select p.id, p.descripcion, p.clasificacion, p.factor, p.estado,
+                   p.tipo_id, p.id_area, p.id_actividad, p.categoria_reg_id,
+                   t.nombre as tipo_nombre,
+                   a.area as area_nombre,
+                   am.nombre_act as actividad_nombre,
+                   {cargo_cols},
+                   ({SUM_CARGOS_SQL}) as total_hh
+            from proyectos p
+            left join tipo t on t.id = p.tipo_id
+            left join area a on a.id = p.id_area
+            left join actividad_main am on am.id = p.id_actividad
+            where p.codigo = ?
+              {"and p.clasificacion = ?" if only else ""}
+            order by total_hh desc, p.descripcion
+        """
+        params: list[Any] = [codigo]
+        if only:
+            params.append(only)
+
+        with sqlite3.connect(self.sqlite_path, timeout=10) as conn:
+            conn.row_factory = sqlite3.Row
+            entregables = [dict(r) for r in conn.execute(sql_rows, params).fetchall()]
+            meta_row = conn.execute(
+                """
+                select codigo, titulo, cliente_directo, cliente_final, tipo_servicio,
+                       estado, monto, horas_lic, cod_proy, fecha_recep
+                from oferta where codigo = ?
+                """,
+                (codigo,),
+            ).fetchone()
+            meta = dict(meta_row) if meta_row else None
+
+        if not entregables:
+            return {
                 "codigo": codigo,
-                "cliente": cliente,
-                "disciplina": disciplina,
-                "text": text,
-                "min_hours": min_hours,
-            },
-            "source_path": settings.hh_excel_source,
-            "note": "HH licitadas extraídas de Excels de oferta. NO incluyen persona individual (solo rol/cargo).",
+                "found": False,
+                "message": f"No hay entregables registrados en `proyectos` para {codigo}",
+                "meta": meta,
+            }
+
+        # Detecta cargos efectivamente usados en este proyecto (para no mostrar columnas vacías)
+        cargos_usados = []
+        cargos_totales: dict[str, float] = {}
+        total_proyecto = 0.0
+        for c in CARGOS:
+            s = sum((row.get(c) or 0) for row in entregables)
+            if s > 0:
+                cargos_usados.append(c)
+                cargos_totales[c] = s
+                total_proyecto += s
+
+        cargos_pct = {
+            c: round(v * 100.0 / total_proyecto, 2) if total_proyecto else 0
+            for c, v in cargos_totales.items()
         }
 
-    # ---- agregaciones reales (Staffing API) ----
+        # Resumen por clasificación
+        por_clasificacion: dict[str, dict] = {}
+        for row in entregables:
+            cls = row.get("clasificacion") or "(sin)"
+            d = por_clasificacion.setdefault(cls, {"filas": 0, "hh": 0.0})
+            d["filas"] += 1
+            d["hh"] += row.get("total_hh") or 0
 
-    async def aggregate_reales(
-        self,
-        view: str = "proyecto",
-        codigo: str | None = None,
-        disciplina: str | None = None,
-        text: str | None = None,
-        ano: int | None = None,
-        top: int = 100,
-    ) -> dict:
-        """Delega a Staffing API. `view` ∈ {proyecto, disciplina, entregable, persona}."""
-        from app.services.staffing_client import StaffingClient
+        # Resumen por tipo de documento
+        por_tipo: dict[str, dict] = {}
+        for row in entregables:
+            tipo = row.get("tipo_nombre") or "(sin tipo)"
+            d = por_tipo.setdefault(tipo, {"filas": 0, "hh": 0.0})
+            d["filas"] += 1
+            d["hh"] += row.get("total_hh") or 0
 
-        client = StaffingClient()
-        if not client.available:
-            return {
-                "error": "STAFFING_API_KEY no configurada — no se pueden obtener HH reales",
-                "fuente": "reales",
-                "rows": [],
-            }
+        return {
+            "codigo": codigo,
+            "found": True,
+            "meta": meta,
+            "entregables": entregables,
+            "cargos_usados": cargos_usados,
+            "resumen_cargos": [
+                {"cargo": c, "hh": cargos_totales[c], "pct": cargos_pct[c]}
+                for c in sorted(cargos_usados, key=lambda c: cargos_totales[c], reverse=True)
+            ],
+            "resumen_clasificacion": [
+                {"clasificacion": k, "filas": v["filas"], "hh": v["hh"],
+                 "pct": round(v["hh"] * 100.0 / total_proyecto, 2) if total_proyecto else 0}
+                for k, v in sorted(por_clasificacion.items(), key=lambda kv: -kv[1]["hh"])
+            ],
+            "resumen_tipo": [
+                {"tipo": k, "filas": v["filas"], "hh": v["hh"],
+                 "pct": round(v["hh"] * 100.0 / total_proyecto, 2) if total_proyecto else 0}
+                for k, v in sorted(por_tipo.items(), key=lambda kv: -kv[1]["hh"])
+            ],
+            "total_entregables": len(entregables),
+            "total_hh": total_proyecto,
+        }
 
-        if view == "persona" and codigo:
-            data = await client.personas_proyecto(codigo, ano=ano, con_detalle=True)
-            personas = (data.get("personas") if isinstance(data, dict) else None) or []
-            total_hours = sum((p.get("horas_totales") or 0) for p in personas)
-            rows = []
-            for p in personas:
-                hours = p.get("horas_totales") or 0
-                rows.append({
-                    "key": p.get("nombre") or p.get("usuario_id"),
-                    "usuario_id": p.get("usuario_id"),
-                    "disciplina": p.get("disciplina"),
-                    "rol": p.get("rol"),
-                    "total_hours": hours,
-                    "pct_hours": round(hours * 100.0 / total_hours, 2) if total_hours else 0,
-                    "entregables": p.get("entregables_count"),
-                })
-            rows.sort(key=lambda r: r["total_hours"], reverse=True)
-            return {
-                "fuente": "reales",
-                "view": "persona",
-                "rows": rows[:top],
-                "totals": {"rows": len(rows), "total_hours": total_hours},
-                "proyecto": codigo,
-            }
-
-        if view == "entregable" or text or disciplina:
-            data = await client.analisis_hh(
-                q=text,
-                disciplina=disciplina,
-                proyecto_codigo=codigo,
-                ano=ano,
-                top=top,
-                incluir_personas=False,
-            )
-            items = (data.get("items") or data.get("entregables") or []) if isinstance(data, dict) else []
-            total_hours = sum((e.get("horas_totales") or e.get("horas") or 0) for e in items)
-            rows = []
-            for e in items:
-                hours = e.get("horas_totales") or e.get("horas") or 0
-                rows.append({
-                    "key": e.get("nombre") or e.get("descripcion") or e.get("id"),
-                    "proyecto": e.get("proyecto_codigo") or e.get("codigo"),
-                    "disciplina": e.get("disciplina"),
-                    "total_hours": hours,
-                    "pct_hours": round(hours * 100.0 / total_hours, 2) if total_hours else 0,
-                    "personas": e.get("personas_count"),
-                })
-            rows.sort(key=lambda r: r["total_hours"], reverse=True)
-            return {
-                "fuente": "reales",
-                "view": "entregable",
-                "rows": rows[:top],
-                "totals": {"rows": len(rows), "total_hours": total_hours},
-            }
-
-        if view == "proyecto":
-            data = await client.listar_proyectos(activo=None, limit=top)
-            proyectos = (data.get("proyectos") or data.get("items") or []) if isinstance(data, dict) else []
-            rows = [{
-                "key": p.get("codigo"),
-                "titulo": p.get("nombre") or p.get("titulo"),
-                "cliente": p.get("cliente"),
-                "total_hours": p.get("horas_cargadas") or p.get("hh_total"),
-                "personas": p.get("personas_count"),
-                "entregables": p.get("entregables_count"),
-                "activo": p.get("activo"),
-            } for p in proyectos]
-            return {"fuente": "reales", "view": "proyecto", "rows": rows, "totals": {"rows": len(rows)}}
-
-        return {"error": f"view '{view}' no soportada en modo reales", "rows": []}
-
-    # ---- helpers ----
-
-    def _build_where(self, codigo, disciplina, text, min_hours):
-        where: list[str] = []
-        params: list[Any] = []
-        if codigo:
-            where.append("upper(h.codigo) = ?")
-            params.append(codigo.strip().upper())
-        if disciplina:
-            where.append("h.discipline like ?")
-            params.append(f"%{disciplina}%")
-        if text:
-            where.append("(h.deliverable like ? or h.activity like ? or h.raw_text like ?)")
-            v = f"%{text}%"
-            params.extend([v, v, v])
-        if min_hours and min_hours > 0:
-            where.append("coalesce(h.hours,0) >= ?")
-            params.append(float(min_hours))
-        # Solo filas plausibles: confianza mínima + horas/monto en rangos creíbles.
-        # Evita filas garbage extraídas del Excel (códigos con 100M horas, etc).
-        where.append("h.confidence >= 0.65")
-        where.append("(h.hours is null or (h.hours > 0 and h.hours <= 20000))")
-        where.append("(h.amount is null or (h.amount >= 0 and h.amount <= 100000000))")
-        return where, params
+    # ---- 3. Stats globales (para el header de la vista) ----
 
     def stats(self) -> dict:
-        """Estadísticas globales — para el header de la vista."""
         with sqlite3.connect(self.sqlite_path, timeout=10) as conn:
             row = conn.execute(
-                """
-                select count(*) total_rows,
-                       count(distinct codigo) total_proyectos,
-                       count(distinct discipline) total_disciplinas,
-                       count(distinct nullif(role,'')) total_roles,
-                       sum(coalesce(hours,0)) total_hours,
-                       sum(coalesce(amount,0)) total_amount
-                from hh_estimate_rows
-                where confidence >= 0.65
-                  and (hours is null or (hours > 0 and hours <= 20000))
+                f"""
+                select count(distinct codigo) proyectos,
+                       count(*) entregables,
+                       sum(case when clasificacion='Documento' then 1 else 0 end) documentos,
+                       sum(case when clasificacion='Actividad' then 1 else 0 end) actividades,
+                       sum({SUM_CARGOS_SQL}) total_hh
+                from proyectos
                 """
             ).fetchone()
         return {
-            "rows": row[0],
-            "proyectos": row[1],
-            "disciplinas": row[2],
-            "roles": row[3],
-            "total_hours": row[4],
-            "total_amount": row[5],
-            "source_path": settings.hh_excel_source,
+            "proyectos": row[0],
+            "entregables": row[1],
+            "documentos": row[2],
+            "actividades": row[3],
+            "total_hh": row[4],
+            "fuente": "tabla `proyectos`",
         }
 
-    def list_disciplines(self, limit: int = 50) -> list[str]:
+    # ---- 4. Top proyectos por tamaño (para ayudar al usuario a elegir) ----
+
+    def top_proyectos(self, limit: int = 20, cliente: str | None = None, tipo_servicio: str | None = None) -> dict:
+        params: list[Any] = []
+        where = []
+        if cliente:
+            where.append("(o.cliente_directo like ? or o.cliente_final like ?)")
+            v = f"%{cliente}%"
+            params.extend([v, v])
+        if tipo_servicio:
+            where.append("o.tipo_servicio = ?")
+            params.append(tipo_servicio)
+        where_clause = ("where " + " and ".join(where)) if where else ""
+        sql = f"""
+            select p.codigo,
+                   max(o.titulo) titulo,
+                   max(coalesce(nullif(o.cliente_directo,'No data'), nullif(o.cliente_final,'No data'))) cliente,
+                   max(nullif(o.tipo_servicio,'No data')) tipo_servicio,
+                   count(*) entregables,
+                   sum({SUM_CARGOS_SQL}) total_hh
+            from proyectos p
+            left join oferta o on o.codigo = p.codigo
+            {where_clause}
+            group by p.codigo
+            order by total_hh desc
+            limit ?
+        """
+        params.append(limit)
         with sqlite3.connect(self.sqlite_path, timeout=10) as conn:
-            rows = conn.execute(
-                """
-                select discipline, sum(coalesce(hours,0)) h
-                from hh_estimate_rows
-                where confidence >= 0.6 and discipline is not null and discipline != ''
-                group by discipline
-                order by h desc
-                limit ?
-                """,
-                (limit,),
-            ).fetchall()
-        return [r[0] for r in rows]
+            conn.row_factory = sqlite3.Row
+            rows = [dict(r) for r in conn.execute(sql, params).fetchall()]
+        return {"rows": rows, "count": len(rows)}

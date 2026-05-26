@@ -47,6 +47,10 @@ class Settings(BaseSettings):
     blob_name: str | None = Field(default=None, alias="BLOB_NAME")
     connection_to_pdf: str | None = Field(default=None, alias="CONNECTION_TO_PDF")
 
+    # Microservicio Azure Function de extracción de presupuesto (HH + tarifas + reembolsables)
+    budget_extractor_url: str | None = Field(default=None, alias="BUDGET_EXTRACTOR_URL")
+    budget_extractor_api_key: str | None = Field(default=None, alias="BUDGET_EXTRACTOR_API_KEY")
+
     # Fuente de Excels de HH licitadas. Acepta:
     #   - path local relativo o absoluto (ej. "storage/emitted_offer_assets/excel")
     #   - "blob://<container>/<prefix>"  → se baja a cache temporal antes de leer

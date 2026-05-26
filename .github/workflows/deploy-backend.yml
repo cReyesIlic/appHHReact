@@ -1,0 +1,74 @@
+name: Deploy backend → apphhshimin
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "backend/**"
+      - ".github/workflows/deploy-backend.yml"
+  workflow_dispatch:
+
+env:
+  RG: appHH
+  APP_SERVICE: apphhshimin
+  ACR_NAME: apphshimin
+  IMAGE_NAME: shimin-backend
+  WORKDIR: backend
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+    environment: production
+    permissions:
+      contents: read
+      id-token: write   # para login OIDC (opcional)
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Compute image tag
+        id: tag
+        run: echo "tag=${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+
+      - name: Azure login (Service Principal)
+        uses: azure/login@v2
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: ACR build & push
+        run: |
+          az acr build \
+            --registry $ACR_NAME \
+            --image $IMAGE_NAME:${{ steps.tag.outputs.tag }} \
+            --image $IMAGE_NAME:latest \
+            --file $WORKDIR/Dockerfile \
+            $WORKDIR
+
+      - name: Update web app to new image
+        run: |
+          az webapp config container set \
+            -g $RG -n $APP_SERVICE \
+            --docker-custom-image-name $ACR_NAME.azurecr.io/$IMAGE_NAME:${{ steps.tag.outputs.tag }} \
+            --docker-registry-server-url https://$ACR_NAME.azurecr.io
+
+      - name: Restart web app
+        run: az webapp restart -g $RG -n $APP_SERVICE
+
+      - name: Health check
+        run: |
+          set -e
+          HOST=$(az webapp show -g $RG -n $APP_SERVICE --query defaultHostName -o tsv)
+          URL="https://$HOST/api/config/status"
+          echo "Waiting for $URL ..."
+          for i in $(seq 1 30); do
+            code=$(curl -s -o /dev/null -w "%{http_code}" "$URL" || echo "000")
+            echo "  attempt $i: HTTP $code"
+            [ "$code" = "200" ] && exit 0
+            sleep 10
+          done
+          echo "Health check failed after 30 attempts" >&2
+          exit 1
+
+      - name: Azure logout
+        if: always()
+        run: az logout

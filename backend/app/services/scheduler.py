@@ -82,6 +82,40 @@ async def _run_sync_ganadas() -> None:
         logger.exception("[scheduler] sync_ganadas failed")
 
 
+async def _run_storage_monitor() -> None:
+    """Job: chequea uso del File Share `shimin-data` y manda email si pasa el umbral.
+
+    Reusa la lógica del CLI `scripts/monitor_share_usage.py`. Soft-fails si Azure SDK
+    no está disponible o las env vars no están seteadas (modo dev local).
+    """
+    logger.info("[scheduler] storage_monitor start")
+    try:
+        from scripts.monitor_share_usage import get_share_stats, render_report
+        from app.services.email_client import EmailClient
+
+        account = os.getenv("AZURE_STORAGE_ACCOUNT", "apphhdrive")
+        share = os.getenv("AZURE_FILE_SHARE_NAME", "shimin-data")
+        key = os.getenv("AZURE_STORAGE_KEY")
+        conn_str = os.getenv("AZURE_CONNECTION_STRING")
+        threshold = float(os.getenv("SHARE_USAGE_THRESHOLD", "0.70"))
+
+        if not (key or conn_str):
+            logger.info("[scheduler] storage_monitor skip: sin AZURE_STORAGE_KEY/CONNECTION_STRING")
+            return
+
+        stats = get_share_stats(account, share, key, conn_str)
+        subject, plain, html = render_report(stats, [], threshold)
+        logger.info("[scheduler] storage_monitor: %.1f%% used", stats["utilization"] * 100)
+
+        if stats["utilization"] >= threshold:
+            email = EmailClient()
+            if email.configured:
+                email.send(subject, plain, html)
+                logger.warning("[scheduler] storage_monitor alert email sent (%.1f%%)", stats["utilization"] * 100)
+    except Exception:  # noqa: BLE001
+        logger.exception("[scheduler] storage_monitor failed")
+
+
 async def _run_master_refresh() -> None:
     """Job secundario: refresca el master Excel (también envía email)."""
     from app.services.email_client import EmailClient
@@ -153,6 +187,17 @@ def start_scheduler() -> dict:
         max_instances=1,
         coalesce=True,
     )
+    # Storage monitor diario: 1 hora antes del sync (avisa antes de quedarse sin espacio)
+    storage_hour = (hour - 1) % 24
+    sched.add_job(
+        _run_storage_monitor,
+        CronTrigger(hour=storage_hour, minute=minute),
+        id="storage_monitor_daily",
+        replace_existing=True,
+        misfire_grace_time=3600,
+        max_instances=1,
+        coalesce=True,
+    )
 
     sched.start()
     _scheduler = sched
@@ -207,4 +252,7 @@ async def trigger_now(job: str = "sync_ganadas") -> dict:
     if job == "master_refresh":
         asyncio.create_task(_run_master_refresh())
         return {"triggered": "master_refresh", "status": "running_in_background"}
-    return {"error": f"job '{job}' desconocido (usar 'sync_ganadas' o 'master_refresh')"}
+    if job == "storage_monitor":
+        asyncio.create_task(_run_storage_monitor())
+        return {"triggered": "storage_monitor", "status": "running_in_background"}
+    return {"error": f"job '{job}' desconocido (usar 'sync_ganadas', 'master_refresh' o 'storage_monitor')"}

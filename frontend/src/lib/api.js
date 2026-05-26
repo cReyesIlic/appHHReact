@@ -95,6 +95,26 @@ export function getOpsDashboard(limit = 80) {
   return jsonFetch(`/api/ops/dashboard?limit=${limit}`);
 }
 
+export function getOpsCoverage({ estado = "PG", limit = 5000 } = {}) {
+  const params = new URLSearchParams({ limit: String(limit) });
+  if (estado) params.set("estado", estado);
+  return jsonFetch(`/api/ops/coverage?${params.toString()}`);
+}
+
+export async function uploadCoverageAsset(codigo, file) {
+  const form = new FormData();
+  form.append("file", file);
+  const response = await fetch(`${API_BASE}/api/ops/coverage/${encodeURIComponent(codigo)}/upload`, {
+    method: "POST",
+    body: form,
+  });
+  if (!response.ok) {
+    const text = await response.text();
+    throw new ApiError(text || `HTTP ${response.status}`, { status: response.status, detail: text });
+  }
+  return response.json();
+}
+
 export function searchMaster(payload) {
   return jsonFetch("/api/master/search", {
     method: "POST",
@@ -275,15 +295,20 @@ export function getEntregablesDisciplinas(limit = 50) {
   return jsonFetch(`/api/entregables/disciplinas?limit=${limit}`);
 }
 
-export function getEntregablesAggregate({ fuente = "licitadas", view = "proyecto", codigo, cliente, disciplina, text, min_hours, ano, limit = 100 } = {}) {
+export function getEntregablesAggregate({ fuente = "licitadas", view = "proyecto", codigo, cliente, tipo_servicio, disciplina, text, min_hours, ano, limit = 100 } = {}) {
   const params = new URLSearchParams({ fuente, view, limit: String(limit) });
   if (codigo) params.set("codigo", codigo);
   if (cliente) params.set("cliente", cliente);
+  if (tipo_servicio) params.set("tipo_servicio", tipo_servicio);
   if (disciplina) params.set("disciplina", disciplina);
   if (text) params.set("text", text);
   if (min_hours) params.set("min_hours", String(min_hours));
   if (ano) params.set("ano", String(ano));
   return jsonFetch(`/api/entregables/aggregate?${params.toString()}`);
+}
+
+export function getEntregablesTiposServicio() {
+  return jsonFetch("/api/entregables/tipos-servicio");
 }
 
 export function askEntregablesAgent(payload) {

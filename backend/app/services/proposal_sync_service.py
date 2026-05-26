@@ -456,6 +456,133 @@ class ProposalSyncService:
         self.hybrid._save_batch(rows, vectors)
         return {"selected": len(rows), "processed": len(rows)}
 
+    async def ingest_local_file(self, codigo: str, content: bytes, filename: str) -> dict:
+        """Ingesta un archivo subido manualmente: PDF/DOCX → RAG; XLSX → RAG + HH extractor.
+
+        Guarda en storage/emitted_offer_assets/{pdf|excel}/{codigo}/{filename},
+        actualiza manifest.csv de assets, e indexa en parent_child + embeddings.
+        """
+        import re
+        from app.services.hh_excel_extractor import HHExcelExtractor
+
+        codigo = codigo.upper().strip()
+        kind = filename.lower().rsplit(".", 1)[-1] if "." in filename else ""
+        if kind not in {"pdf", "docx", "xlsx", "xls", "xlsm"}:
+            return {"codigo": codigo, "status": "unsupported", "error": f"Formato no soportado: {kind}"}
+
+        safe_name = re.sub(r"[^A-Za-z0-9._ -]+", "_", filename).strip() or "archivo.bin"
+        subdir = "excel" if kind in {"xlsx", "xls", "xlsm"} else "pdf"
+        target = settings.resolve_path(f"storage/emitted_offer_assets/{subdir}/{codigo}/{safe_name}")
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(content)
+
+        result = {
+            "codigo": codigo,
+            "status": "pending",
+            "filename": safe_name,
+            "kind": kind,
+            "saved_to": str(target),
+        }
+
+        text = self._extract_text_any(content, kind, filename)
+        if not text or text.startswith("[error"):
+            result.update({"status": "extract_error", "error": text or "sin texto"})
+            self._update_assets_manifest(codigo, kind, safe_name, target)
+            return result
+
+        try:
+            virtual = {"name": safe_name, "webUrl": None}
+            metadata = self._metadata(codigo, virtual, str(target))
+            knowledge = await self.extractor.extract(metadata, text[:8000], text)
+            raw_metadata = {**metadata.model_dump(), **knowledge.model_dump()}
+            enriched = enrich_metadata(raw_metadata)
+            parse_result = {"text": text, "pages": []}
+            pc = self.parent_child.index_parse_result(codigo, parse_result, enriched)
+            result["chunks_parent"] = pc.get("parents", 0)
+            result["chunks_child"] = pc.get("children", 0)
+            chunks = self.rag_store.make_chunks(codigo=codigo, text=text, source=str(target), metadata=raw_metadata)
+            self.rag_store.upsert_proposal(metadata, knowledge)
+            self.rag_store.replace_chunks(codigo, chunks)
+            try:
+                await self._build_embeddings_for_code(codigo)
+            except Exception as exc:  # noqa: BLE001
+                result["embedding_error"] = str(exc)
+        except Exception as exc:  # noqa: BLE001
+            result.update({"status": "index_error", "error": f"indexing: {exc}"})
+            self._update_assets_manifest(codigo, kind, safe_name, target)
+            return result
+
+        if kind in {"xlsx", "xlsm"}:
+            try:
+                hh_res = HHExcelExtractor().extract_file(codigo, target)
+                result["hh_rows"] = hh_res.get("rows", 0)
+                result["hh_status"] = hh_res.get("status")
+            except Exception as exc:  # noqa: BLE001
+                result["hh_error"] = str(exc)
+
+            # Azure Function: extracción robusta (proyectos_extracted + tarifas + gastos)
+            try:
+                from app.services.budget_extractor_client import BudgetExtractorClient
+                bclient = BudgetExtractorClient()
+                if bclient.available:
+                    extracted = await bclient.extract_normalized(codigo, content, safe_name)
+                    if extracted.get("error"):
+                        result["budget_extractor_error"] = extracted["error"]
+                    else:
+                        persisted = bclient.persist(codigo, safe_name, extracted)
+                        result["budget_extractor"] = {
+                            "totals": extracted.get("totals"),
+                            "persisted": persisted,
+                            "sheet": extracted.get("entregables_sheet_seleccionado"),
+                        }
+            except Exception as exc:  # noqa: BLE001
+                result["budget_extractor_error"] = f"{type(exc).__name__}: {exc}"
+
+        self._update_assets_manifest(codigo, kind, safe_name, target)
+        result["status"] = "ok"
+        return result
+
+    def _update_assets_manifest(self, codigo: str, kind: str, filename: str, local_path: Path) -> None:
+        """Actualiza (o crea) la fila del manifest emitted_offer_assets/manifest.csv para este codigo."""
+        manifest_path = settings.resolve_path("storage/emitted_offer_assets/manifest.csv")
+        manifest_path.parent.mkdir(parents=True, exist_ok=True)
+        cols = ["codigo", "status", "folder_name", "pdf_count", "excel_count", "zip_count",
+                "selected_pdf", "selected_pdf_local", "selected_excel", "selected_excel_local",
+                "zip_assets", "error", "updated_at"]
+        rows: list[dict] = []
+        existing: dict | None = None
+        if manifest_path.exists():
+            with manifest_path.open("r", encoding="utf-8-sig", newline="") as fh:
+                for r in csv.DictReader(fh):
+                    if (r.get("codigo") or "").strip().upper() == codigo:
+                        existing = r
+                    else:
+                        rows.append(r)
+        row = existing or {c: "" for c in cols}
+        row["codigo"] = codigo
+        row["updated_at"] = datetime.now().isoformat(timespec="seconds")
+        row["status"] = "manual_upload"
+        if kind in {"pdf"}:
+            try:
+                row["pdf_count"] = str(int(row.get("pdf_count") or 0) + 1)
+            except ValueError:
+                row["pdf_count"] = "1"
+            row["selected_pdf"] = filename
+            row["selected_pdf_local"] = str(local_path)
+        elif kind in {"xlsx", "xls", "xlsm"}:
+            try:
+                row["excel_count"] = str(int(row.get("excel_count") or 0) + 1)
+            except ValueError:
+                row["excel_count"] = "1"
+            row["selected_excel"] = filename
+            row["selected_excel_local"] = str(local_path)
+        rows.append(row)
+        with manifest_path.open("w", encoding="utf-8", newline="") as fh:
+            writer = csv.DictWriter(fh, fieldnames=cols)
+            writer.writeheader()
+            for r in rows:
+                writer.writerow({c: r.get(c, "") for c in cols})
+
     def _extract_text_any(self, content: bytes, kind: str, filename: str) -> str:
         """Extrae texto de PDF, DOCX o XLSX. Devuelve texto plano concatenado."""
         from io import BytesIO

@@ -422,6 +422,7 @@ async def entregables_aggregate(
     view: str = "proyecto",
     codigo: str | None = None,
     cliente: str | None = None,
+    tipo_servicio: str | None = None,
     disciplina: str | None = None,
     text: str | None = None,
     min_hours: float = 0.0,
@@ -434,8 +435,46 @@ async def entregables_aggregate(
     if fuente == "reales":
         return await repo.aggregate_reales(view=view, codigo=codigo, disciplina=disciplina, text=text, ano=ano, top=limit)
     return repo.aggregate_licitadas(
-        view=view, codigo=codigo, cliente=cliente, disciplina=disciplina, text=text, min_hours=min_hours, limit=limit,
+        view=view, codigo=codigo, cliente=cliente, tipo_servicio=tipo_servicio,
+        disciplina=disciplina, text=text, min_hours=min_hours, limit=limit,
     )
+
+
+@router.post("/entregables/extract-budget/{codigo}")
+async def entregables_extract_budget(codigo: str) -> dict:
+    """Dispara la Azure Function de extracción de presupuesto para un O-XXXX.
+    Baja Excels desde SharePoint, los manda al microservicio, y persiste en SQLite."""
+    from app.services.budget_extractor_client import BudgetExtractorClient
+    client = BudgetExtractorClient()
+    if not client.available:
+        raise HTTPException(status_code=503, detail="BUDGET_EXTRACTOR_URL no configurada en App Settings")
+    codigo = codigo.strip().upper()
+    if not codigo.startswith("O-"):
+        raise HTTPException(status_code=400, detail=f"Código inválido: '{codigo}' debe empezar con 'O-'")
+    return await client.extract_from_sharepoint(codigo)
+
+
+@router.get("/entregables/extracted/{codigo}")
+def entregables_extracted(codigo: str) -> dict:
+    """Devuelve lo extraído por la Function para un código (filas, tarifas, gastos, audit)."""
+    from app.services.budget_extractor_client import BudgetExtractorClient
+    return BudgetExtractorClient().get_for_codigo(codigo)
+
+
+@router.get("/entregables/tipos-servicio")
+def entregables_tipos_servicio() -> dict:
+    """Lista los tipos de servicio del master (catálogo + presentes en oferta)."""
+    import sqlite3
+    with sqlite3.connect(settings.sqlite_path, timeout=5) as conn:
+        try:
+            cat = [r[0] for r in conn.execute("select tipo_servicio from servicio order by tipo_servicio").fetchall() if r[0]]
+        except sqlite3.OperationalError:
+            cat = []
+        try:
+            usados = [r[0] for r in conn.execute("select distinct tipo_servicio from oferta where tipo_servicio not in ('','No data') and tipo_servicio is not null").fetchall()]
+        except sqlite3.OperationalError:
+            usados = []
+    return {"catalogo": cat, "presentes_en_oferta": sorted(set(usados))}
 
 
 @router.post("/entregables/ask")
@@ -566,6 +605,20 @@ def config_status() -> dict:
 @router.get("/ops/dashboard")
 def ops_dashboard(limit: int = 80) -> dict:
     return OpsDashboardService().build(limit=limit)
+
+
+@router.get("/ops/coverage")
+def ops_coverage(estado: str | None = "PG", limit: int = 5000) -> dict:
+    estado_filter = None if estado in (None, "", "ALL", "*") else estado
+    return OpsDashboardService().build_coverage(estado=estado_filter, limit=limit)
+
+
+@router.post("/ops/coverage/{codigo}/upload")
+async def ops_coverage_upload(codigo: str, file: UploadFile = File(...)) -> dict:
+    """Subir manualmente un PDF/Excel para una propuesta, indexarlo a RAG (y HH si es Excel)."""
+    raw = await file.read()
+    filename = file.filename or "archivo.bin"
+    return await ProposalSyncService().ingest_local_file(codigo, raw, filename)
 
 
 @router.get("/entities/status")

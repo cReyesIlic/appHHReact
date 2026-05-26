@@ -17,6 +17,8 @@
 | `EMAIL_REPORT_RECIPIENTS` | CSV: `cri.reyes@shimin.cl,otro@shimin.cl` | destinatarios por defecto de reportes | **PENDIENTE** |
 | `HH_EXCEL_SOURCE` | `storage/emitted_offer_assets/excel` (default) o `blob://<container>/<prefix>` | path adaptable de Excels HH licitadas | opcional |
 | `HH_EXCEL_CACHE_DIR` | `storage/hh_excel_ingestion` (default) | cache si HH_EXCEL_SOURCE es blob | opcional |
+| `BUDGET_EXTRACTOR_URL` | `https://shimin-budget-extractor.azurewebsites.net` | URL del microservicio Azure Function de extracción de presupuesto | **PENDIENTE** — deployar function (carpeta `budget-extractor-function/`) |
+| `BUDGET_EXTRACTOR_API_KEY` | (shared secret) | auth para llamar a la Function | **PENDIENTE** |
 
 Comando para aplicar a App Service:
 ```bash
@@ -285,3 +287,6 @@ Antes de hacer `git push` + `az acr build`:
 | 2026-05-14 | Vista **Entregables / HH** (sidenav) — pivots por proyecto/disciplina/rol/entregable/persona sobre `hh_estimate_rows` (licitadas locales) + `StaffingClient.analisis_hh` (reales). Filtro plausibilidad (`confidence ≥ 0.65`, `0 < hours ≤ 20000`). |
 | 2026-05-14 | **Sub-agente `EntregablesAgent`** — `/api/entregables/ask` adapta respuesta a tipo_servicio (IP/IC/IB/ID). Detecta código y consulta licitadas + reales según pregunta. |
 | 2026-05-14 | Setting `HH_EXCEL_SOURCE` + `HH_EXCEL_CACHE_DIR` — path adaptable (local hoy, `blob://...` mañana) sin tocar código. |
+| 2026-05-14 | **Azure Function dedicada** `budget-extractor-function/` — extrae entregables/tarifas/gastos de Excels de oferta. Espejo desacoplado de `agentePresupuesto/portable_table_extractor`. Endpoints `/api/extract`, `/api/extract-normalized`. |
+| 2026-05-14 | Tablas SQLite nuevas (limpias, separadas de `hh_estimate_rows` que estaba contaminada): `proyectos_extracted`, `proyecto_tarifas`, `proyecto_gastos_reembolsables`, `proyecto_extraction_audit`. Formato canónico alineado con tabla `proyectos`. |
+| 2026-05-14 | Endpoints backend `/api/entregables/extract-budget/{codigo}` (dispara extracción end-to-end SharePoint→Function→SQLite) y `/api/entregables/extracted/{codigo}` (consulta). |

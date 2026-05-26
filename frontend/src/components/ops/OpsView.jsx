@@ -4,6 +4,7 @@ import { getOpsDashboard, getConfigStatus } from "../../lib/api.js";
 import { Card } from "../shared/Card.jsx";
 import { Button } from "../shared/Button.jsx";
 import { EmptyState } from "../shared/EmptyState.jsx";
+import { CoverageTable } from "./CoverageTable.jsx";
 
 function Metric({ label, value }) {
   return (
@@ -113,6 +114,8 @@ export function OpsView() {
           </div>
         </Card>
       )}
+
+      <CoverageTable />
     </div>
   );
 }
