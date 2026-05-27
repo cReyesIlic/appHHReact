@@ -8,6 +8,10 @@ on:
       - ".github/workflows/deploy-budget-function.yml"
   workflow_dispatch:
 
+concurrency:
+  group: budget-function-deploy-${{ github.ref }}
+  cancel-in-progress: false
+
 env:
   AZURE_FUNCTIONAPP_NAME: apphh-budget-extractor
   PYTHON_VERSION: "3.11"

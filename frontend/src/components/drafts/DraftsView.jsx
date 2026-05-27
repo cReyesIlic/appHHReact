@@ -100,6 +100,7 @@ export function DraftsView() {
       alert(`Error subiendo: ${exc.message}`);
     } finally {
       setBusy(null);
+      if (fileInputRef.current) fileInputRef.current.value = "";
     }
   };
 
