@@ -613,6 +613,21 @@ def ops_coverage(estado: str | None = "PG", limit: int = 5000) -> dict:
     return OpsDashboardService().build_coverage(estado=estado_filter, limit=limit)
 
 
+@router.get("/ops/coverage/{codigo}/wiki")
+def ops_coverage_wiki(codigo: str) -> dict:
+    """Devuelve el markdown de la página Wiki auto-compilada para una propuesta."""
+    codigo = codigo.strip().upper()
+    path = settings.resolve_path(f"storage/llm_wiki/proposals/{codigo}.md")
+    if not path.exists():
+        raise HTTPException(status_code=404, detail=f"No hay página Wiki para {codigo}")
+    return {
+        "codigo": codigo,
+        "path": str(path),
+        "markdown": path.read_text(encoding="utf-8"),
+        "size_bytes": path.stat().st_size,
+    }
+
+
 @router.post("/ops/coverage/{codigo}/upload")
 async def ops_coverage_upload(codigo: str, file: UploadFile = File(...)) -> dict:
     """Subir manualmente un PDF/Excel para una propuesta, indexarlo a RAG (y HH si es Excel)."""

@@ -111,6 +111,11 @@ class OpsDashboardService:
                         for row in conn.execute("select distinct codigo from proyectos_extracted where codigo is not null").fetchall()
                     }
 
+        wiki_dir = settings.resolve_path("storage/llm_wiki/proposals")
+        codes_with_wiki: set[str] = set()
+        if wiki_dir.exists():
+            codes_with_wiki = {p.stem.upper() for p in wiki_dir.glob("O-*.md")}
+
         recent_cutoff = datetime.now() - timedelta(days=60)
         estado_norm = (estado or "").strip().upper()
         rows: list[dict[str, Any]] = []
@@ -148,6 +153,7 @@ class OpsDashboardService:
                     "excel": has_excel,
                     "excel_parsed": code in codes_with_hh,
                     "in_db": code in codes_in_rag,
+                    "has_wiki": code in codes_with_wiki,
                     "updated_at": manifest_updated,
                     "is_recent": is_recent,
                 }
@@ -160,6 +166,7 @@ class OpsDashboardService:
             "with_excel": sum(1 for r in rows if r["excel"]),
             "excel_parsed": sum(1 for r in rows if r["excel_parsed"]),
             "in_db": sum(1 for r in rows if r["in_db"]),
+            "with_wiki": sum(1 for r in rows if r["has_wiki"]),
             "incomplete": sum(1 for r in rows if not (r["pdf"] and r["excel"] and r["in_db"])),
             "recent": sum(1 for r in rows if r["is_recent"]),
         }

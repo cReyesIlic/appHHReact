@@ -101,6 +101,10 @@ export function getOpsCoverage({ estado = "PG", limit = 5000 } = {}) {
   return jsonFetch(`/api/ops/coverage?${params.toString()}`);
 }
 
+export function getCoverageWiki(codigo) {
+  return jsonFetch(`/api/ops/coverage/${encodeURIComponent(codigo)}/wiki`);
+}
+
 export async function uploadCoverageAsset(codigo, file) {
   const form = new FormData();
   form.append("file", file);

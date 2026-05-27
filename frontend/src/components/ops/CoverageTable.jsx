@@ -1,10 +1,11 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { RefreshCw, Download, Check, X, Sparkles, Loader2, FileUp, FileSpreadsheet } from "lucide-react";
+import { RefreshCw, Download, Check, X, Sparkles, Loader2, FileUp, FileSpreadsheet, BookOpen } from "lucide-react";
 
-import { getOpsCoverage, syncNew, syncCode, uploadCoverageAsset } from "../../lib/api.js";
+import { getOpsCoverage, syncNew, syncCode, uploadCoverageAsset, getCoverageWiki } from "../../lib/api.js";
 import { Card } from "../shared/Card.jsx";
 import { Button } from "../shared/Button.jsx";
 import { EmptyState } from "../shared/EmptyState.jsx";
+import { Modal } from "../shared/Modal.jsx";
 
 const RECENT_HIGHLIGHT = 20;
 
@@ -41,6 +42,9 @@ export function CoverageTable() {
   const pdfInputRef = useRef(null);
   const excelInputRef = useRef(null);
   const pendingUpload = useRef({ codigo: null, kind: null });
+  const [wikiOpen, setWikiOpen] = useState(null);
+  const [wikiLoading, setWikiLoading] = useState(false);
+  const [wikiContent, setWikiContent] = useState(null);
 
   const load = async () => {
     setLoading(true);
@@ -73,6 +77,20 @@ export function CoverageTable() {
       setMessage({ type: "error", text: exc.message });
     } finally {
       setSyncing(false);
+    }
+  };
+
+  const openWiki = async (codigo) => {
+    setWikiOpen(codigo);
+    setWikiLoading(true);
+    setWikiContent(null);
+    try {
+      const res = await getCoverageWiki(codigo);
+      setWikiContent(res);
+    } catch (exc) {
+      setWikiContent({ error: exc.message });
+    } finally {
+      setWikiLoading(false);
     }
   };
 
@@ -262,6 +280,7 @@ export function CoverageTable() {
         <span>Con Excel: <b>{totals.with_excel ?? 0}</b></span>
         <span>Excel procesado: <b>{totals.excel_parsed ?? 0}</b></span>
         <span>En BD (RAG): <b>{totals.in_db ?? 0}</b></span>
+        <span>Con Wiki: <b>{totals.with_wiki ?? 0}</b></span>
         <span>Incompletas: <b>{totals.incomplete ?? 0}</b></span>
       </div>
 
@@ -286,6 +305,7 @@ export function CoverageTable() {
                   Excel proc.
                 </th>
                 <th style={{ textAlign: "center" }}>En BD</th>
+                <th style={{ textAlign: "center" }} title="Página Wiki auto-compilada">Wiki</th>
                 <th></th>
               </tr>
             </thead>
@@ -321,6 +341,20 @@ export function CoverageTable() {
                       <Flag on={row.excel_parsed} label="Excel parseado (HH / Azure Function)" />
                     </td>
                     <td style={{ textAlign: "center" }}><Flag on={row.in_db} label="Indexada en BD (RAG chunks)" /></td>
+                    <td style={{ textAlign: "center" }}>
+                      {row.has_wiki ? (
+                        <button
+                          className="btn btn-ghost"
+                          style={{ padding: "2px 8px", fontSize: 12 }}
+                          onClick={() => openWiki(row.codigo)}
+                          title="Ver página Wiki auto-compilada"
+                        >
+                          <BookOpen size={13} /> Ver
+                        </button>
+                      ) : (
+                        <Flag on={false} label="Sin página Wiki" />
+                      )}
+                    </td>
                     <td>
                       <div style={{ display: "flex", gap: 4, flexWrap: "wrap" }}>
                         <Button
@@ -360,6 +394,26 @@ export function CoverageTable() {
         </div>
       )}
     </Card>
+    <Modal
+      open={wikiOpen !== null}
+      title={wikiOpen ? `Wiki · ${wikiOpen}` : "Wiki"}
+      onClose={() => { setWikiOpen(null); setWikiContent(null); }}
+    >
+      {wikiLoading && <EmptyState title="Cargando página Wiki…" />}
+      {!wikiLoading && wikiContent?.error && (
+        <div style={{ padding: 12, color: "#b34141" }}>{wikiContent.error}</div>
+      )}
+      {!wikiLoading && wikiContent?.markdown && (
+        <div style={{ maxHeight: "70vh", overflow: "auto" }}>
+          <div style={{ fontSize: 11, color: "var(--muted, #888)", marginBottom: 8, fontFamily: "Consolas, monospace" }}>
+            {wikiContent.path}  ·  {Math.round((wikiContent.size_bytes || 0) / 1024)} KB
+          </div>
+          <pre style={{ whiteSpace: "pre-wrap", fontFamily: "Consolas, 'SF Mono', monospace", fontSize: 12, lineHeight: 1.5, padding: 14, background: "rgba(0,0,0,0.03)", borderRadius: 6 }}>
+            {wikiContent.markdown}
+          </pre>
+        </div>
+      )}
+    </Modal>
     </>
   );
 }
