@@ -465,7 +465,9 @@ class ProposalSyncService:
         import re
         from app.services.hh_excel_extractor import HHExcelExtractor
 
-        codigo = codigo.upper().strip()
+        codigo = (codigo or "").upper().strip().replace(" ", "")
+        if not re.match(r"^[OS]H?-?\d{2,6}$", codigo) or any(c in codigo for c in ("/", "\\", "..", "\x00")):
+            return {"codigo": codigo, "status": "invalid_codigo", "error": f"codigo invalido: {codigo!r}"}
         kind = filename.lower().rsplit(".", 1)[-1] if "." in filename else ""
         if kind not in {"pdf", "docx", "xlsx", "xls", "xlsm"}:
             return {"codigo": codigo, "status": "unsupported", "error": f"Formato no soportado: {kind}"}

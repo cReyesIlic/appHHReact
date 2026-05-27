@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import time
 from dataclasses import dataclass, field
 from typing import Any
@@ -18,6 +19,8 @@ from typing import Any
 from app.agents.tools import TOOL_SCHEMAS, ToolDispatcher
 from app.agents.tools.handlers import ToolContext
 from app.core.config import settings
+
+logger = logging.getLogger("shimin.agent_loop")
 from app.schemas import ChatMessage, Source, ToolTrace
 from app.services.llm import LlmService
 from app.services.search_filters import SearchFilters
@@ -254,10 +257,19 @@ class AgentLoop:
 
             for tc in tool_calls:
                 name = tc.function.name
+                raw_args = tc.function.arguments or "{}"
                 try:
-                    args = json.loads(tc.function.arguments or "{}")
-                except json.JSONDecodeError:
-                    args = {}
+                    args = json.loads(raw_args)
+                    if not isinstance(args, dict):
+                        raise ValueError(f"tool args no es objeto JSON: {type(args).__name__}")
+                except (json.JSONDecodeError, ValueError) as exc:
+                    logger.warning("[agent_loop] tool %s args invalidos (%s): %r", name, exc, raw_args[:200])
+                    trace.append(ToolTrace(tool=f"agent.{name}", status="error", detail=f"args invalidos: {exc}"))
+                    messages.append({
+                        "role": "tool", "tool_call_id": tc.id, "name": name,
+                        "content": json.dumps({"error": f"args JSON invalidos: {exc}", "raw_preview": raw_args[:200]}),
+                    })
+                    continue
                 # Inyectar filtros seed si la tool acepta filtros y el LLM no los pasó
                 if seed_filters_dict and "filters" in (args or {}).get("__skip__", {}):
                     pass

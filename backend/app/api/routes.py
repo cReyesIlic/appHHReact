@@ -1,5 +1,26 @@
+import re as _re
+
 from fastapi import APIRouter, File, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse
+
+_CODIGO_RE = _re.compile(r"^[OS]H?-?\d{2,6}$")
+
+
+def _validate_codigo(codigo: str, *, prefix: str | None = None) -> str:
+    """Normaliza y valida que el código tenga formato O-XXXX o SH-XXXX.
+
+    Bloquea path traversal, inyecciones SQL/shell con nulos, y formatos arbitrarios.
+    """
+    if codigo is None:
+        raise HTTPException(status_code=400, detail="codigo requerido")
+    norm = codigo.strip().upper().replace(" ", "")
+    if not norm or "/" in norm or "\\" in norm or ".." in norm or "\x00" in norm:
+        raise HTTPException(status_code=400, detail=f"codigo invalido: {codigo!r}")
+    if not _CODIGO_RE.match(norm):
+        raise HTTPException(status_code=400, detail=f"codigo debe ser O-XXXX o SH-XXXX: {codigo!r}")
+    if prefix and not norm.startswith(prefix.upper()):
+        raise HTTPException(status_code=400, detail=f"codigo debe empezar con {prefix}: {codigo!r}")
+    return norm
 
 from app.agents.orchestrator import AgentOrchestrator
 from app.schemas import ChatMessage, ChatRequest, ChatResponse, ChatSessionCreateRequest, ChatSessionRenameRequest, ExportRequest, IngestBatchRequest, MasterSearchRequest, MemoryRequest, ProposalSupportRequest, WikiAutoCreateRequest, WikiBuildRequest, WikiEntryRequest, WikiSearchRequest, WikiValidateRequest
@@ -332,11 +353,7 @@ async def sync_new(limit: int = 20, force_wiki: bool = False) -> dict:
 
 @router.post("/sync/code/{codigo}")
 async def sync_code(codigo: str, force_wiki: bool = False) -> dict:
-    codigo = (codigo or "").strip().upper()
-    if not codigo:
-        raise HTTPException(status_code=400, detail="Código vacío")
-    if not codigo.startswith("O-"):
-        raise HTTPException(status_code=400, detail=f"Código '{codigo}' inválido: debe empezar con 'O-' (ej. O-2658)")
+    codigo = _validate_codigo(codigo, prefix="O-")
     svc = ProposalSyncService()
     try:
         result = await svc.sync_code(codigo, force_wiki=force_wiki)
@@ -445,12 +462,10 @@ async def entregables_extract_budget(codigo: str) -> dict:
     """Dispara la Azure Function de extracción de presupuesto para un O-XXXX.
     Baja Excels desde SharePoint, los manda al microservicio, y persiste en SQLite."""
     from app.services.budget_extractor_client import BudgetExtractorClient
+    codigo = _validate_codigo(codigo, prefix="O-")
     client = BudgetExtractorClient()
     if not client.available:
         raise HTTPException(status_code=503, detail="BUDGET_EXTRACTOR_URL no configurada en App Settings")
-    codigo = codigo.strip().upper()
-    if not codigo.startswith("O-"):
-        raise HTTPException(status_code=400, detail=f"Código inválido: '{codigo}' debe empezar con 'O-'")
     return await client.extract_from_sharepoint(codigo)
 
 
@@ -458,6 +473,7 @@ async def entregables_extract_budget(codigo: str) -> dict:
 def entregables_extracted(codigo: str) -> dict:
     """Devuelve lo extraído por la Function para un código (filas, tarifas, gastos, audit)."""
     from app.services.budget_extractor_client import BudgetExtractorClient
+    codigo = _validate_codigo(codigo)
     return BudgetExtractorClient().get_for_codigo(codigo)
 
 
@@ -616,7 +632,7 @@ def ops_coverage(estado: str | None = "PG", limit: int = 5000) -> dict:
 @router.get("/ops/coverage/{codigo}/wiki")
 def ops_coverage_wiki(codigo: str) -> dict:
     """Devuelve el markdown de la página Wiki auto-compilada para una propuesta."""
-    codigo = codigo.strip().upper()
+    codigo = _validate_codigo(codigo)
     path = settings.resolve_path(f"storage/llm_wiki/proposals/{codigo}.md")
     if not path.exists():
         raise HTTPException(status_code=404, detail=f"No hay página Wiki para {codigo}")
@@ -628,10 +644,21 @@ def ops_coverage_wiki(codigo: str) -> dict:
     }
 
 
+UPLOAD_MAX_BYTES = 50 * 1024 * 1024  # 50 MB
+
+
 @router.post("/ops/coverage/{codigo}/upload")
 async def ops_coverage_upload(codigo: str, file: UploadFile = File(...)) -> dict:
     """Subir manualmente un PDF/Excel para una propuesta, indexarlo a RAG (y HH si es Excel)."""
+    codigo = _validate_codigo(codigo)
     raw = await file.read()
+    if len(raw) > UPLOAD_MAX_BYTES:
+        raise HTTPException(
+            status_code=413,
+            detail=f"Archivo demasiado grande ({len(raw) // 1024 // 1024} MB). Maximo: 50 MB.",
+        )
+    if len(raw) == 0:
+        raise HTTPException(status_code=400, detail="Archivo vacio")
     filename = file.filename or "archivo.bin"
     return await ProposalSyncService().ingest_local_file(codigo, raw, filename)
 
