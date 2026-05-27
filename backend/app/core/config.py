@@ -1,8 +1,23 @@
+import logging
 from functools import lru_cache
 from pathlib import Path
 
 from pydantic import AliasChoices, Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+_logger = logging.getLogger("shimin.config")
+_warned_deployments: set[str] = set()
+
+
+def _warn_fallback(name: str, fallback: str) -> str:
+    if name not in _warned_deployments:
+        _warned_deployments.add(name)
+        _logger.warning(
+            "[config] %s no configurado en env; usando fallback '%s'. "
+            "Definir AZURE_OPENAI_%s_DEPLOYMENT en App Settings para evitar errores en runtime.",
+            name, fallback, name.upper(),
+        )
+    return fallback
 
 
 class Settings(BaseSettings):
@@ -93,19 +108,19 @@ class Settings(BaseSettings):
 
     @property
     def planner_deployment(self) -> str:
-        return self.azure_openai_planner_deployment or "gpt-5.4-nano"
+        return self.azure_openai_planner_deployment or _warn_fallback("planner", "gpt-5.4-nano")
 
     @property
     def index_deployment(self) -> str:
-        return self.azure_openai_index_deployment or self.azure_openai_deployment or "gpt-5.4-mini"
+        return self.azure_openai_index_deployment or self.azure_openai_deployment or _warn_fallback("index", "gpt-5.4-mini")
 
     @property
     def answer_deployment(self) -> str:
-        return self.azure_openai_answer_deployment or self.azure_openai_deployment or "gpt-5.4"
+        return self.azure_openai_answer_deployment or self.azure_openai_deployment or _warn_fallback("answer", "gpt-5.4")
 
     @property
     def embedding_deployment(self) -> str:
-        return self.azure_openai_embedding_deployment or "text-embedding-3-small"
+        return self.azure_openai_embedding_deployment or _warn_fallback("embedding", "text-embedding-3-small")
 
 
 @lru_cache

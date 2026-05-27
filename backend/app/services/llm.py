@@ -1,4 +1,5 @@
 import json
+import logging
 import re
 import unicodedata
 import asyncio
@@ -7,6 +8,8 @@ from openai import AsyncAzureOpenAI, AsyncOpenAI
 
 from app.core.config import settings
 from app.services.credits import CreditService
+
+logger = logging.getLogger("shimin.llm")
 
 
 class LlmService:
@@ -73,7 +76,8 @@ class LlmService:
             data = json.loads(content)
             keywords = [self._norm(str(item)) for item in data.get("keywords", []) if str(item).strip()]
             return {**fallback, **data, "keywords": keywords[:14] or fallback["keywords"]}
-        except Exception:
+        except Exception as exc:
+            logger.warning("[llm] plan_query fallback: %s", exc)
             return fallback
 
     async def compose_answer(

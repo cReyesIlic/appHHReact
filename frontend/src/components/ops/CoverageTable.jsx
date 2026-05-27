@@ -45,6 +45,19 @@ export function CoverageTable() {
   const [wikiOpen, setWikiOpen] = useState(null);
   const [wikiLoading, setWikiLoading] = useState(false);
   const [wikiContent, setWikiContent] = useState(null);
+  const messageTimerRef = useRef(null);
+
+  const showMessage = (msg) => {
+    if (messageTimerRef.current) clearTimeout(messageTimerRef.current);
+    setMessage(msg);
+    if (msg && msg.type !== "error") {
+      messageTimerRef.current = setTimeout(() => setMessage(null), 6000);
+    }
+  };
+
+  useEffect(() => () => {
+    if (messageTimerRef.current) clearTimeout(messageTimerRef.current);
+  }, []);
 
   const load = async () => {
     setLoading(true);
@@ -52,7 +65,7 @@ export function CoverageTable() {
       const res = await getOpsCoverage({ estado: showAll ? "" : "PG", limit: 5000 });
       setData(res);
     } catch (exc) {
-      setMessage({ type: "error", text: exc.message });
+      showMessage({ type: "error", text: exc.message });
     } finally {
       setLoading(false);
     }
@@ -65,16 +78,16 @@ export function CoverageTable() {
 
   const handleSyncAll = async () => {
     setSyncing(true);
-    setMessage({ type: "info", text: "Sincronizando nuevas propuestas desde SharePoint…" });
+    showMessage({ type: "info", text: "Sincronizando nuevas propuestas desde SharePoint…" });
     try {
       const res = await syncNew(20, false);
-      setMessage({
+      showMessage({
         type: "success",
         text: `Sync completado: ${res.processed ?? res.count ?? 0} propuestas procesadas`,
       });
       await load();
     } catch (exc) {
-      setMessage({ type: "error", text: exc.message });
+      showMessage({ type: "error", text: exc.message });
     } finally {
       setSyncing(false);
     }
@@ -109,7 +122,7 @@ export function CoverageTable() {
     pendingUpload.current = { codigo: null, kind: null };
     if (!file || !codigo) return;
     setRowUploading(codigo);
-    setMessage({ type: "info", text: `Subiendo ${file.name} para ${codigo}…` });
+    showMessage({ type: "info", text: `Subiendo ${file.name} para ${codigo}…` });
     try {
       const res = await uploadCoverageAsset(codigo, file);
       if (res.status === "ok") {
@@ -124,16 +137,16 @@ export function CoverageTable() {
           if (be.gastos_filas) parts.push(`${be.gastos_filas} gastos`);
           if (parts.length) extras.push(`Function: ${parts.join("+")}`);
         }
-        setMessage({
+        showMessage({
           type: "success",
           text: `${codigo}: ${res.filename} indexado${extras.length ? ` (${extras.join(", ")})` : ""}`,
         });
       } else {
-        setMessage({ type: "error", text: `${codigo}: ${res.error || res.status}` });
+        showMessage({ type: "error", text: `${codigo}: ${res.error || res.status}` });
       }
       await load();
     } catch (exc) {
-      setMessage({ type: "error", text: `Upload falló: ${exc.message}` });
+      showMessage({ type: "error", text: `Upload falló: ${exc.message}` });
     } finally {
       setRowUploading(null);
     }
@@ -141,13 +154,13 @@ export function CoverageTable() {
 
   const handleSyncRow = async (codigo) => {
     setRowSyncing(codigo);
-    setMessage({ type: "info", text: `Re-sincronizando ${codigo}…` });
+    showMessage({ type: "info", text: `Re-sincronizando ${codigo}…` });
     try {
       await syncCode(codigo, false);
-      setMessage({ type: "success", text: `${codigo} re-sincronizada` });
+      showMessage({ type: "success", text: `${codigo} re-sincronizada` });
       await load();
     } catch (exc) {
-      setMessage({ type: "error", text: exc.message });
+      showMessage({ type: "error", text: exc.message });
     } finally {
       setRowSyncing(null);
     }

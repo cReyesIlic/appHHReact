@@ -1,4 +1,5 @@
 import json
+import logging
 import sqlite3
 import unicodedata
 import asyncio
@@ -9,6 +10,8 @@ from app.core.config import settings
 from app.rag.parent_child import ParentChildIndexer
 from app.services.embedding_service import EmbeddingService
 from app.services.search_filters import SearchFilters
+
+logger = logging.getLogger("shimin.hybrid_store")
 
 
 class HybridRagStore:
@@ -28,6 +31,7 @@ class HybridRagStore:
                 self._save_batch(batch, vectors)
                 processed += len(batch)
             except Exception:
+                logger.exception("[hybrid_store] embed batch failed (start=%d, size=%d)", start, len(batch))
                 errors += len(batch)
         return {"selected": len(rows), "processed": processed, "errors": errors, "status": self.status()}
 
@@ -55,6 +59,7 @@ class HybridRagStore:
                 query_vector = query_vector / norm
             vector_hits = self._vector_search(query_vector, filters=effective, limit=vector_candidates, child_ids=candidate_ids or None)
         except Exception:
+            logger.warning("[hybrid_store] vector search failed (lexical-only fallback)", exc_info=True)
             vector_hits = []
         return self._merge_hits(query_text, vector_hits, lexical_hits, limit)
 

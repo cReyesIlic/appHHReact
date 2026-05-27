@@ -12,6 +12,7 @@ Stateless: cada extracción reemplaza los datos previos del mismo `codigo + sour
 
 from __future__ import annotations
 
+import logging
 import sqlite3
 from datetime import datetime
 from typing import Any
@@ -19,6 +20,8 @@ from typing import Any
 import httpx
 
 from app.core.config import settings
+
+logger = logging.getLogger("shimin.budget_extractor")
 
 
 class BudgetExtractorClient:
@@ -52,10 +55,13 @@ class BudgetExtractorClient:
                 resp.raise_for_status()
                 return resp.json()
         except httpx.HTTPStatusError as exc:
+            logger.warning("extract_normalized HTTP %s for %s: %s", exc.response.status_code, codigo, exc.response.text[:300])
             return {"error": f"HTTP {exc.response.status_code}: {exc.response.text[:300]}"}
         except httpx.RequestError as exc:
+            logger.warning("extract_normalized request error for %s: %s", codigo, exc)
             return {"error": f"Conexión: {exc}"}
         except Exception as exc:  # noqa: BLE001
+            logger.exception("extract_normalized unexpected error for %s", codigo)
             return {"error": f"{type(exc).__name__}: {exc}"}
 
     async def extract_from_sharepoint(self, codigo: str) -> dict:
