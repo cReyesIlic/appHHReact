@@ -59,7 +59,7 @@ build/
 
 # Editores
 .claude/
-.vscode/
+
 .idea/
 *.swp
 *.swo

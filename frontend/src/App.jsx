@@ -16,7 +16,7 @@ import { EntregablesView } from "./components/entregables/EntregablesView.jsx";
 
 const VIEW_META = {
   chat: { title: "Agente SHIMIN", subtitle: "tool calling + filtros estructurados" },
-  master: { title: "Planilla Master", subtitle: "datos tabulares de propuestas" },
+  master: { title: "Planilla Master v2", subtitle: "datos tabulares de propuestas" },
   entregables: { title: "Entregables / HH", subtitle: "HH licitadas + reales · pivots + sub-agente" },
   library: { title: "Wiki / Librería curada", subtitle: "espacio entre Master y RAG" },
   drafts: { title: "Propuestas en armado", subtitle: "antecedentes del cliente + guía LLM" },
