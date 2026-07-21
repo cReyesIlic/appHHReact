@@ -9,6 +9,12 @@ from typing import Any
 from app.core.config import settings
 from app.services.hh_excel_extractor import HHExcelExtractor
 from app.services.master_repository import MasterRepository
+from app.services.pipeline_registry import (
+    PIPELINE_VERSION,
+    RAG_PIPELINE_VERSION,
+    WIKI_PIPELINE_VERSION,
+    PipelineRegistry,
+)
 from app.rag.hybrid_store import HybridRagStore
 from app.rag.parent_child import ParentChildIndexer
 
@@ -17,6 +23,7 @@ class OpsDashboardService:
     def __init__(self) -> None:
         self.root = settings.project_root
         self.manifest_path = self.root / "storage" / "emitted_offer_assets" / "manifest.csv"
+        self.pipeline = PipelineRegistry()
 
     def build(self, limit: int = 80) -> dict[str, Any]:
         master_rows = MasterRepository().all_offers()
@@ -74,6 +81,7 @@ class OpsDashboardService:
                 "parent_child": ParentChildIndexer().status(),
                 "hybrid": HybridRagStore().status(),
             },
+            "pipeline": self.pipeline.status(),
             "hh_excel": HHExcelExtractor().summary(),
             "asset_status": dict(Counter(row.get("status", "unknown") for row in manifest_rows)),
             "won_recent": [self._project_master_row(row) for row in won_rows[:limit]],
@@ -86,6 +94,9 @@ class OpsDashboardService:
         master_rows = MasterRepository().all_offers()
         manifest_rows = self._read_manifest()
         manifest_by_code = {self._code(row.get("codigo")): row for row in manifest_rows if self._code(row.get("codigo"))}
+        pipeline_by_code = {
+            row["codigo"]: row for row in self.pipeline.list(limit=max(limit, 5000))
+        }
 
         codes_in_rag: set[str] = set()
         codes_with_hh: set[str] = set()
@@ -127,8 +138,12 @@ class OpsDashboardService:
             if estado_norm and row_estado != estado_norm:
                 continue
             manifest = manifest_by_code.get(code, {})
-            has_pdf = self._int(manifest.get("pdf_count")) > 0 or bool(manifest.get("selected_pdf_local"))
-            has_excel = self._int(manifest.get("excel_count")) > 0 or bool(manifest.get("selected_excel_local"))
+            pipeline = pipeline_by_code.get(code, {})
+            pdf_count = max(self._int(manifest.get("pdf_count")), self._int(pipeline.get("pdf_count")))
+            docx_count = self._int(pipeline.get("docx_count"))
+            excel_count = max(self._int(manifest.get("excel_count")), self._int(pipeline.get("excel_count")))
+            has_pdf = pdf_count > 0 or bool(manifest.get("selected_pdf_local"))
+            has_excel = excel_count > 0 or bool(manifest.get("selected_excel_local"))
             for item in self._zip_assets(manifest.get("zip_assets")):
                 lower = str(item).lower()
                 has_pdf = has_pdf or lower.endswith(".pdf")
@@ -141,6 +156,13 @@ class OpsDashboardService:
                     is_recent = ts >= recent_cutoff
             except ValueError:
                 is_recent = False
+            needs_reprocess = (
+                not pipeline
+                or bool(pipeline.get("needs_reprocess"))
+                or pipeline.get("pipeline_version") != PIPELINE_VERSION
+                or pipeline.get("rag_pipeline_version") != RAG_PIPELINE_VERSION
+                or pipeline.get("wiki_pipeline_version") != WIKI_PIPELINE_VERSION
+            )
             rows.append(
                 {
                     "codigo": code,
@@ -150,10 +172,22 @@ class OpsDashboardService:
                     "estado": row_estado,
                     "fecha_recep": row.get("fecha_recep", ""),
                     "pdf": has_pdf,
+                    "pdf_count": pdf_count,
+                    "docx_count": docx_count,
                     "excel": has_excel,
+                    "excel_count": excel_count,
                     "excel_parsed": code in codes_with_hh,
                     "in_db": code in codes_in_rag,
                     "has_wiki": code in codes_with_wiki,
+                    "rag_quality_score": pipeline.get("rag_quality_score"),
+                    "wiki_quality_score": pipeline.get("wiki_quality_score"),
+                    "quality_mode": pipeline.get("quality_mode"),
+                    "quality_summary": pipeline.get("quality_summary"),
+                    "pipeline_version": pipeline.get("pipeline_version") or "sin-registro",
+                    "pipeline_status": pipeline.get("status") or "pending",
+                    "needs_reprocess": needs_reprocess,
+                    "source_last_modified": pipeline.get("source_last_modified"),
+                    "last_processed_at": pipeline.get("last_processed_at"),
                     "updated_at": manifest_updated,
                     "is_recent": is_recent,
                 }
@@ -163,11 +197,22 @@ class OpsDashboardService:
         totals = {
             "total": len(rows),
             "with_pdf": sum(1 for r in rows if r["pdf"]),
+            "with_docx": sum(1 for r in rows if r["docx_count"] > 0),
             "with_excel": sum(1 for r in rows if r["excel"]),
             "excel_parsed": sum(1 for r in rows if r["excel_parsed"]),
             "in_db": sum(1 for r in rows if r["in_db"]),
             "with_wiki": sum(1 for r in rows if r["has_wiki"]),
-            "incomplete": sum(1 for r in rows if not (r["pdf"] and r["excel"] and r["in_db"])),
+            "quality_warning": sum(
+                1 for r in rows
+                if (r.get("rag_quality_score") is not None and r["rag_quality_score"] < 70)
+                or (r.get("wiki_quality_score") is not None and r["wiki_quality_score"] < 70)
+            ),
+            "needs_reprocess": sum(1 for r in rows if r["needs_reprocess"]),
+            "incomplete": sum(
+                1 for r in rows
+                if not (r["pdf"] and r["in_db"] and r["has_wiki"])
+                or r["needs_reprocess"]
+            ),
             "recent": sum(1 for r in rows if r["is_recent"]),
         }
         return {
@@ -191,6 +236,7 @@ class OpsDashboardService:
             "rag_parent_sections",
             "rag_child_chunks",
             "rag_child_embeddings",
+            "proposal_pipeline_registry",
             "proposal_entities",
             "hh_estimate_rows",
         ]

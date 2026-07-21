@@ -141,6 +141,9 @@ class BudgetExtractorClient:
         }
 
     def _ensure_tables(self) -> None:
+        # Azure Files monta este directorio en produccion. SQLite no crea por
+        # si solo el directorio padre durante el primer request del contenedor.
+        settings.sqlite_path.parent.mkdir(parents=True, exist_ok=True)
         with sqlite3.connect(settings.sqlite_path, timeout=10) as conn:
             conn.executescript("""
                 create table if not exists proyectos_extracted (

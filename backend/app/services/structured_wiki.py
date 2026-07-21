@@ -115,13 +115,17 @@ class StructuredWikiService:
         existing = None
         with sqlite3.connect(settings.sqlite_path) as conn:
             existing = conn.execute(
-                "select created_at, propuestas_referenciadas, filtros_aplicables, times_used "
+                "select created_at, propuestas_referenciadas, filtros_aplicables, times_used, file_path "
                 "from wiki_entries where id = ?",
                 (entry_id,),
             ).fetchone()
         created_at = existing[0] if existing else now
         self.entries_dir.mkdir(parents=True, exist_ok=True)
-        file_path = self.entries_dir / f"{self._slug(clean_title)}-{entry_id}.md"
+        file_path = (
+            Path(existing[4])
+            if existing and len(existing) > 4 and existing[4]
+            else self.entries_dir / f"{self._slug(clean_title)}-{entry_id}.md"
+        )
         file_path.write_text(
             self._entry_markdown(
                 {

@@ -319,20 +319,26 @@ def sync_status() -> dict:
         "rag_proposals": gap["rag_count"],
         "wiki_missing": gap["missing_wiki"],
         "missing_codes_preview": gap["missing_codes"][:20],
+        "pipeline": svc.pipeline.status(),
     }
+
+
+@router.get("/sync/registry")
+def sync_registry(limit: int = 5000) -> dict:
+    svc = ProposalSyncService()
+    rows = svc.pipeline.list(limit=min(max(1, limit), 10000))
+    return {"status": svc.pipeline.status(), "rows": rows, "count": len(rows)}
 
 
 @router.get("/sync/ganadas-pendientes")
 def sync_ganadas_pendientes() -> dict:
-    """Lista propuestas ganadas (PG) en master que aún NO están indexadas en RAG/Wiki.
-    Es el listado que alimenta el botón 'Sincronizar ganadas nuevas'."""
+    """Lista ganadas nuevas y las que requieren reproceso por versión/calidad."""
     return ProposalSyncService().discover_ganadas_pendientes()
 
 
 @router.post("/sync/ganadas")
 async def sync_ganadas(limit: int = 10) -> dict:
-    """Para cada propuesta ganada (PG) sin RAG, descarga PDFs/Excel de SharePoint
-    y la alimenta al sistema (RAG + Wiki). Bajo demanda, no automático."""
+    """Ciclo completo: cambios SharePoint + nuevas + versiones obsoletas."""
     return await ProposalSyncService().sync_ganadas(limit=limit)
 
 

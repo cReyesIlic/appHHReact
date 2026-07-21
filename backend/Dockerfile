@@ -21,6 +21,7 @@ RUN pip install -r requirements.txt \
 
 COPY app ./app
 COPY scripts ./scripts
+RUN mkdir -p /srv/app_principal/database /srv/app_principal/storage
 # Skills (playbooks markdown) viajan con la imagen
 # (Ya están dentro de app/skills/)
 

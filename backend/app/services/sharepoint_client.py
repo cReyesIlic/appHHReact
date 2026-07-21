@@ -122,7 +122,11 @@ class SharePointClient:
         async with httpx.AsyncClient(timeout=120) as client:
             return await self._request_content(client, download_url)
 
-    async def list_emitido_files(self, code: str, kinds: tuple[str, ...] = (".pdf", ".docx", ".xlsx")) -> list[dict]:
+    async def list_emitido_files(
+        self,
+        code: str,
+        kinds: tuple[str, ...] = (".pdf", ".docx", ".xlsx", ".xlsm", ".xls"),
+    ) -> list[dict]:
         """Lista archivos emitidos (PDF/DOCX/XLSX) de la carpeta '03 Oferta/02 Emitido' de O-XXXX.
 
         A diferencia de `list_pdfs` (que solo trae PDFs), este método trae cualquier formato
@@ -150,9 +154,12 @@ class SharePointClient:
             files = await self._files_descendants(client, headers, drive_id, final["id"], kinds=kinds, max_depth=4)
         return [
             {
+                "id": f.get("id"),
                 "name": f.get("name"),
                 "size": f.get("size") or 0,
                 "webUrl": f.get("webUrl"),
+                "lastModifiedDateTime": f.get("lastModifiedDateTime"),
+                "eTag": f.get("eTag"),
                 "kind": (f.get("name", "").lower().rsplit(".", 1)[-1] if "." in f.get("name", "") else ""),
                 "@microsoft.graph.downloadUrl": f.get("@microsoft.graph.downloadUrl"),
             }

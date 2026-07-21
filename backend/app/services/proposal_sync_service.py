@@ -21,8 +21,10 @@ Modo dry-run:
 
 from __future__ import annotations
 
+import asyncio
 import csv
 import json
+import os
 import sqlite3
 import time
 from dataclasses import dataclass, field
@@ -37,6 +39,13 @@ from app.services.ingestion_reporter import ganadas_sync_report
 from app.services.knowledge_extractor import KnowledgeExtractor
 from app.services.knowledge_models import ProposalMetadata
 from app.services.master_repository import MasterRepository
+from app.services.pipeline_registry import (
+    PIPELINE_VERSION,
+    RAG_PIPELINE_VERSION,
+    WIKI_PIPELINE_VERSION,
+    PipelineRegistry,
+    source_signature,
+)
 from app.services.proposal_taxonomy import enrich_metadata
 from app.services.rag_store import RagStore
 from app.services.sharepoint_client import SharePointClient
@@ -81,6 +90,7 @@ class ProposalSyncService:
         self.hybrid = HybridRagStore()
         self.wiki = StructuredWikiService()
         self.wiki_compiler = WikiAutoCompiler()
+        self.pipeline = PipelineRegistry()
 
     # ---- discovery ----
 
@@ -94,33 +104,29 @@ class ProposalSyncService:
 
         NO mira todo SharePoint, solo lo que el master marcó como ganado.
         """
-        from app.services.proposal_taxonomy import status_category
-        all_rows = self.master.all_offers()
-        ganadas = []
-        for row in all_rows:
-            estado = str(row.get("estado") or "").strip().upper()
-            if status_category(estado) != "ganada":
-                continue
-            codigo = str(row.get("codigo") or "").strip().upper()
-            if not codigo or not codigo.startswith("O-"):
-                continue
-            ganadas.append({
-                "codigo": codigo,
-                "titulo": str(row.get("titulo") or "")[:160],
-                "cliente": row.get("cliente_directo") or row.get("cliente_final"),
-                "fecha_recep": row.get("fecha_recep") or row.get("fecha_recepcion"),
-                "estado": estado,
-                "monto": row.get("monto"),
-                "horas_lic": row.get("horas_lic"),
-                "cod_proy": row.get("cod_proy"),
-            })
+        ganadas = self._ganadas_master_rows()
 
         already = self._codigos_with_rag()
+        states = self.pipeline.by_codes([row["codigo"] for row in ganadas])
         proposals_dir = settings.resolve_path("storage/llm_wiki/proposals")
         wiki_existing = {p.stem.upper() for p in proposals_dir.glob("O-*.md")} if proposals_dir.exists() else set()
 
         pendientes_rag = self._order_pending_by_last_attempt(
-            [g for g in ganadas if g["codigo"] not in already]
+            [{**g, "sync_reason": "new_rag"} for g in ganadas if g["codigo"] not in already]
+        )
+        pendientes_reprocess = self._order_pending_by_last_attempt(
+            [
+                {**g, "sync_reason": "pipeline_stale"}
+                for g in ganadas
+                if g["codigo"] in already
+                and (
+                    not states.get(g["codigo"])
+                    or states[g["codigo"]].get("pipeline_version") != PIPELINE_VERSION
+                    or states[g["codigo"]].get("rag_pipeline_version") != RAG_PIPELINE_VERSION
+                    or states[g["codigo"]].get("wiki_pipeline_version") != WIKI_PIPELINE_VERSION
+                    or states[g["codigo"]].get("needs_reprocess")
+                )
+            ]
         )
         pendientes_wiki = [g for g in ganadas if g["codigo"] not in wiki_existing]
         total_ganadas = len(ganadas)
@@ -130,10 +136,13 @@ class ProposalSyncService:
             "ya_indexadas_rag": total_ganadas - len(pendientes_rag),
             "ya_compiladas_wiki": total_ganadas - len(pendientes_wiki),
             "pendientes_rag_count": len(pendientes_rag),
+            "pendientes_reprocess_count": len(pendientes_reprocess),
             "pendientes_wiki_count": len(pendientes_wiki),
+            "pipeline_version": PIPELINE_VERSION,
             # La cola completa es necesaria para que el scheduler pueda rotarla.
             # El limite de cada corrida se aplica en sync_ganadas(), no aqui.
             "pendientes_rag": pendientes_rag,
+            "pendientes_reprocess": pendientes_reprocess,
             "pendientes_wiki": pendientes_wiki,
         }
 
@@ -144,11 +153,26 @@ class ProposalSyncService:
         Idempotente. Apto para uso bajo demanda (botón UI o cron manual cuando se confirme).
         """
         gap = self.discover_ganadas_pendientes(include_excel=include_excel)
-        pendientes = gap["pendientes_rag"][:limit]
+        limit = max(1, int(limit))
+        stale = gap.get("pendientes_reprocess") or []
+        pending_codes = {row["codigo"] for row in gap["pendientes_rag"]}
+        stale_codes = {row["codigo"] for row in stale}
+        recheck_candidates = [
+            row for row in self._ganadas_master_rows()
+            if row["codigo"] not in pending_codes and row["codigo"] not in stale_codes
+        ]
+        changed = await self._discover_changed_sources(recheck_candidates)
+        pendientes = self._mix_queues([changed, gap["pendientes_rag"], stale], limit)
         counters = SyncCounters(discovered=len(pendientes))
         for ganada in pendientes:
             codigo = ganada["codigo"]
-            outcome = await self.sync_code(codigo, force_wiki=False)
+            reason = ganada.get("sync_reason") or "new_rag"
+            outcome = await self.sync_code(
+                codigo,
+                force_wiki=reason != "new_rag",
+                source_files=ganada.get("_source_files"),
+            )
+            outcome["sync_reason"] = reason
             counters.by_code.append({**outcome, "titulo": ganada.get("titulo"), "cliente": ganada.get("cliente")})
             if outcome["status"] == "ok":
                 counters.ingested += 1
@@ -166,6 +190,9 @@ class ProposalSyncService:
             "scope": "ganadas_master_pendientes",
             "total_ganadas_master": gap["total_ganadas_master"],
             "ya_indexadas": gap["ya_indexadas_rag"],
+            "pipeline_version": PIPELINE_VERSION,
+            "sources_changed": len(changed),
+            "pipeline_stale": len(stale),
             "objetivo_corrida": len(pendientes),
             "ingested": counters.ingested,
             "skipped": counters.skipped,
@@ -219,7 +246,14 @@ class ProposalSyncService:
 
     # ---- sync per code ----
 
-    async def sync_code(self, codigo: str, *, force_wiki: bool = False, build_embeddings: bool = True) -> dict:
+    async def sync_code(
+        self,
+        codigo: str,
+        *,
+        force_wiki: bool = False,
+        build_embeddings: bool = True,
+        source_files: list[dict] | None = None,
+    ) -> dict:
         codigo = codigo.upper().strip()
         result = {
             "codigo": codigo,
@@ -231,7 +265,7 @@ class ProposalSyncService:
 
         # 1-3. Descargar y parsear (PDF, DOCX, XLSX)
         try:
-            files = await self.sharepoint.list_emitido_files(codigo)
+            files = source_files if source_files is not None else await self.sharepoint.list_emitido_files(codigo)
             if not files:
                 # Fallback: intentar la lógica antigua que solo busca PDFs
                 pdfs = await self.sharepoint.list_pdfs(codigo)
@@ -239,37 +273,63 @@ class ProposalSyncService:
                 if not latest:
                     result.update({"status": "no_files", "note": "carpeta '03 Oferta/02 Emitido' vacía o sin PDF/DOCX/XLSX"})
                     self._record_manifest(result)
+                    self.pipeline.record_failure(codigo, result)
                     return result
                 files = [latest]
             # Procesar todos los archivos emitidos → concatenar texto
             full_text_parts = []
+            processed_files = []
+            file_errors = []
             first_pages_text = ""
             primary_name = None
             primary_path = None
+            primary_url = None
             for f in files:
                 content = await self.sharepoint.download_file(f)
                 local_path = self.sharepoint.save_pdf_locally(codigo, f.get("name", "doc.bin"), content)
                 kind = (f.get("name", "").lower().rsplit(".", 1)[-1] if "." in f.get("name", "") else "")
                 file_text = self._extract_text_any(content, kind, f.get("name", ""))
-                if file_text:
-                    full_text_parts.append(f"\n\n## Fuente: {f.get('name')}\n\n{file_text}")
+                if not file_text.strip() or file_text.startswith("[error extrayendo "):
+                    file_errors.append(file_text or f"{f.get('name')}: sin texto extraible")
+                    continue
+                processed_files.append(f)
+                full_text_parts.append(f"\n\n## Fuente: {f.get('name')}\n\n{file_text}")
                 # primer archivo procesable = "primario" (para metadata + name)
                 if primary_name is None:
                     primary_name = f.get("name")
                     primary_path = str(local_path)
+                    primary_url = f.get("webUrl")
                     if kind == "pdf":
                         first_pages_text = self.sharepoint.extract_first_pages_text(content, pages=5)
                     else:
                         first_pages_text = file_text[:8000]
             full_text = "\n".join(full_text_parts)
-            latest = {"name": primary_name, "webUrl": (files[0] or {}).get("webUrl")}
+            if not full_text.strip():
+                result.update(
+                    {
+                        "status": "no_text",
+                        "error": "Los archivos emitidos no contienen texto extraible",
+                        "file_errors": file_errors,
+                    }
+                )
+                self._record_manifest(result)
+                self.pipeline.record_failure(codigo, result)
+                return result
+            result["text_chars"] = len(full_text)
+            latest = {"name": primary_name, "webUrl": primary_url}
             local_path = primary_path or ""
             result["pdf_name"] = primary_name
-            result["files_processed"] = len(files)
-            result["kinds_processed"] = sorted(set(f.get("name", "").lower().rsplit(".", 1)[-1] for f in files if "." in f.get("name", "")))
+            result["files_discovered"] = len(files)
+            result["files_processed"] = len(processed_files)
+            result["file_errors"] = file_errors
+            result["kinds_processed"] = sorted(
+                set(f.get("name", "").lower().rsplit(".", 1)[-1] for f in processed_files if "." in f.get("name", ""))
+            )
+            result["source_signature"] = source_signature(files)
         except Exception as exc:  # noqa: BLE001
             result.update({"status": "error", "error": f"sharepoint: {exc}"})
             self._record_manifest(result)
+            self.pipeline.record_failure(codigo, result)
             return result
 
         # 4. Indexar en parent_child (tabla híbrida)
@@ -294,13 +354,15 @@ class ProposalSyncService:
         except Exception as exc:  # noqa: BLE001
             result.update({"status": "error", "error": f"indexing: {exc}"})
             self._record_manifest(result)
+            self.pipeline.record_failure(codigo, result)
             return result
 
         # 5. Embeddings (solo pendientes — idempotente)
         if build_embeddings:
             try:
                 # Solo procesa chunks de este codigo si están sin embedding
-                await self._build_embeddings_for_code(codigo)
+                embedding_result = await self._build_embeddings_for_code(codigo)
+                result["embedding_count"] = int(embedding_result.get("processed") or 0)
             except Exception as exc:  # noqa: BLE001
                 result["embedding_error"] = str(exc)
 
@@ -309,12 +371,16 @@ class ProposalSyncService:
             wiki_res = await self.wiki_compiler.compile_for_proposal(codigo, force=force_wiki)
             result["wiki_status"] = wiki_res.get("status")
             result["wiki_path"] = wiki_res.get("path")
+            result["wiki_entry_id"] = wiki_res.get("entry_id")
+            result["quality"] = self._quality_result(result, wiki_res.get("quality") or {})
         except Exception as exc:  # noqa: BLE001
             result["wiki_status"] = "error"
             result["wiki_error"] = str(exc)
+            result["quality"] = self._quality_result(result, {})
 
         result["status"] = "ok"
         self._record_manifest(result)
+        self.pipeline.record_success(codigo, files, result)
         return result
 
     async def sync_new(self, limit: int = 50, force_wiki: bool = False) -> dict:
@@ -419,6 +485,109 @@ class ProposalSyncService:
         }
 
     # ---- internal helpers ----
+
+    def _ganadas_master_rows(self) -> list[dict]:
+        from app.services.proposal_taxonomy import status_category
+
+        unique: dict[str, dict] = {}
+        for row in self.master.all_offers():
+            estado = str(row.get("estado") or "").strip().upper()
+            codigo = str(row.get("codigo") or "").strip().upper()
+            if status_category(estado) != "ganada" or not codigo.startswith("O-"):
+                continue
+            unique[codigo] = {
+                "codigo": codigo,
+                "titulo": str(row.get("titulo") or "")[:160],
+                "cliente": row.get("cliente_directo") or row.get("cliente_final"),
+                "fecha_recep": row.get("fecha_recep") or row.get("fecha_recepcion"),
+                "estado": estado,
+                "monto": row.get("monto"),
+                "horas_lic": row.get("horas_lic"),
+                "cod_proy": row.get("cod_proy"),
+            }
+        return list(unique.values())
+
+    async def _discover_changed_sources(self, candidates: list[dict]) -> list[dict]:
+        """Revisa en rotacion fuentes ya procesadas y detecta cambios por firma Graph."""
+        if not candidates:
+            return []
+        states = self.pipeline.by_codes([row["codigo"] for row in candidates])
+        ordered = sorted(
+            [row for row in candidates if states.get(row["codigo"])],
+            key=lambda row: str(states[row["codigo"]].get("source_checked_at") or ""),
+        )
+        recheck_limit = self._bounded_env_int("SYNC_SOURCE_RECHECK_LIMIT", 200, minimum=1, maximum=5000)
+        concurrency = self._bounded_env_int("SYNC_SOURCE_RECHECK_CONCURRENCY", 8, minimum=1, maximum=20)
+        semaphore = asyncio.Semaphore(concurrency)
+
+        async def inspect(row: dict) -> dict | None:
+            codigo = row["codigo"]
+            async with semaphore:
+                try:
+                    files = await self.sharepoint.list_emitido_files(codigo)
+                except Exception:
+                    return None
+            if not files:
+                return None
+            stored = states[codigo].get("source_signature") or ""
+            current = source_signature(files)
+            self.pipeline.mark_checked(codigo, files, establish_baseline=False)
+            if stored and current != stored:
+                return {
+                    **row,
+                    "sync_reason": "source_changed",
+                    "_source_files": files,
+                }
+            return None
+
+        results = await asyncio.gather(*(inspect(row) for row in ordered[:recheck_limit]))
+        return [row for row in results if row]
+
+    def _mix_queues(self, queues: list[list[dict]], limit: int) -> list[dict]:
+        """Round-robin entre cambios, propuestas nuevas y versiones obsoletas."""
+        pending = [list(queue) for queue in queues]
+        selected: list[dict] = []
+        seen: set[str] = set()
+        while len(selected) < limit and any(pending):
+            for queue in pending:
+                while queue:
+                    row = queue.pop(0)
+                    codigo = str(row.get("codigo") or "").upper()
+                    if not codigo or codigo in seen:
+                        continue
+                    selected.append(row)
+                    seen.add(codigo)
+                    break
+                if len(selected) >= limit:
+                    break
+        return selected
+
+    def _quality_result(self, result: dict, ai_quality: dict) -> dict:
+        rag_score = 0
+        rag_score += 15 if int(result.get("files_processed") or 0) > 0 else 0
+        rag_score += 20 if int(result.get("text_chars") or 0) >= 5000 else 8 if result.get("text_chars") else 0
+        rag_score += 20 if int(result.get("chunks_parent") or 0) > 0 else 0
+        rag_score += 20 if int(result.get("chunks_child") or 0) > 0 else 0
+        rag_score += 25 if int(result.get("embedding_count") or 0) > 0 and not result.get("embedding_error") else 0
+        if result.get("file_errors"):
+            rag_score = max(0, rag_score - 15)
+        wiki_score = ai_quality.get("wiki_score")
+        if wiki_score is None:
+            wiki_score = 70 if result.get("wiki_status") == "ok" else 45 if result.get("wiki_status") == "skipped" else 0
+        return {
+            "mode": ai_quality.get("mode") or "heuristic",
+            "rag_score": ai_quality.get("rag_score", rag_score),
+            "wiki_score": wiki_score,
+            "summary": ai_quality.get("summary") or "Calidad calculada con señales objetivas del pipeline.",
+            "issues": [*(ai_quality.get("issues") or []), *result.get("file_errors", [])][:8],
+        }
+
+    def _bounded_env_int(self, name: str, default: int, *, minimum: int, maximum: int) -> int:
+        try:
+            value = int(os.getenv(name, str(default)))
+        except (TypeError, ValueError):
+            value = default
+        return max(minimum, min(maximum, value))
 
     def _codigos_with_rag(self) -> set[str]:
         with sqlite3.connect(settings.sqlite_path, timeout=5) as conn:
@@ -641,7 +810,7 @@ class ProposalSyncService:
                         if cells:
                             blocks.append(" | ".join(cells))
                 return "\n".join(blocks)
-            if kind in {"xlsx", "xls"}:
+            if kind in {"xlsx", "xlsm"}:
                 import openpyxl
                 wb = openpyxl.load_workbook(BytesIO(content), data_only=True, read_only=True)
                 blocks = []
@@ -649,6 +818,17 @@ class ProposalSyncService:
                     blocks.append(f"## Hoja: {ws.title}")
                     for row in ws.iter_rows(values_only=True):
                         cells = [str(c).strip() for c in row if c is not None and str(c).strip()]
+                        if cells:
+                            blocks.append(" | ".join(cells))
+                return "\n".join(blocks)
+            if kind == "xls":
+                import pandas as pd
+                sheets = pd.read_excel(BytesIO(content), sheet_name=None, header=None)
+                blocks = []
+                for title, frame in sheets.items():
+                    blocks.append(f"## Hoja: {title}")
+                    for row in frame.fillna("").astype(str).itertuples(index=False, name=None):
+                        cells = [cell.strip() for cell in row if cell.strip()]
                         if cells:
                             blocks.append(" | ".join(cells))
                 return "\n".join(blocks)

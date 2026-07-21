@@ -72,10 +72,13 @@ class WikiAutoCompiler:
                         "content": (
                             "Compila conocimiento reutilizable para un LLM Wiki de propuestas de ingenieria SHIMIN. "
                             "No copies la respuesta completa: sintetiza reglas, entidades, criterios y gaps. "
-                            "Devuelve solo JSON con keys: title, category, tags, operational_value, content. "
+                            "Devuelve solo JSON con keys: title, category, tags, operational_value, content, "
+                            "rag_quality_score, wiki_quality_score, quality_summary, quality_issues. "
                             "content debe ser Markdown con secciones: Resumen, Como usar, Entidades utiles, "
                             "Propuestas o referencias, Criterios de busqueda, Gaps a validar. "
-                            "Distingue evidencia de inferencia y conserva codigos O-XXXX si existen."
+                            "Distingue evidencia de inferencia y conserva codigos O-XXXX si existen. "
+                            "Evalua de 0 a 100 la suficiencia del material RAG recibido y la fidelidad/cobertura "
+                            "de la Wiki generada. quality_issues debe ser una lista breve y concreta."
                         ),
                     },
                     {
@@ -102,6 +105,11 @@ class WikiAutoCompiler:
                 "tags": [str(tag).strip() for tag in data.get("tags", fallback["tags"]) if str(tag).strip()][:12],
                 "operational_value": bool(data.get("operational_value", fallback["operational_value"])),
                 "content": str(data.get("content") or fallback["content"]),
+                "rag_quality_score": self._score(data.get("rag_quality_score"), fallback["rag_quality_score"]),
+                "wiki_quality_score": self._score(data.get("wiki_quality_score"), fallback["wiki_quality_score"]),
+                "quality_summary": str(data.get("quality_summary") or fallback["quality_summary"])[:500],
+                "quality_issues": [str(item)[:240] for item in data.get("quality_issues", []) if str(item).strip()][:8],
+                "quality_mode": "ai",
             }
         except Exception:
             return fallback
@@ -138,9 +146,14 @@ class WikiAutoCompiler:
         topic = f"{codigo_upper} — {titulo}"
         source_text = self._format_source_text(codigo_upper, titulo, cliente, estado, tipo_servicio, rag_payload)
 
-        # Path corto: NO buscar "existing" (los archivos faltantes son por definición nuevos).
-        # Esto evita el _sync_entries_from_files de 646 .md que satura SQLite con concurrency.
-        draft = await self._draft(topic, source_text, "rag_autocompile", [codigo_upper], existing=None)
+        existing_entry_id = self._page_entry_id(target_file) if target_file.exists() else None
+        existing = None
+        if existing_entry_id:
+            try:
+                existing = self.wiki.get_entry(existing_entry_id)
+            except KeyError:
+                existing_entry_id = None
+        draft = await self._draft(topic, source_text, "rag_autocompile", [codigo_upper], existing=existing)
         filtros = {}
         if estado:
             filtros["estados"] = [estado]
@@ -156,6 +169,7 @@ class WikiAutoCompiler:
             tags=draft.get("tags", []),
             pinned=False,
             source="rag_autocompile",
+            entry_id=existing_entry_id,
             propuestas_referenciadas=[codigo_upper],
             filtros_aplicables=filtros,
             skip_reindex=True,
@@ -170,6 +184,13 @@ class WikiAutoCompiler:
             "entry_id": entry.get("id"),
             "path": str(target_file),
             "title": titulo,
+            "quality": {
+                "mode": draft.get("quality_mode") or "heuristic",
+                "rag_score": draft.get("rag_quality_score"),
+                "wiki_score": draft.get("wiki_quality_score"),
+                "summary": draft.get("quality_summary"),
+                "issues": draft.get("quality_issues") or [],
+            },
         }
 
     def _collect_rag_material(self, codigo: str, max_parents: int = 4, parent_chars: int = 1800) -> dict:
@@ -298,7 +319,27 @@ class WikiAutoCompiler:
             "tags": list(dict.fromkeys([*keywords, *[code.lower() for code in codes[:5]]]))[:12],
             "operational_value": True,
             "content": content,
+            "rag_quality_score": min(85, 35 + len(source_text) // 500),
+            "wiki_quality_score": 65 if source_text.strip() else 20,
+            "quality_summary": "Evaluación heurística; no se pudo ejecutar la revisión IA.",
+            "quality_issues": ["Revisar manualmente fidelidad y cobertura de la Wiki."],
+            "quality_mode": "heuristic",
         }
+
+    def _page_entry_id(self, path: Path) -> str | None:
+        try:
+            for line in path.read_text(encoding="utf-8").splitlines()[:20]:
+                if line.lower().startswith("entry_id:"):
+                    return line.split(":", 1)[1].strip() or None
+        except OSError:
+            return None
+        return None
+
+    def _score(self, value: object, fallback: object) -> float:
+        try:
+            return max(0.0, min(100.0, float(value)))
+        except (TypeError, ValueError):
+            return max(0.0, min(100.0, float(fallback)))
 
     def _norm(self, value: object) -> str:
         return " ".join(str(value or "").lower().split())

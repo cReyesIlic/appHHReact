@@ -63,7 +63,7 @@ export function SyncPanel({ onChanged }) {
     try {
       const r = await discoverGanadasPendientes();
       setGanadasPreview(r);
-      push(`🏆 Ganadas master: ${r.total_ganadas_master} totales · ${r.pendientes_rag_count} sin RAG · ${r.pendientes_wiki_count} sin Wiki`);
+      push(`🏆 Ganadas: ${r.total_ganadas_master} · ${r.pendientes_rag_count} sin RAG · ${r.pendientes_reprocess_count || 0} por reprocesar · ${r.pendientes_wiki_count} sin Wiki`);
     } catch (exc) {
       push(`❌ ganadas: ${exc.detail || exc.message}`);
     } finally {
@@ -72,8 +72,8 @@ export function SyncPanel({ onChanged }) {
   };
 
   const handleSyncGanadas = async () => {
-    if (!ganadasPreview || ganadasPreview.pendientes_rag_count === 0) return;
-    const total = ganadasPreview.pendientes_rag_count;
+    const total = (ganadasPreview?.pendientes_rag_count || 0) + (ganadasPreview?.pendientes_reprocess_count || 0);
+    if (!ganadasPreview || total === 0) return;
     const limit = parseInt(ganadasLimit || "10", 10) || 10;
     const target = Math.min(limit, total);
     const cost = (target * 0.0015).toFixed(2);
@@ -281,7 +281,7 @@ export function SyncPanel({ onChanged }) {
             Scheduler interno {scheduler?.running ? "· activo" : "· detenido"}
           </div>
           <small className="dim" style={{ display: "block", marginBottom: 8 }}>
-            La app corre el sync sola — sin GitHub Actions. Por defecto cada 2 días a las 02:15 hora Chile.
+            La app corre cinco ciclos diarios en hora Chile: 02:15, 07:15, 12:15, 17:15 y 22:15.
           </small>
           {scheduler?.jobs?.length > 0 && (
             <div className="flex-col" style={{ gap: 4, marginBottom: 8 }}>
@@ -322,25 +322,25 @@ export function SyncPanel({ onChanged }) {
         >
           <div className="card-title" style={{ fontSize: 13, marginBottom: 4, display: "flex", alignItems: "center", gap: 6 }}>
             <Trophy size={14} style={{ color: "var(--accent)" }} />
-            Propuestas ganadas nuevas (recomendado)
+            Pipeline automático de propuestas ganadas
           </div>
           <small className="dim" style={{ display: "block", marginBottom: 10 }}>
-            Detecta propuestas en estado <b>PG</b> en master que aún no están indexadas, descarga sus PDFs de SharePoint y las alimenta al sistema (RAG + Wiki). Sin cron automático — bajo demanda.
+            Detecta propuestas nuevas, archivos modificados y versiones antiguas del pipeline. Descarga PDF/DOCX/Excel, actualiza RAG, embeddings, Wiki y evaluación de calidad.
           </small>
           <div className="flex-row" style={{ flexWrap: "wrap", gap: 8, alignItems: "center" }}>
             <Button variant="primary" icon={Trophy} onClick={handleDiscoverGanadas} disabled={busy}>
               Detectar ganadas pendientes
             </Button>
-            {ganadasPreview && ganadasPreview.pendientes_rag_count > 0 && (
+            {ganadasPreview && ((ganadasPreview.pendientes_rag_count || 0) + (ganadasPreview.pendientes_reprocess_count || 0)) > 0 && (
               <>
                 <Input
-                  placeholder={`Límite (default 10, total ${ganadasPreview.pendientes_rag_count})`}
+                  placeholder={`Límite (default 10, total ${(ganadasPreview.pendientes_rag_count || 0) + (ganadasPreview.pendientes_reprocess_count || 0)})`}
                   value={ganadasLimit}
                   onChange={(e) => setGanadasLimit(e.target.value)}
                   style={{ width: 240 }}
                 />
                 <Button variant="accent" icon={Sparkles} onClick={handleSyncGanadas} disabled={busy}>
-                  Sincronizar {Math.min(parseInt(ganadasLimit || "10", 10) || 10, ganadasPreview.pendientes_rag_count)} ganadas
+                  Sincronizar {Math.min(parseInt(ganadasLimit || "10", 10) || 10, (ganadasPreview.pendientes_rag_count || 0) + (ganadasPreview.pendientes_reprocess_count || 0))} ganadas
                 </Button>
               </>
             )}
@@ -348,7 +348,7 @@ export function SyncPanel({ onChanged }) {
           {ganadasPreview && (
             <small className="dim" style={{ display: "block", marginTop: 8 }}>
               {ganadasPreview.total_ganadas_master} ganadas en master · {ganadasPreview.ya_indexadas_rag} con RAG · {ganadasPreview.ya_compiladas_wiki} con Wiki ·{" "}
-              <b>{ganadasPreview.pendientes_rag_count} pendientes</b>
+              <b>{ganadasPreview.pendientes_rag_count} nuevas · {ganadasPreview.pendientes_reprocess_count || 0} por reprocesar</b>
             </small>
           )}
         </div>

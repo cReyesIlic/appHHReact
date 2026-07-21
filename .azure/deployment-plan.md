@@ -1,6 +1,6 @@
 # Azure Deployment Plan
 
-> **Status:** Validated
+> **Status:** Validated (pipeline registry release)
 
 Generated: 2026-07-21 (America/Santiago)
 
@@ -8,7 +8,7 @@ Generated: 2026-07-21 (America/Santiago)
 
 ## 1. Project Overview
 
-**Goal:** Repair and deploy the synchronization path for the existing SHIMIN Proposal Intelligence production application, refresh the Planilla Master from its current SharePoint source, and verify SharePoint -> AI extraction -> RAG -> embeddings -> Wiki end to end.
+**Goal:** Repair and deploy the synchronization path for the existing SHIMIN Proposal Intelligence production application, refresh the Planilla Master from its current SharePoint source, verify SharePoint -> AI extraction -> RAG -> embeddings -> Wiki end to end, and expose durable per-project coverage/quality/version data with automatic reprocessing.
 
 **Path:** Modify an existing Azure production application. No infrastructure replacement or new Azure resources.
 
@@ -21,6 +21,9 @@ Generated: 2026-07-21 (America/Santiago)
 - Master refresh currently re-imports a cached/local Excel and only downloads the configured blob when the local file is absent.
 - The configured Master blob was last updated on 2026-03-10.
 - The exact current Master workbook was found in SharePoint (`Documentos/SH001-REG-GC-005 Planilla Master.xlsx`), last modified on 2026-07-20T22:21:29Z.
+- The first repair release (`116cbff`) is live and healthy; production synchronization of `O-2637` processed 12 PDF/DOCX/XLSX files into 18 parent chunks, 348 child chunks/embeddings, and a Wiki page.
+- A real main-chat trace successfully called Master, Wiki, RAG, and staffing tools; the static registry contains 22 exposed tools and 22 handlers.
+- The first release smoke test exposed an independent startup race: the budget extractor received a successful Azure Function response but SQLite could not open its mounted parent directory.
 
 ---
 
@@ -85,8 +88,14 @@ No GitHub Copilot SDK markers were detected.
 6. Add focused tests for collision handling, queue ordering, scheduler timezone, and Master source refresh.
 7. Add a Docker context allowlist/exclusion boundary so local virtual environments, secrets, databases, and storage data are never uploaded during image builds.
 8. Deploy only backend changes, preserving unrelated local user changes.
-9. Refresh Master, synchronize a controlled proposal, and compare RAG/embedding/Wiki counters in production.
-10. Leave the production scheduler enabled for an automatic daily Master refresh followed by the proposal synchronization job.
+9. Add `proposal_pipeline_registry`, a durable per-project table containing PDF/DOCX/Excel inventory, source signatures, RAG/embedding/Wiki results, AI quality scores, component versions, errors, and reprocesing state.
+10. Detect new or modified emitted documents by Graph ID/eTag/modified time/size and fairly mix changed, new, and stale-version proposals in every run.
+11. Make component-version changes automatically enqueue proposals for the newer RAG/Wiki pipeline while retaining a manual forced-reprocess action.
+12. Ask the Wiki AI to score source/RAG sufficiency and Wiki coverage/fidelity; retain an objective heuristic fallback and surface both in the operations table.
+13. Preserve Wiki entry identity/file paths during forced recompilation so reprocessing cannot create duplicate entries.
+14. Expose the project coverage table in the frontend with PDF/DOCX/Excel counts, parsed Excel, RAG, Wiki, quality, pipeline version, and reprocess state.
+15. Run five automatic Chile-time cycles daily (02:15, 07:15, 12:15, 17:15, 22:15), each refreshing Master first and then processing a fair bounded batch.
+16. Ensure Azure Files mount-point directories exist in the container and before the budget extractor opens SQLite.
 
 ---
 
@@ -119,25 +128,24 @@ This is a code-only deployment to existing resources. `azure-quotas` was invoked
 ### Phase 2: Execution
 
 - [x] Load App Service/AZCLI deployment references
-- [x] Implement synchronization and Master refresh fixes
+- [x] Implement synchronization, Master refresh, registry, quality, and automatic reprocess fixes
 - [x] Run focused tests and backend system checks
 - [x] Add `.dockerignore` and verify the container build context
-- [x] Update status to `Ready for Validation`
+- [x] Update status to `Ready for Validation` for the expanded registry release
 
 ### Phase 3: Validation
 
-- [x] Invoke `azure-validate`
-- [x] Add AZCLI recipe validation steps
+- [x] Re-run `azure-validate` checks for the expanded release
 - [x] All applicable validation checks pass
 - [x] Record proof and update status to `Validated`
 
 ### Phase 4: Deployment
 
-- [ ] Invoke `azure-deploy`
-- [ ] Build and publish immutable backend image
-- [ ] Update App Service and verify health
-- [ ] Refresh current SharePoint Master
-- [ ] Run controlled end-to-end synchronization
+- [x] First repair release deployed (`116cbff`)
+- [ ] Deploy expanded pipeline registry release
+- [ ] Verify five-run production schedule and persistent registry endpoint
+- [ ] Reprocess a controlled production proposal and verify AI quality/version fields
+- [ ] Re-run budget extractor smoke test
 - [ ] Update status to `Deployed`
 
 ---
@@ -151,11 +159,12 @@ application code to existing resources and contains no infrastructure templates.
 | Check | Command Run | Result | Timestamp |
 |-------|-------------|--------|-----------|
 | Python syntax | `python -m compileall -q backend/app backend/tests` | Passed | 2026-07-21 |
-| Reliability tests | `python -m unittest discover -s backend/tests -v` | 4 passed | 2026-07-21 |
+| Reliability tests | `python -m pytest backend/tests/test_sync_reliability.py -q` | 10 passed (before final expanded-release validation) | 2026-07-21 |
+| Frontend build | `npm run build` | Passed; 2,011 modules transformed | 2026-07-21 |
 | Workflow syntax | `yaml.safe_load(.github/workflows/deploy-backend.yml)` | Passed; 11 steps | 2026-07-21 |
 | Whitespace | `git diff --check -- <deployment files>` | Passed; unrelated user-owned frontend workflow excluded | 2026-07-21 |
-| Docker build | `docker build -t shimin-backend:validation -f backend/Dockerfile backend` | Passed; context reduced to 9.86 kB | 2026-07-21 |
-| Container startup | Run validation image and GET `/api/config/status` | HTTP 200; scheduler started with two daily jobs in `America/Santiago` | 2026-07-21 |
+| Docker build | `docker build -t shimin-backend:pipeline-registry-validation -f backend/Dockerfile backend` | Passed; context 596 kB | 2026-07-21 |
+| Container startup | Run validation image and GET `/health` + `/api/sync/registry` | HTTP 200; pipeline version `2026.07.21.2` | 2026-07-21 |
 | Azure CLI/auth | `az version`; `az account show` | CLI 2.80.0; correct confirmed subscription/tenant | 2026-07-21 |
 | Existing resources | `az webapp show`; `az acr show`; `az acr check-health` | App Service running; ACR succeeded; registry auth/pull/DNS passed | 2026-07-21 |
 | Azure Policy | `az policy assignment list` | Only existing Security Center built-in assignment; no deployment blocker | 2026-07-21 |
@@ -167,7 +176,7 @@ deployment blocker: the existing GitHub workflow builds with Docker and pushes
 directly to the same validated registry, and the identical Docker build passed
 locally.
 
-**Validated by:** `azure-validate` workflow, 2026-07-21T19:11:37-04:00
+**Validated by:** `azure-validate` workflow, expanded release revalidated 2026-07-21T19:44:20-04:00
 
 ---
 
@@ -177,12 +186,19 @@ locally.
 |------|---------|
 | `backend/app/rag/parent_child.py` | Collision-safe replacement and embedding cleanup |
 | `backend/app/services/proposal_sync_service.py` | Fair pending queue |
-| `backend/app/services/scheduler.py` | Correct timezone and current Master refresh |
+| `backend/app/services/pipeline_registry.py` | Durable per-project source, quality, version, and reprocessing registry |
+| `backend/app/services/scheduler.py` | Correct timezone, five daily cycles, and current Master refresh |
 | `backend/app/services/sharepoint_client.py` | Exact Master discovery/download |
+| `backend/app/services/wiki_auto_compiler.py` | AI RAG/Wiki quality scoring and identity-preserving recompilation |
+| `backend/app/services/structured_wiki.py` | Reuse the existing Wiki file during upsert |
+| `backend/app/services/ops_dashboard.py` | Coverage/quality/version API rows |
+| `backend/app/services/budget_extractor_client.py` | Safe SQLite mount-point initialization |
 | `backend/app/services/master_repository.py` | Atomic SharePoint-first refresh with fallback |
 | `backend/app/api/routes.py` | Async/source-aware Master refresh response |
-| `backend/.dockerignore` | Minimal and secret-safe Docker build context |
+| `backend/Dockerfile` | Create Azure Files mount points in the image |
 | `backend/tests/test_sync_reliability.py` | Regression coverage |
+| `frontend/src/components/ops/CoverageTable.jsx` | Operational project coverage/quality/reprocess table |
+| `frontend/src/components/library/SyncPanel.jsx` | Automatic schedule and pipeline status UI |
 | `.github/workflows/deploy-backend.yml` | Mandatory tests before image build/deployment |
 | `.azure/deployment-plan.md` | Deployment workflow evidence |
 
@@ -190,5 +206,6 @@ locally.
 
 ## 10. Next Step
 
-Deploy the validated commit through the existing GitHub Actions pipeline, then
-refresh the live Master and run the controlled production synchronization check.
+Complete final validation, commit/push the scoped release, deploy it through the
+existing GitHub Actions pipeline, then verify the registry, schedule, controlled
+reprocess, Wiki quality, chat tool consistency, and budget extractor in production.

@@ -1,7 +1,7 @@
 """Arma reportes HTML + texto plano para enviar por email tras una corrida de ingesta.
 
 Casos de uso:
-  - Cron cada 2 días sincroniza ganadas: envía resumen al finalizar
+  - Cinco ciclos diarios sincronizan ganadas: envía resumen al finalizar
   - Master refresh manual: envía diff de filas nuevas/cambiadas
   - Upload individual via /api/ingest/upload: confirma al usuario
 

@@ -2,14 +2,14 @@
 
 Reemplaza al workflow `sync-daily.yml` de GitHub Actions. La app es autónoma:
 arranca con uvicorn, levanta un BackgroundScheduler en el mismo proceso, y dispara
-`sync_ganadas` cada N días (por defecto 1) a las 02:15 hora Chile.
+`sync_ganadas` cinco veces al día (02:15, 07:15, 12:15, 17:15 y 22:15 Chile).
 
 Config via env:
   SYNC_SCHEDULE_ENABLED   = "true" / "false"  (default true)
-  SYNC_SCHEDULE_HOUR      = hora local del trigger (default 2)
+  SYNC_SCHEDULE_HOURS     = horas locales separadas por coma (default 2,7,12,17,22)
   SYNC_SCHEDULE_MINUTE    = minuto local (default 15)
-  SYNC_SCHEDULE_EVERY_DAYS = cada cuántos días (default 1)
   SYNC_SCHEDULE_LIMIT     = máximo de propuestas por corrida (default 20)
+  SYNC_SOURCE_RECHECK_LIMIT = fuentes ya indexadas a revisar por corrida (default 200)
   SYNC_SCHEDULE_TZ        = zona horaria IANA (default America/Santiago)
 
 El scheduler es **idempotente**: si el App Service reinicia, la próxima corrida
@@ -46,6 +46,19 @@ def _int_env(name: str, default: int) -> int:
         return int(os.getenv(name, str(default)))
     except (TypeError, ValueError):
         return default
+
+
+def _schedule_hours() -> list[int]:
+    raw = os.getenv("SYNC_SCHEDULE_HOURS", "2,7,12,17,22")
+    hours: list[int] = []
+    for value in raw.split(","):
+        try:
+            hour = int(value.strip())
+        except (TypeError, ValueError):
+            continue
+        if 0 <= hour <= 23 and hour not in hours:
+            hours.append(hour)
+    return sorted(hours) or [2, 7, 12, 17, 22]
 
 
 async def _run_sync_ganadas() -> None:
@@ -176,9 +189,8 @@ def start_scheduler() -> dict:
         return {"enabled": False, "reason": "APScheduler no instalado"}
 
     tz = os.getenv("SYNC_SCHEDULE_TZ", "America/Santiago")
-    hour = _int_env("SYNC_SCHEDULE_HOUR", 2)
+    hours = _schedule_hours()
     minute = _int_env("SYNC_SCHEDULE_MINUTE", 15)
-    every_days = max(1, _int_env("SYNC_SCHEDULE_EVERY_DAYS", 1))
 
     try:
         sched = AsyncIOScheduler(timezone=tz)
@@ -188,10 +200,9 @@ def start_scheduler() -> dict:
 
     # Cada CronTrigger recibe explicitamente el timezone. Sin esto APScheduler
     # puede resolverlo en UTC aunque el scheduler declare America/Santiago.
-    day_expr = f"*/{every_days}" if every_days > 1 else "*"
     sched.add_job(
         _run_sync_ganadas,
-        CronTrigger(day=day_expr, hour=hour, minute=minute, timezone=sched.timezone),
+        CronTrigger(hour=",".join(str(hour) for hour in hours), minute=minute, timezone=sched.timezone),
         id="sync_ganadas_periodic",
         replace_existing=True,
         misfire_grace_time=3600,
@@ -200,7 +211,7 @@ def start_scheduler() -> dict:
     )
     # El Master se refresca dentro del ciclo anterior, garantizando el orden.
     # Storage monitor diario: 1 hora antes del ciclo.
-    storage_hour = (hour - 1) % 24
+    storage_hour = (hours[0] - 1) % 24
     sched.add_job(
         _run_storage_monitor,
         CronTrigger(hour=storage_hour, minute=minute, timezone=sched.timezone),
@@ -214,14 +225,14 @@ def start_scheduler() -> dict:
     sched.start()
     _scheduler = sched
     logger.info(
-        "[scheduler] iniciado tz=%s every_days=%s hour=%s minute=%s limit=%s",
-        tz, every_days, hour, minute, _int_env("SYNC_SCHEDULE_LIMIT", 20),
+        "[scheduler] iniciado tz=%s hours=%s minute=%s limit=%s",
+        tz, hours, minute, _int_env("SYNC_SCHEDULE_LIMIT", 20),
     )
     return {
         "enabled": True,
         "timezone": tz,
-        "every_days": every_days,
-        "hour": hour,
+        "hours": hours,
+        "runs_per_day": len(hours),
         "minute": minute,
         "limit": _int_env("SYNC_SCHEDULE_LIMIT", 20),
         "jobs": [j.id for j in sched.get_jobs()],

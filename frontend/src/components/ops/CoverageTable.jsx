@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { RefreshCw, Download, Check, X, Sparkles, Loader2, FileUp, FileSpreadsheet, BookOpen } from "lucide-react";
 
-import { getOpsCoverage, syncNew, syncCode, uploadCoverageAsset, getCoverageWiki } from "../../lib/api.js";
+import { getOpsCoverage, syncGanadas, syncCode, uploadCoverageAsset, getCoverageWiki } from "../../lib/api.js";
 import { Card } from "../shared/Card.jsx";
 import { Button } from "../shared/Button.jsx";
 import { EmptyState } from "../shared/EmptyState.jsx";
@@ -27,6 +27,13 @@ function Flag({ on, label }) {
       {on ? <Check size={14} /> : <X size={14} />}
     </span>
   );
+}
+
+function Quality({ score, mode, summary }) {
+  if (score === null || score === undefined) return <span title="Pendiente de evaluación">—</span>;
+  const value = Math.round(Number(score));
+  const color = value >= 80 ? "#1f8a4c" : value >= 65 ? "#b7791f" : "#b34141";
+  return <b title={`${mode || "heuristic"} · ${summary || "sin detalle"}`} style={{ color }}>{value}</b>;
 }
 
 export function CoverageTable() {
@@ -80,10 +87,10 @@ export function CoverageTable() {
     setSyncing(true);
     showMessage({ type: "info", text: "Sincronizando nuevas propuestas desde SharePoint…" });
     try {
-      const res = await syncNew(20, false);
+      const res = await syncGanadas(20);
       showMessage({
         type: "success",
-        text: `Sync completado: ${res.processed ?? res.count ?? 0} propuestas procesadas`,
+        text: `Sync: ${res.ingested ?? 0} procesadas · ${res.errors ?? 0} errores · ${res.sources_changed ?? 0} fuentes cambiadas`,
       });
       await load();
     } catch (exc) {
@@ -156,7 +163,7 @@ export function CoverageTable() {
     setRowSyncing(codigo);
     showMessage({ type: "info", text: `Re-sincronizando ${codigo}…` });
     try {
-      await syncCode(codigo, false);
+      await syncCode(codigo, true);
       showMessage({ type: "success", text: `${codigo} re-sincronizada` });
       await load();
     } catch (exc) {
@@ -170,7 +177,7 @@ export function CoverageTable() {
     const rows = data?.rows || [];
     const term = search.trim().toLowerCase();
     return rows.filter((r) => {
-      if (onlyIncomplete && r.pdf && r.excel && r.in_db) return false;
+      if (onlyIncomplete && r.pdf && r.in_db && r.has_wiki && !r.needs_reprocess) return false;
       if (!term) return true;
       return (
         (r.codigo || "").toLowerCase().includes(term) ||
@@ -204,7 +211,7 @@ export function CoverageTable() {
       subtitle={
         showAll
           ? "todas las propuestas del Master"
-          : "ganadas (PG) — código O, código SH, PDF, Excel y estado en BD"
+          : "ganadas (PG) — archivos, RAG, Wiki, calidad IA y versión de pipeline"
       }
       actions={
         <>
@@ -287,13 +294,16 @@ export function CoverageTable() {
         </div>
       )}
 
-      <div style={{ display: "flex", gap: 16, fontSize: 12, marginBottom: 10, color: "var(--muted, #666)" }}>
+      <div style={{ display: "flex", flexWrap: "wrap", gap: 16, fontSize: 12, marginBottom: 10, color: "var(--muted, #666)" }}>
         <span>Total: <b>{totals.total ?? 0}</b></span>
         <span>Con PDF: <b>{totals.with_pdf ?? 0}</b></span>
+        <span>Con DOCX: <b>{totals.with_docx ?? 0}</b></span>
         <span>Con Excel: <b>{totals.with_excel ?? 0}</b></span>
         <span>Excel procesado: <b>{totals.excel_parsed ?? 0}</b></span>
         <span>En BD (RAG): <b>{totals.in_db ?? 0}</b></span>
         <span>Con Wiki: <b>{totals.with_wiki ?? 0}</b></span>
+        <span>Reprocesar: <b>{totals.needs_reprocess ?? 0}</b></span>
+        <span>Calidad baja: <b>{totals.quality_warning ?? 0}</b></span>
         <span>Incompletas: <b>{totals.incomplete ?? 0}</b></span>
       </div>
 
@@ -313,12 +323,16 @@ export function CoverageTable() {
                 <th>Título</th>
                 <th>Fecha</th>
                 <th style={{ textAlign: "center" }}>PDF</th>
+                <th style={{ textAlign: "center" }}>DOCX</th>
                 <th style={{ textAlign: "center" }}>Excel</th>
                 <th style={{ textAlign: "center" }} title="Excel parseado a hh_estimate_rows / proyectos_extracted (Azure Function)">
                   Excel proc.
                 </th>
                 <th style={{ textAlign: "center" }}>En BD</th>
                 <th style={{ textAlign: "center" }} title="Página Wiki auto-compilada">Wiki</th>
+                <th style={{ textAlign: "center" }} title="Calidad del índice (0-100)">Q RAG</th>
+                <th style={{ textAlign: "center" }} title="Calidad de la Wiki (0-100)">Q Wiki</th>
+                <th style={{ textAlign: "center" }}>Pipeline</th>
                 <th></th>
               </tr>
             </thead>
@@ -348,8 +362,9 @@ export function CoverageTable() {
                       {row.titulo || "—"}
                     </td>
                     <td>{(row.fecha_recep || "").slice(0, 10) || "—"}</td>
-                    <td style={{ textAlign: "center" }}><Flag on={row.pdf} label="PDF cargado" /></td>
-                    <td style={{ textAlign: "center" }}><Flag on={row.excel} label="Excel descargado" /></td>
+                    <td style={{ textAlign: "center" }}><Flag on={row.pdf} label={`${row.pdf_count || 0} PDF cargados`} /> <small>{row.pdf_count || 0}</small></td>
+                    <td style={{ textAlign: "center" }}><Flag on={(row.docx_count || 0) > 0} label={`${row.docx_count || 0} DOCX cargados`} /> <small>{row.docx_count || 0}</small></td>
+                    <td style={{ textAlign: "center" }}><Flag on={row.excel} label={`${row.excel_count || 0} Excel descargados`} /> <small>{row.excel_count || 0}</small></td>
                     <td style={{ textAlign: "center" }}>
                       <Flag on={row.excel_parsed} label="Excel parseado (HH / Azure Function)" />
                     </td>
@@ -367,6 +382,16 @@ export function CoverageTable() {
                       ) : (
                         <Flag on={false} label="Sin página Wiki" />
                       )}
+                    </td>
+                    <td style={{ textAlign: "center" }}>
+                      <Quality score={row.rag_quality_score} mode={row.quality_mode} summary={row.quality_summary} />
+                    </td>
+                    <td style={{ textAlign: "center" }}>
+                      <Quality score={row.wiki_quality_score} mode={row.quality_mode} summary={row.quality_summary} />
+                    </td>
+                    <td style={{ textAlign: "center", whiteSpace: "nowrap" }}>
+                      <span title={row.last_processed_at || "Nunca procesada"}>{row.pipeline_version}</span>
+                      {row.needs_reprocess && <div style={{ color: "#b7791f", fontSize: 11 }}>reprocesar</div>}
                     </td>
                     <td>
                       <div style={{ display: "flex", gap: 4, flexWrap: "wrap" }}>
