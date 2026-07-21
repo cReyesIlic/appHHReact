@@ -24,6 +24,7 @@ Generated: 2026-07-21 (America/Santiago)
 - The first repair release (`116cbff`) is live and healthy; production synchronization of `O-2637` processed 12 PDF/DOCX/XLSX files into 18 parent chunks, 348 child chunks/embeddings, and a Wiki page.
 - A real main-chat trace successfully called Master, Wiki, RAG, and staffing tools; the static registry contains 22 exposed tools and 22 handlers.
 - The first release smoke test exposed an independent startup race: the budget extractor received a successful Azure Function response but SQLite could not open its mounted parent directory.
+- Root cause was confirmed from the SQLite header: the 812 MB database was in WAL mode on an Azure Files SMB mount. WAL uses shared-memory sidecars and is not supported safely on a network filesystem across container restarts.
 
 ---
 
@@ -96,6 +97,7 @@ No GitHub Copilot SDK markers were detected.
 14. Expose the project coverage table in the frontend with PDF/DOCX/Excel counts, parsed Excel, RAG, Wiki, quality, pipeline version, and reprocess state.
 15. Run five automatic Chile-time cycles daily (02:15, 07:15, 12:15, 17:15, 22:15), each refreshing Master first and then processing a fair bounded batch.
 16. Ensure Azure Files mount-point directories exist in the container and before the budget extractor opens SQLite.
+17. Migrate SQLite from WAL to network-safe DELETE journaling during application startup, before health traffic, and use the lightweight `/health` endpoint for deployment warm-up.
 
 ---
 
@@ -159,12 +161,13 @@ application code to existing resources and contains no infrastructure templates.
 | Check | Command Run | Result | Timestamp |
 |-------|-------------|--------|-----------|
 | Python syntax | `python -m compileall -q backend/app backend/tests` | Passed | 2026-07-21 |
-| Reliability tests | `python -m pytest backend/tests/test_sync_reliability.py -q` | 10 passed (before final expanded-release validation) | 2026-07-21 |
+| Reliability tests | `python -m pytest backend/tests/test_sync_reliability.py -q` | 11 passed, including WAL-to-DELETE migration | 2026-07-21 |
 | Frontend build | `npm run build` | Passed; 2,011 modules transformed | 2026-07-21 |
 | Workflow syntax | `yaml.safe_load(.github/workflows/deploy-backend.yml)` | Passed; 11 steps | 2026-07-21 |
 | Whitespace | `git diff --check -- <deployment files>` | Passed; unrelated user-owned frontend workflow excluded | 2026-07-21 |
 | Docker build | `docker build -t shimin-backend:pipeline-registry-validation -f backend/Dockerfile backend` | Passed; context 596 kB | 2026-07-21 |
 | Container startup | Run validation image and GET `/health` + `/api/sync/registry` | HTTP 200; pipeline version `2026.07.21.2` | 2026-07-21 |
+| SQLite network mode | Run validation image and inspect startup bootstrap | Journal mode `delete`; `/health` and registry HTTP 200 | 2026-07-21 |
 | Azure CLI/auth | `az version`; `az account show` | CLI 2.80.0; correct confirmed subscription/tenant | 2026-07-21 |
 | Existing resources | `az webapp show`; `az acr show`; `az acr check-health` | App Service running; ACR succeeded; registry auth/pull/DNS passed | 2026-07-21 |
 | Azure Policy | `az policy assignment list` | Only existing Security Center built-in assignment; no deployment blocker | 2026-07-21 |
@@ -193,13 +196,15 @@ locally.
 | `backend/app/services/structured_wiki.py` | Reuse the existing Wiki file during upsert |
 | `backend/app/services/ops_dashboard.py` | Coverage/quality/version API rows |
 | `backend/app/services/budget_extractor_client.py` | Safe SQLite mount-point initialization |
+| `backend/app/services/database_runtime.py` | WAL-to-DELETE startup migration for Azure Files |
+| `backend/app/main.py` | Prepare SQLite before scheduler/traffic |
 | `backend/app/services/master_repository.py` | Atomic SharePoint-first refresh with fallback |
 | `backend/app/api/routes.py` | Async/source-aware Master refresh response |
 | `backend/Dockerfile` | Create Azure Files mount points in the image |
 | `backend/tests/test_sync_reliability.py` | Regression coverage |
 | `frontend/src/components/ops/CoverageTable.jsx` | Operational project coverage/quality/reprocess table |
 | `frontend/src/components/library/SyncPanel.jsx` | Automatic schedule and pipeline status UI |
-| `.github/workflows/deploy-backend.yml` | Mandatory tests before image build/deployment |
+| `.github/workflows/deploy-backend.yml` | Mandatory tests, lightweight health probe, and HTTP-aware budget smoke test |
 | `.azure/deployment-plan.md` | Deployment workflow evidence |
 
 ---

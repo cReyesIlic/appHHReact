@@ -15,6 +15,7 @@ from openpyxl import Workbook
 from app.agents.tools import TOOL_SCHEMAS, ToolDispatcher
 from app.core.config import settings
 from app.rag.parent_child import ParentChildIndexer
+from app.services.database_runtime import prepare_runtime_database
 from app.services.master_repository import MasterRepository
 from app.services.pipeline_registry import PIPELINE_VERSION, PipelineRegistry, source_signature
 from app.services.proposal_sync_service import ProposalSyncService
@@ -69,6 +70,26 @@ class ParentChildReliabilityTests(SettingsPathsMixin, unittest.TestCase):
                 ).fetchone()[0]
             self.assertEqual(len(parent_ids), len(set(parent_ids)))
             self.assertEqual(old_embeddings, 0)
+
+
+class DatabaseRuntimeTests(SettingsPathsMixin, unittest.TestCase):
+    def test_wal_database_is_migrated_to_network_safe_delete_journal(self):
+        with tempfile.TemporaryDirectory() as temp_dir, self.patch_settings(temp_dir):
+            with closing(sqlite3.connect(settings.sqlite_path)) as conn:
+                self.assertEqual(conn.execute("pragma journal_mode=wal").fetchone()[0], "wal")
+                conn.execute("create table sample (id integer primary key)")
+                conn.commit()
+
+            result = prepare_runtime_database(attempts=1)
+
+            with closing(sqlite3.connect(settings.sqlite_path)) as conn:
+                journal = conn.execute("pragma journal_mode").fetchone()[0]
+                table = conn.execute(
+                    "select count(*) from sqlite_master where type='table' and name='sample'"
+                ).fetchone()[0]
+            self.assertEqual(result["journal_mode"], "delete")
+            self.assertEqual(journal, "delete")
+            self.assertEqual(table, 1)
 
 
 class QueueReliabilityTests(unittest.TestCase):
