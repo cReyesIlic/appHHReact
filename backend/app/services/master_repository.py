@@ -1,5 +1,7 @@
+import asyncio
 import sqlite3
 import unicodedata
+from io import BytesIO
 from pathlib import Path
 
 import pandas as pd
@@ -53,6 +55,8 @@ TERM_WEIGHTS = {
     "aguas": 2.0,
     "mina": 2.0,
 }
+
+_MASTER_REFRESH_LOCK = asyncio.Lock()
 
 
 class MasterRepository:
@@ -238,10 +242,74 @@ class MasterRepository:
         if not path.exists():
             return 0
         df = self._read_excel(path)
-        settings.sqlite_path.parent.mkdir(parents=True, exist_ok=True)
-        with sqlite3.connect(settings.sqlite_path) as conn:
-            df.to_sql("oferta", conn, if_exists="replace", index=False)
+        self._validate_master(df)
+        self._persist_master(df)
         return len(df)
+
+    async def refresh_from_source(self) -> dict:
+        """Descarga el Master vigente, lo valida y recien entonces reemplaza SQLite.
+
+        Prioridad: SharePoint -> Blob -> copia local. Una descarga o Excel invalido
+        nunca reemplaza la tabla operativa existente.
+        """
+        async with _MASTER_REFRESH_LOCK:
+            path = settings.resolve_path(settings.master_path or "storage/master.xlsx")
+            filename = path.name
+            content: bytes | None = None
+            source = ""
+            metadata: dict = {}
+            warnings: list[str] = []
+
+            try:
+                from app.services.sharepoint_client import SharePointClient
+
+                content, metadata = await SharePointClient().download_named_file(filename)
+                source = "sharepoint"
+            except Exception as exc:  # noqa: BLE001
+                warnings.append(f"sharepoint: {type(exc).__name__}: {exc}")
+
+            if content is None:
+                try:
+                    content = self.blob.download_bytes(settings.master_path_blob)
+                    if content is not None:
+                        source = "blob"
+                        metadata = {"name": settings.master_path_blob, "size": len(content)}
+                except Exception as exc:  # noqa: BLE001
+                    warnings.append(f"blob: {type(exc).__name__}: {exc}")
+
+            if content is None and path.exists():
+                content = path.read_bytes()
+                source = "local"
+                metadata = {"name": path.name, "size": len(content)}
+
+            if content is None:
+                raise RuntimeError("No se pudo obtener la Planilla Master desde SharePoint, Blob ni disco local")
+
+            df = self._read_excel_bytes(content)
+            self._validate_master(df)
+            self._write_master_atomic(path, content)
+            self._persist_master(df)
+
+            blob_updated = False
+            if source == "sharepoint" and settings.master_path_blob:
+                try:
+                    blob_updated = self.blob.upload_bytes(
+                        settings.master_path_blob,
+                        content,
+                        content_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    warnings.append(f"blob_backup: {type(exc).__name__}: {exc}")
+
+            return {
+                "rows_loaded": len(df),
+                "source": source,
+                "file_name": metadata.get("name") or filename,
+                "source_last_modified": metadata.get("last_modified"),
+                "source_size": metadata.get("size") or len(content),
+                "blob_updated": blob_updated,
+                "warnings": warnings,
+            }
 
     def _load(self) -> pd.DataFrame:
         self._ensure_sqlite()
@@ -269,6 +337,13 @@ class MasterRepository:
 
     def _read_excel(self, path: Path) -> pd.DataFrame:
         raw = pd.read_excel(path, sheet_name="Ofertas", header=21)
+        return self._normalize_excel(raw)
+
+    def _read_excel_bytes(self, content: bytes) -> pd.DataFrame:
+        raw = pd.read_excel(BytesIO(content), sheet_name="Ofertas", header=21)
+        return self._normalize_excel(raw)
+
+    def _normalize_excel(self, raw: pd.DataFrame) -> pd.DataFrame:
         rename: dict[str, str] = {}
         normalized_cols = {self._norm(col): col for col in raw.columns}
         for target, variants in EXPECTED_COLUMNS.items():
@@ -286,6 +361,32 @@ class MasterRepository:
         df = raw.rename(columns=rename)
         keep = [col for col in EXPECTED_COLUMNS if col in df.columns]
         return df[keep].astype(str).replace({"nan": "No data", "None": "No data"})
+
+    def _validate_master(self, df: pd.DataFrame) -> None:
+        if df.empty:
+            raise ValueError("La Planilla Master no contiene filas en la hoja 'Ofertas'")
+        if "codigo" not in df.columns:
+            raise ValueError("La Planilla Master no contiene una columna de codigo reconocible")
+        valid_codes = df["codigo"].astype(str).str.strip().str.upper().str.match(r"^O-?\d+")
+        if not bool(valid_codes.any()):
+            raise ValueError("La Planilla Master no contiene codigos de oferta validos")
+
+    def _persist_master(self, df: pd.DataFrame) -> None:
+        settings.sqlite_path.parent.mkdir(parents=True, exist_ok=True)
+        conn = sqlite3.connect(settings.sqlite_path, timeout=30)
+        try:
+            df.to_sql("_oferta_refresh", conn, if_exists="replace", index=False)
+            with conn:
+                conn.execute("drop table if exists oferta")
+                conn.execute("alter table _oferta_refresh rename to oferta")
+        finally:
+            conn.close()
+
+    def _write_master_atomic(self, path: Path, content: bytes) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temp_path = path.with_name(f".{path.name}.sync.tmp")
+        temp_path.write_bytes(content)
+        temp_path.replace(path)
 
     def _norm(self, value: object) -> str:
         text = unicodedata.normalize("NFKD", str(value).lower())

@@ -2,13 +2,13 @@
 
 Reemplaza al workflow `sync-daily.yml` de GitHub Actions. La app es autónoma:
 arranca con uvicorn, levanta un BackgroundScheduler en el mismo proceso, y dispara
-`sync_ganadas` cada N días (por defecto 2) a las 02:00 hora Chile.
+`sync_ganadas` cada N días (por defecto 1) a las 02:15 hora Chile.
 
 Config via env:
   SYNC_SCHEDULE_ENABLED   = "true" / "false"  (default true)
   SYNC_SCHEDULE_HOUR      = hora local del trigger (default 2)
   SYNC_SCHEDULE_MINUTE    = minuto local (default 15)
-  SYNC_SCHEDULE_EVERY_DAYS = cada cuántos días (default 2)
+  SYNC_SCHEDULE_EVERY_DAYS = cada cuántos días (default 1)
   SYNC_SCHEDULE_LIMIT     = máximo de propuestas por corrida (default 20)
   SYNC_SCHEDULE_TZ        = zona horaria IANA (default America/Santiago)
 
@@ -31,6 +31,7 @@ logger = logging.getLogger("shimin.scheduler")
 
 _scheduler: Any = None
 _last_run: dict | None = None
+_last_master_run: dict | None = None
 
 
 def _bool_env(name: str, default: bool) -> bool:
@@ -48,7 +49,7 @@ def _int_env(name: str, default: int) -> int:
 
 
 async def _run_sync_ganadas() -> None:
-    """Job principal: sincroniza ganadas pendientes y envía email de resumen."""
+    """Ciclo automatico: refresca Master y luego sincroniza ganadas pendientes."""
     from app.services.proposal_sync_service import ProposalSyncService
 
     global _last_run
@@ -56,6 +57,7 @@ async def _run_sync_ganadas() -> None:
     started_at = datetime.now()
     logger.info("[scheduler] sync_ganadas start (limit=%s)", limit)
     try:
+        master_result = await _run_master_refresh(send_email=False)
         svc = ProposalSyncService()
         result = await svc.sync_ganadas(limit=limit)
         _last_run = {
@@ -67,6 +69,7 @@ async def _run_sync_ganadas() -> None:
             "wiki_ok": result.get("wiki_ok"),
             "objetivo": result.get("objetivo_corrida"),
             "email": result.get("email"),
+            "master_refresh": master_result,
         }
         logger.info(
             "[scheduler] sync_ganadas done: ingested=%s errors=%s wiki_ok=%s",
@@ -116,22 +119,39 @@ async def _run_storage_monitor() -> None:
         logger.exception("[scheduler] storage_monitor failed")
 
 
-async def _run_master_refresh() -> None:
+async def _run_master_refresh(send_email: bool = True) -> dict:
     """Job secundario: refresca el master Excel (también envía email)."""
     from app.services.email_client import EmailClient
     from app.services.ingestion_reporter import master_refresh_report
     from app.services.master_repository import MasterRepository
 
+    global _last_master_run
+    started_at = datetime.now()
     logger.info("[scheduler] master_refresh start")
     try:
-        rows = MasterRepository().refresh_from_excel()
+        result = await MasterRepository().refresh_from_source()
+        rows = int(result.get("rows_loaded") or 0)
         email = EmailClient()
-        if email.configured:
+        if send_email and email.configured:
             subject, text, html = master_refresh_report(rows)
-            email.send(subject, text, html)
-        logger.info("[scheduler] master_refresh done: %s rows", rows)
-    except Exception:  # noqa: BLE001
+            result["email"] = email.send(subject, text, html)
+        _last_master_run = {
+            "started_at": started_at.isoformat(timespec="seconds"),
+            "finished_at": datetime.now().isoformat(timespec="seconds"),
+            "ok": True,
+            **result,
+        }
+        logger.info("[scheduler] master_refresh done: %s rows source=%s", rows, result.get("source"))
+        return _last_master_run
+    except Exception as exc:  # noqa: BLE001
+        _last_master_run = {
+            "started_at": started_at.isoformat(timespec="seconds"),
+            "finished_at": datetime.now().isoformat(timespec="seconds"),
+            "ok": False,
+            "error": f"{type(exc).__name__}: {exc}",
+        }
         logger.exception("[scheduler] master_refresh failed")
+        return _last_master_run
 
 
 def start_scheduler() -> dict:
@@ -158,7 +178,7 @@ def start_scheduler() -> dict:
     tz = os.getenv("SYNC_SCHEDULE_TZ", "America/Santiago")
     hour = _int_env("SYNC_SCHEDULE_HOUR", 2)
     minute = _int_env("SYNC_SCHEDULE_MINUTE", 15)
-    every_days = max(1, _int_env("SYNC_SCHEDULE_EVERY_DAYS", 2))
+    every_days = max(1, _int_env("SYNC_SCHEDULE_EVERY_DAYS", 1))
 
     try:
         sched = AsyncIOScheduler(timezone=tz)
@@ -166,32 +186,24 @@ def start_scheduler() -> dict:
         logger.warning("[scheduler] timezone %s no disponible, usando UTC", tz)
         sched = AsyncIOScheduler(timezone="UTC")
 
-    # Cron "cada N días a hora:minuto" — usamos day="*/N"
+    # Cada CronTrigger recibe explicitamente el timezone. Sin esto APScheduler
+    # puede resolverlo en UTC aunque el scheduler declare America/Santiago.
     day_expr = f"*/{every_days}" if every_days > 1 else "*"
     sched.add_job(
         _run_sync_ganadas,
-        CronTrigger(day=day_expr, hour=hour, minute=minute),
+        CronTrigger(day=day_expr, hour=hour, minute=minute, timezone=sched.timezone),
         id="sync_ganadas_periodic",
         replace_existing=True,
         misfire_grace_time=3600,
         max_instances=1,
         coalesce=True,
     )
-    # Master refresh diario 5 minutos antes (barato, ayuda a detectar nuevos PG)
-    sched.add_job(
-        _run_master_refresh,
-        CronTrigger(hour=hour, minute=max(0, minute - 5)),
-        id="master_refresh_daily",
-        replace_existing=True,
-        misfire_grace_time=1800,
-        max_instances=1,
-        coalesce=True,
-    )
-    # Storage monitor diario: 1 hora antes del sync (avisa antes de quedarse sin espacio)
+    # El Master se refresca dentro del ciclo anterior, garantizando el orden.
+    # Storage monitor diario: 1 hora antes del ciclo.
     storage_hour = (hour - 1) % 24
     sched.add_job(
         _run_storage_monitor,
-        CronTrigger(hour=storage_hour, minute=minute),
+        CronTrigger(hour=storage_hour, minute=minute, timezone=sched.timezone),
         id="storage_monitor_daily",
         replace_existing=True,
         misfire_grace_time=3600,
@@ -226,7 +238,7 @@ def shutdown_scheduler() -> None:
 
 def scheduler_status() -> dict:
     if _scheduler is None or not getattr(_scheduler, "running", False):
-        return {"running": False, "last_run": _last_run}
+        return {"running": False, "last_run": _last_run, "last_master_run": _last_master_run}
     jobs = []
     for j in _scheduler.get_jobs():
         nxt = getattr(j, "next_run_time", None)
@@ -234,12 +246,14 @@ def scheduler_status() -> dict:
             "id": j.id,
             "next_run": nxt.isoformat() if nxt else None,
             "trigger": str(j.trigger),
+            "timezone": str(getattr(j.trigger, "timezone", "")),
         })
     return {
         "running": True,
         "timezone": str(_scheduler.timezone),
         "jobs": jobs,
         "last_run": _last_run,
+        "last_master_run": _last_master_run,
     }
 
 

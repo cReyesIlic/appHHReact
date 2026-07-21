@@ -240,10 +240,13 @@ def proposal_support_advice(request: ProposalSupportRequest) -> dict:
 
 
 @router.post("/master/refresh")
-def master_refresh() -> dict:
+async def master_refresh() -> dict:
     repo = MasterRepository()
-    count = repo.refresh_from_excel()
-    payload: dict = {"rows_loaded": count}
+    try:
+        payload: dict = await repo.refresh_from_source()
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"Master refresh: {exc}") from exc
+    count = int(payload.get("rows_loaded") or 0)
     # Reporte por email — best effort
     try:
         from app.services.email_client import EmailClient

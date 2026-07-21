@@ -3,7 +3,7 @@ import asyncio
 import time
 from io import BytesIO
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import quote, urlparse
 
 import httpx
 import msal
@@ -68,6 +68,48 @@ class SharePointClient:
             if len(folders) >= limit:
                 break
         return folders
+
+    async def download_named_file(self, filename: str, site_url: str | None = None) -> tuple[bytes, dict]:
+        """Busca un archivo por nombre exacto en el sitio y descarga su version vigente."""
+        if not self._configured():
+            raise RuntimeError("SharePoint/Graph no esta configurado")
+        clean_name = str(filename or "").strip()
+        if not clean_name:
+            raise ValueError("Falta nombre de archivo SharePoint")
+        selected_site = site_url or settings.site_url_ofertas or settings.site_url_proyectos
+        if not selected_site:
+            raise RuntimeError("Falta SITE_URL_OFERTAS o SITE_URL_PROYECTOS")
+
+        headers = self._headers()
+        async with httpx.AsyncClient(timeout=120) as client:
+            drive_id = await self._default_drive_id(client, headers, selected_site)
+            escaped = quote(clean_name.replace("'", "''"), safe="")
+            search = await self._request_json(
+                client,
+                f"{GRAPH}/drives/{drive_id}/root/search(q='{escaped}')?$top=200",
+                headers=headers,
+            )
+            exact = [
+                item for item in search.get("value", [])
+                if item.get("file") and str(item.get("name") or "").casefold() == clean_name.casefold()
+            ]
+            if not exact:
+                raise FileNotFoundError(f"No se encontro '{clean_name}' en SharePoint")
+            item = max(exact, key=lambda row: str(row.get("lastModifiedDateTime") or ""))
+            if not item.get("@microsoft.graph.downloadUrl"):
+                item = await self._request_json(
+                    client,
+                    f"{GRAPH}/drives/{drive_id}/items/{item['id']}",
+                    headers=headers,
+                )
+            content = await self._request_content(client, item["@microsoft.graph.downloadUrl"])
+        return content, {
+            "name": item.get("name"),
+            "item_id": item.get("id"),
+            "last_modified": item.get("lastModifiedDateTime"),
+            "size": item.get("size") or len(content),
+            "web_url": item.get("webUrl"),
+        }
 
     async def download_pdf(self, pdf: dict) -> bytes:
         return await self.download_file(pdf)

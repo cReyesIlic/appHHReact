@@ -119,7 +119,9 @@ class ProposalSyncService:
         proposals_dir = settings.resolve_path("storage/llm_wiki/proposals")
         wiki_existing = {p.stem.upper() for p in proposals_dir.glob("O-*.md")} if proposals_dir.exists() else set()
 
-        pendientes_rag = [g for g in ganadas if g["codigo"] not in already]
+        pendientes_rag = self._order_pending_by_last_attempt(
+            [g for g in ganadas if g["codigo"] not in already]
+        )
         pendientes_wiki = [g for g in ganadas if g["codigo"] not in wiki_existing]
         total_ganadas = len(ganadas)
 
@@ -129,8 +131,10 @@ class ProposalSyncService:
             "ya_compiladas_wiki": total_ganadas - len(pendientes_wiki),
             "pendientes_rag_count": len(pendientes_rag),
             "pendientes_wiki_count": len(pendientes_wiki),
-            "pendientes_rag": pendientes_rag[:200],
-            "pendientes_wiki": pendientes_wiki[:200],
+            # La cola completa es necesaria para que el scheduler pueda rotarla.
+            # El limite de cada corrida se aplica en sync_ganadas(), no aqui.
+            "pendientes_rag": pendientes_rag,
+            "pendientes_wiki": pendientes_wiki,
         }
 
     async def sync_ganadas(self, limit: int = 20, include_excel: bool = True) -> dict:
@@ -420,6 +424,40 @@ class ProposalSyncService:
         with sqlite3.connect(settings.sqlite_path, timeout=5) as conn:
             rows = conn.execute("select distinct codigo from rag_parent_sections").fetchall()
         return {str(r[0]).upper() for r in rows if r[0]}
+
+    def _order_pending_by_last_attempt(self, pending: list[dict]) -> list[dict]:
+        """Ordena la cola por el intento mas antiguo, dejando nuevos primero.
+
+        Cada resultado se agrega al manifest. Al mover lo recien intentado al
+        final, un codigo sin archivos o con error no puede bloquear para siempre
+        las propuestas que vienen despues.
+        """
+        attempts = self._latest_manifest_attempts()
+
+        def key(row: dict) -> str:
+            codigo = str(row.get("codigo") or "").upper()
+            return attempts.get(codigo, {}).get("updated_at") or ""
+
+        return sorted(pending, key=key)
+
+    def _latest_manifest_attempts(self) -> dict[str, dict]:
+        path = settings.resolve_path(MANIFEST_PATH)
+        if not path.exists():
+            return {}
+        latest: dict[str, dict] = {}
+        try:
+            with path.open("r", encoding="utf-8-sig", newline="") as fh:
+                for row in csv.DictReader(fh):
+                    codigo = str(row.get("codigo") or "").strip().upper()
+                    updated_at = str(row.get("updated_at") or "").strip()
+                    if not codigo:
+                        continue
+                    previous = latest.get(codigo)
+                    if previous is None or updated_at >= str(previous.get("updated_at") or ""):
+                        latest[codigo] = row
+        except (OSError, csv.Error):
+            return {}
+        return latest
 
     async def _build_embeddings_for_code(self, codigo: str) -> dict:
         """Genera embeddings solo para los chunks del código sin embedding (del modelo activo)."""

@@ -43,6 +43,7 @@ class ParentChildIndexer:
         if not parents:
             text = parse_result.get("text", "")
             parents = [self._parent(codigo, "Documento", text, None, None, metadata)]
+        parents = self._unique_parents(parents)
         children = []
         for index, parent in enumerate(parents, start=1):
             parent.metadata.update({"section_index": index, "section_count": len(parents)})
@@ -51,7 +52,7 @@ class ParentChildIndexer:
         return {"codigo": codigo, "parents": len(parents), "children": len(children)}
 
     def index_markdown(self, codigo: str, markdown: str, metadata: dict) -> dict:
-        parents = self._markdown_sections(codigo, markdown, metadata)
+        parents = self._unique_parents(self._markdown_sections(codigo, markdown, metadata))
         children = []
         for index, parent in enumerate(parents, start=1):
             parent.metadata.update({"section_index": index, "section_count": len(parents)})
@@ -62,41 +63,52 @@ class ParentChildIndexer:
         return {"codigo": codigo, "parents": len(parents), "children": len(children)}
 
     def replace(self, codigo: str, parents: list[ParentSection], children: list[ChildChunk]) -> None:
-        with sqlite3.connect(settings.sqlite_path) as conn:
-            conn.execute("delete from rag_child_chunks where codigo = ?", (codigo,))
-            conn.execute("delete from rag_parent_sections where codigo = ?", (codigo,))
-            for parent in parents:
-                conn.execute(
-                    """
-                    insert into rag_parent_sections (parent_id, codigo, title, text, page_start, page_end, metadata)
-                    values (?, ?, ?, ?, ?, ?, ?)
-                    """,
-                    (
-                        parent.parent_id,
-                        parent.codigo,
-                        parent.title,
-                        parent.text,
-                        parent.page_start,
-                        parent.page_end,
-                        json.dumps(parent.metadata, ensure_ascii=False),
-                    ),
-                )
-            for child in children:
-                conn.execute(
-                    """
-                    insert into rag_child_chunks (child_id, parent_id, codigo, text, page_start, page_end, metadata)
-                    values (?, ?, ?, ?, ?, ?, ?)
-                    """,
-                    (
-                        child.child_id,
-                        child.parent_id,
-                        child.codigo,
-                        child.text,
-                        child.page_start,
-                        child.page_end,
-                        json.dumps(child.metadata, ensure_ascii=False),
-                    ),
-                )
+        conn = sqlite3.connect(settings.sqlite_path)
+        try:
+            with conn:
+                # Los embeddings dependen de child_id. Eliminarlos dentro de la misma
+                # transaccion evita dejar vectores huerfanos al reindexar un codigo.
+                has_embeddings = conn.execute(
+                    "select 1 from sqlite_master where type = 'table' and name = 'rag_child_embeddings'"
+                ).fetchone()
+                if has_embeddings:
+                    conn.execute("delete from rag_child_embeddings where codigo = ?", (codigo,))
+                conn.execute("delete from rag_child_chunks where codigo = ?", (codigo,))
+                conn.execute("delete from rag_parent_sections where codigo = ?", (codigo,))
+                for parent in parents:
+                    conn.execute(
+                        """
+                        insert into rag_parent_sections (parent_id, codigo, title, text, page_start, page_end, metadata)
+                        values (?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            parent.parent_id,
+                            parent.codigo,
+                            parent.title,
+                            parent.text,
+                            parent.page_start,
+                            parent.page_end,
+                            json.dumps(parent.metadata, ensure_ascii=False),
+                        ),
+                    )
+                for child in children:
+                    conn.execute(
+                        """
+                        insert into rag_child_chunks (child_id, parent_id, codigo, text, page_start, page_end, metadata)
+                        values (?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            child.child_id,
+                            child.parent_id,
+                            child.codigo,
+                            child.text,
+                            child.page_start,
+                            child.page_end,
+                            json.dumps(child.metadata, ensure_ascii=False),
+                        ),
+                    )
+        finally:
+            conn.close()
 
     def search(
         self,
@@ -308,6 +320,37 @@ class ParentChildIndexer:
         }
         return ParentSection(parent_id, codigo, title, text.strip(), page_start, page_end, parent_metadata)
 
+    def _unique_parents(self, parents: list[ParentSection]) -> list[ParentSection]:
+        """Elimina duplicados exactos y desambigua colisiones de parent_id.
+
+        El identificador historico usa los primeros 120 caracteres para mantener
+        estabilidad. Ofertas con varios archivos pueden repetir titulo y prefijo;
+        en ese caso conservamos el primer id y derivamos uno determinista usando
+        el contenido completo de las secciones distintas.
+        """
+        unique: list[ParentSection] = []
+        fingerprints: dict[str, str] = {}
+        for parent in parents:
+            fingerprint = sha1(
+                f"{parent.title}:{parent.page_start}:{parent.page_end}:{parent.text}".encode("utf-8")
+            ).hexdigest()
+            existing = fingerprints.get(parent.parent_id)
+            if existing == fingerprint:
+                continue
+            if existing is not None:
+                base_id = parent.parent_id
+                candidate = sha1(f"{base_id}:{fingerprint}".encode("utf-8")).hexdigest()[:18]
+                suffix = 1
+                while candidate in fingerprints and fingerprints[candidate] != fingerprint:
+                    candidate = sha1(f"{base_id}:{fingerprint}:{suffix}".encode("utf-8")).hexdigest()[:18]
+                    suffix += 1
+                if fingerprints.get(candidate) == fingerprint:
+                    continue
+                parent.parent_id = candidate
+            fingerprints[parent.parent_id] = fingerprint
+            unique.append(parent)
+        return unique
+
     def _looks_like_heading(self, line: str) -> bool:
         norm = self._norm(line)
         if len(line) > 110 or len(line) < 4:
@@ -332,33 +375,37 @@ class ParentChildIndexer:
 
     def _ensure_tables(self) -> None:
         settings.sqlite_path.parent.mkdir(parents=True, exist_ok=True)
-        with sqlite3.connect(settings.sqlite_path) as conn:
-            conn.execute(
-                """
-                create table if not exists rag_parent_sections (
-                    parent_id text primary key,
-                    codigo text not null,
-                    title text not null,
-                    text text not null,
-                    page_start integer,
-                    page_end integer,
-                    metadata text not null
+        conn = sqlite3.connect(settings.sqlite_path)
+        try:
+            with conn:
+                conn.execute(
+                    """
+                    create table if not exists rag_parent_sections (
+                        parent_id text primary key,
+                        codigo text not null,
+                        title text not null,
+                        text text not null,
+                        page_start integer,
+                        page_end integer,
+                        metadata text not null
+                    )
+                    """
                 )
-                """
-            )
-            conn.execute(
-                """
-                create table if not exists rag_child_chunks (
-                    child_id text primary key,
-                    parent_id text not null,
-                    codigo text not null,
-                    text text not null,
-                    page_start integer,
-                    page_end integer,
-                    metadata text not null
+                conn.execute(
+                    """
+                    create table if not exists rag_child_chunks (
+                        child_id text primary key,
+                        parent_id text not null,
+                        codigo text not null,
+                        text text not null,
+                        page_start integer,
+                        page_end integer,
+                        metadata text not null
+                    )
+                    """
                 )
-                """
-            )
+        finally:
+            conn.close()
 
     def _norm(self, value: object) -> str:
         text = unicodedata.normalize("NFKD", str(value).lower())
