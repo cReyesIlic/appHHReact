@@ -3,7 +3,7 @@ import asyncio
 import time
 from io import BytesIO
 from pathlib import Path
-from urllib.parse import quote, urlparse
+from urllib.parse import quote, unquote, urlparse
 
 import httpx
 import msal
@@ -210,6 +210,129 @@ class SharePointClient:
             for f in files
         ]
 
+    async def list_project_pdn_files(
+        self,
+        offer_code: str,
+        project_code: str,
+        *,
+        limit: int = 1,
+    ) -> list[dict]:
+        """Busca el PDF de una oferta agrupada por su PDN dentro del proyecto.
+
+        Algunas ofertas (por ejemplo O-2611 a O-2620) comparten una carpeta vacía
+        que declara la correspondencia ordenada de códigos con PDN. En ese caso el
+        documento real vive en SH-XXXX. La selección exige simultáneamente rango,
+        proyecto exacto y número PDN en nombre/ruta; no acepta resultados por mera
+        similitud ni PDFs que sólo mencionen esa PDN en su contenido.
+        """
+        offer_code = normalize_offer_code(offer_code) or ""
+        project_code = normalize_project_code(project_code) or ""
+        if not self._configured() or not offer_code or not project_code:
+            return []
+        headers = self._headers()
+        async with httpx.AsyncClient(timeout=120) as client:
+            offers_site = settings.site_url_ofertas or settings.site_url_proyectos
+            projects_site = settings.site_url_proyectos or settings.site_url_ofertas
+            offers_drive = await self._default_drive_id(client, headers, offers_site)
+            offers_root = await self._item_by_path(client, headers, offers_drive, "01 Ofertas")
+            group = await self._find_child_by_code(
+                client, headers, offers_drive, offers_root["id"], offer_code
+            )
+            if not group:
+                return []
+            pdn = self._pdn_for_offer_group(group.get("name", ""), offer_code)
+            if pdn is None:
+                return []
+
+            projects_drive = await self._default_drive_id(client, headers, projects_site)
+            projects_root = await self._item_by_path(client, headers, projects_drive, "Proyectos")
+            project = await self._find_child_by_code(
+                client, headers, projects_drive, projects_root["id"], project_code
+            )
+            if not project:
+                return []
+            search_items: dict[str, dict] = {}
+            # El correlativo documental usado por SH-0390 codifica la PDN como
+            # 21 + tres dígitos (PDN 29 -> ...PDN-21029...). Consultamos ambos
+            # identificadores, pero la validación exacta posterior sigue siendo
+            # obligatoria para descartar PDFs que sólo mencionan PDN 29.
+            for term in (f"PDN{pdn}", f"21{pdn:03d}"):
+                query = quote(term, safe="")
+                search = await self._request_json(
+                    client,
+                    f"{GRAPH}/drives/{projects_drive}/root/search(q='{query}')?$top=200",
+                    headers=headers,
+                )
+                for item in search.get("value", []):
+                    if item.get("id"):
+                        search_items[item["id"]] = item
+            candidates = []
+            project_url = str(project.get("webUrl") or "").rstrip("/")
+            for item in search_items.values():
+                name = str(item.get("name") or "")
+                web_url = str(item.get("webUrl") or "")
+                if (
+                    not item.get("file")
+                    or not name.lower().endswith((".pdf", ".docx"))
+                    or not project_url
+                    or not web_url.startswith(project_url)
+                    or not self._is_exact_pdn_document(name, web_url, pdn)
+                ):
+                    continue
+                candidates.append(item)
+
+            # El mismo archivo suele repetirse en Emitidos y Notas de Envío.
+            # Conservamos la copia más reciente por nombre, priorizando aprobados.
+            unique: dict[str, dict] = {}
+            for item in candidates:
+                key = str(item.get("name") or "").casefold()
+                current = unique.get(key)
+                score = (
+                    "aprob" in self._norm(item.get("name", "")),
+                    str(item.get("lastModifiedDateTime") or ""),
+                )
+                current_score = (
+                    "aprob" in self._norm((current or {}).get("name", "")),
+                    str((current or {}).get("lastModifiedDateTime") or ""),
+                )
+                if current is None or score > current_score:
+                    unique[key] = item
+            selected = sorted(
+                unique.values(),
+                key=lambda item: (
+                    "aprob" in self._norm(item.get("name", "")),
+                    str(item.get("lastModifiedDateTime") or ""),
+                ),
+                reverse=True,
+            )[: max(1, min(int(limit), 5))]
+            detailed = []
+            for item in selected:
+                if not item.get("@microsoft.graph.downloadUrl"):
+                    item = await self._request_json(
+                        client,
+                        f"{GRAPH}/drives/{projects_drive}/items/{item['id']}",
+                        headers=headers,
+                    )
+                detailed.append(item)
+        return [
+            {
+                "id": item.get("id"),
+                "name": item.get("name"),
+                "size": item.get("size") or 0,
+                "webUrl": item.get("webUrl"),
+                "lastModifiedDateTime": item.get("lastModifiedDateTime"),
+                "eTag": item.get("eTag"),
+                "kind": str(item.get("name") or "").lower().rsplit(".", 1)[-1],
+                "sourceOfferCode": offer_code,
+                "sourceOfferName": group.get("name"),
+                "sourceProjectCode": project_code,
+                "sourcePdn": pdn,
+                "sourceScope": "project_pdn_exact",
+                "@microsoft.graph.downloadUrl": item.get("@microsoft.graph.downloadUrl"),
+            }
+            for item in detailed
+        ]
+
     async def _find_pdfs(self, client: httpx.AsyncClient, headers: dict[str, str], code: str) -> list[dict]:
         normalized = code.strip().upper()
         if normalized.startswith("O"):
@@ -264,7 +387,20 @@ class SharePointClient:
         drives = data.get("value", [])
         if not drives:
             raise RuntimeError("El sitio SharePoint no tiene drives disponibles")
-        return drives[0]["id"]
+        preferred = [
+            drive for drive in drives
+            if self._norm(drive.get("name", "")) in {
+                "documentos", "documentos compartidos", "shared documents"
+            }
+        ]
+        if preferred:
+            return preferred[0]["id"]
+        usable = [
+            drive for drive in drives
+            if "preservationholdlibrary" not in str(drive.get("webUrl") or "").casefold()
+            and "suspensiones de conservacion" not in self._norm(drive.get("name", ""))
+        ]
+        return (usable or drives)[0]["id"]
 
     async def _site_from_url(self, client: httpx.AsyncClient, headers: dict[str, str], site_url: str) -> dict:
         parsed = urlparse(site_url)
@@ -306,10 +442,62 @@ class SharePointClient:
         ]
         if exact:
             return exact[0]
+        if code.startswith("O-"):
+            ranged = [
+                child for child in children
+                if child.get("folder") is not None
+                and self._offer_range_contains(child.get("name", ""), code)
+            ]
+            if len(ranged) == 1:
+                return ranged[0]
         # Un codigo identifica datos comerciales y no admite aproximacion. Por
         # ejemplo, O-2637 y O-2370 son suficientemente parecidos para un fuzzy
         # match, pero pertenecen a propuestas distintas.
         return None
+
+    def _offer_range_contains(self, folder_name: str, code: str) -> bool:
+        bounds = self._offer_range_bounds(folder_name)
+        target = normalize_offer_code(code)
+        if not bounds or not target:
+            return False
+        number = int(target.split("-", 1)[1])
+        return bounds[0] <= number <= bounds[1]
+
+    def _pdn_for_offer_group(self, folder_name: str, code: str) -> int | None:
+        bounds = self._offer_range_bounds(folder_name)
+        target = normalize_offer_code(code)
+        if not bounds or not target:
+            return None
+        number = int(target.split("-", 1)[1])
+        if not bounds[0] <= number <= bounds[1]:
+            return None
+        match = re.search(
+            r"PDN(?:'S|S)?\s+(.+?)(?=\s+-\s+SH\b|$)",
+            folder_name.upper(),
+        )
+        if not match:
+            return None
+        pdns = [int(value) for value in re.findall(r"\d+", match.group(1))]
+        offset = number - bounds[0]
+        return pdns[offset] if offset < len(pdns) else None
+
+    def _offer_range_bounds(self, folder_name: str) -> tuple[int, int] | None:
+        match = re.search(
+            r"\bO\s*-?\s*(\d{1,6})\s+(?:A|AL|HASTA)\s+O?\s*-?\s*(\d{1,6})\b",
+            folder_name.upper(),
+        )
+        if not match:
+            return None
+        start, end = int(match.group(1)), int(match.group(2))
+        return (start, end) if start <= end else None
+
+    def _is_exact_pdn_document(self, name: str, web_url: str, pdn: int) -> bool:
+        target = str(int(pdn)).zfill(3)
+        for value in (name, unquote(web_url)):
+            for match in re.finditer(r"PDN\s*[-_]?\s*(\d+)", value, flags=re.IGNORECASE):
+                if match.group(1).zfill(3).endswith(target):
+                    return True
+        return False
 
     async def _find_child_by_names(self, client: httpx.AsyncClient, headers: dict[str, str], drive_id: str, parent_id: str, names: list[str]) -> dict | None:
         children = await self._children(client, headers, drive_id, parent_id)

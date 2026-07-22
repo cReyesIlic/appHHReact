@@ -188,6 +188,23 @@ class WikiAutoCompiler:
         except KeyError:
             existing = None
         draft = await self._draft(topic, source_text, "rag_autocompile", [codigo_upper], existing)
+        if draft.get("quality_mode") != "ai":
+            # La migración técnica no publica resúmenes heurísticos. El
+            # extractivo queda sólo como salvaguarda interna y la propuesta se
+            # mantiene pendiente para reintentar con Azure OpenAI.
+            return {
+                "codigo": codigo_upper,
+                "status": "ai_retry",
+                "error": "Azure OpenAI no generó una ficha que superara el control de evidencia; se reintentará.",
+                "sources": rag_payload.get("sources") or [],
+                "quality": {
+                    "mode": draft.get("quality_mode") or "unavailable",
+                    "rag_score": draft.get("rag_quality_score"),
+                    "wiki_score": draft.get("wiki_quality_score"),
+                    "summary": draft.get("quality_summary"),
+                    "issues": draft.get("quality_issues") or [],
+                },
+            }
         entry_title = str(draft.get("title") or topic)[:120]
         if codigo_upper not in entry_title.upper():
             entry_title = topic[:120]

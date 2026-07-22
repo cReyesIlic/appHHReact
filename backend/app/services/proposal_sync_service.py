@@ -49,7 +49,11 @@ from app.services.pipeline_registry import (
 )
 from app.services.proposal_taxonomy import enrich_metadata
 from app.services.rag_store import RagStore
-from app.services.sharepoint_client import SharePointClient, normalize_offer_code
+from app.services.sharepoint_client import (
+    SharePointClient,
+    normalize_offer_code,
+    normalize_project_code,
+)
 from app.services.structured_wiki import StructuredWikiService
 from app.services.wiki_auto_compiler import WikiAutoCompiler
 
@@ -336,19 +340,31 @@ class ProposalSyncService:
                 pdfs = await self.sharepoint.list_pdfs(codigo)
                 latest = self.sharepoint.select_latest_pdf(pdfs)
                 if not latest:
-                    if previous_source_mismatch:
-                        mismatch = ", ".join(sorted(previous_source_codes))
-                        error = f"Indice retirado: las fuentes registradas pertenecian a {mismatch}, no a {codigo}"
-                        cleanup = self._purge_invalid_index(codigo, previous_state or {})
-                        result.update({"status": "invalid_source_removed", "error": error, "cleanup": cleanup})
+                    project_code = self._project_code_for_offer(codigo)
+                    project_files = (
+                        await self.sharepoint.list_project_pdn_files(codigo, project_code)
+                        if project_code else []
+                    )
+                    if project_files:
+                        files = project_files
+                        result["source_fallback"] = "project_pdn_exact"
+                        result["source_project_code"] = project_code
+                        result["source_pdn"] = project_files[0].get("sourcePdn")
+                    else:
+                        if previous_source_mismatch:
+                            mismatch = ", ".join(sorted(previous_source_codes))
+                            error = f"Indice retirado: las fuentes registradas pertenecian a {mismatch}, no a {codigo}"
+                            cleanup = self._purge_invalid_index(codigo, previous_state or {})
+                            result.update({"status": "invalid_source_removed", "error": error, "cleanup": cleanup})
+                            self._record_manifest(result)
+                            self.pipeline.record_invalidated(codigo, error)
+                            return result
+                        result.update({"status": "no_files", "note": "sin documento emitido ni PDF PDN exacto en el proyecto asociado"})
                         self._record_manifest(result)
-                        self.pipeline.record_invalidated(codigo, error)
+                        self.pipeline.record_failure(codigo, result)
                         return result
-                    result.update({"status": "no_files", "note": "carpeta '03 Oferta/02 Emitido' vacía o sin PDF/DOCX/XLSX"})
-                    self._record_manifest(result)
-                    self.pipeline.record_failure(codigo, result)
-                    return result
-                files = [latest]
+                else:
+                    files = [latest]
             current_source_codes = self._source_offer_codes(files)
             if current_source_codes and codigo not in current_source_codes:
                 mismatch = ", ".join(sorted(current_source_codes))
@@ -635,6 +651,22 @@ class ProposalSyncService:
         }
 
     # ---- internal helpers ----
+
+    def _project_code_for_offer(self, codigo: str) -> str | None:
+        try:
+            rows = self.master.search(codigo=codigo, limit=1)
+        except Exception:
+            return None
+        if not rows:
+            return None
+        raw = str(rows[0].get("cod_proy") or "").strip()
+        normalized = normalize_project_code(raw)
+        if normalized:
+            return normalized
+        try:
+            return f"SH-{int(float(raw)):04d}"
+        except (TypeError, ValueError):
+            return None
 
     async def _process_excel_assets(self, codigo: str, assets: list[dict]) -> list[dict]:
         """Extrae HH localmente y, si esta configurado, normaliza presupuesto en paralelo."""

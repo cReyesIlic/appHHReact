@@ -204,6 +204,54 @@ class SharePointFolderMatchingTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(found["id"], "correct")
 
+    async def test_offer_code_accepts_explicit_range_but_not_fuzzy(self):
+        client = object.__new__(SharePointClient)
+        client._children = AsyncMock(
+            return_value=[
+                {
+                    "id": "group",
+                    "name": "O-2611 a O-2620 - PDN's 15-21-25-29-32-35-37-38-39-41 - SH-0390 - BHP",
+                    "folder": {"childCount": 4},
+                },
+                {"id": "wrong", "name": "O-2140 - Vecina", "folder": {"childCount": 1}},
+            ]
+        )
+
+        found = await client._find_child_by_code(Mock(), {}, "drive", "parent", "O-2614")
+
+        self.assertEqual(found["id"], "group")
+        self.assertEqual(client._pdn_for_offer_group(found["name"], "O-2614"), 29)
+        self.assertIsNone(client._pdn_for_offer_group(found["name"], "O-2621"))
+
+    async def test_default_drive_ignores_preservation_library(self):
+        client = object.__new__(SharePointClient)
+        client._site_from_url = AsyncMock(return_value={"id": "site"})
+        client._request_json = AsyncMock(
+            return_value={
+                "value": [
+                    {
+                        "id": "retention",
+                        "name": "Biblioteca de suspensiones de conservación",
+                        "webUrl": "https://tenant/PreservationHoldLibrary",
+                    },
+                    {"id": "docs", "name": "Documentos", "webUrl": "https://tenant/Documentos"},
+                ]
+            }
+        )
+
+        drive = await client._default_drive_id(Mock(), {}, "proyectos.vigentes")
+
+        self.assertEqual(drive, "docs")
+
+    def test_project_pdn_document_must_match_filename_or_path(self):
+        client = object.__new__(SharePointClient)
+        self.assertTrue(
+            client._is_exact_pdn_document("SRPS-2630-PC-PDN-21029_P.pdf", "https://tenant/SH-0390", 29)
+        )
+        self.assertFalse(
+            client._is_exact_pdn_document("SRPS-2630-PC-PDN-21091_P.pdf", "https://tenant/SH-0390", 29)
+        )
+
     async def test_registered_mismatched_source_is_removed_when_exact_folder_is_absent(self):
         service = object.__new__(ProposalSyncService)
         service.pipeline = Mock()
@@ -484,7 +532,12 @@ class WikiReprocessTests(SettingsPathsMixin, unittest.IsolatedAsyncioTestCase):
                 )
                 StructuredWikiService.invalidate_sync_cache()
                 compiler = WikiAutoCompiler()
-                compiler.llm.client = None
+                compiler._draft = AsyncMock(return_value={
+                    "title": "O-9999 - Oferta de prueba", "category": "propuesta", "tags": ["o-9999"],
+                    "content": "## Resumen ejecutivo\nContenido IA [F1].\n\n## Alcance del servicio\nIngeniería de detalle [F1].\n\n## Entregables\nMemoria y planos [F1].\n\n## Evidencia y fuentes\nFuente F1.",
+                    "quality_mode": "ai", "rag_quality_score": 85, "wiki_quality_score": 90,
+                    "quality_summary": "Ficha IA trazable.", "quality_issues": [],
+                })
 
                 first = await compiler.compile_for_proposal("O-9999")
                 second = await compiler.compile_for_proposal("O-9999", force=True)
@@ -537,7 +590,12 @@ class WikiReprocessTests(SettingsPathsMixin, unittest.IsolatedAsyncioTestCase):
                 proposal_page.write_text("---\nentry_id: legacy-bad\n---\ncontenido contaminado", encoding="utf-8")
 
                 compiler = WikiAutoCompiler()
-                compiler.llm.client = None
+                compiler._draft = AsyncMock(return_value={
+                    "title": "O-9999 - Oferta válida", "category": "propuesta", "tags": ["o-9999"],
+                    "content": "## Resumen ejecutivo\nContenido IA [F1].\n\n## Alcance del servicio\nAlcance válido [F1].\n\n## Entregables\nEntregables válidos [F1].\n\n## Evidencia y fuentes\nFuente F1.",
+                    "quality_mode": "ai", "rag_quality_score": 88, "wiki_quality_score": 91,
+                    "quality_summary": "Ficha IA trazable.", "quality_issues": [],
+                })
                 result = await compiler.compile_for_proposal("O-9999", force=True)
                 entries = [
                     row for row in wiki.list_entries()
@@ -578,6 +636,29 @@ class WikiReprocessTests(SettingsPathsMixin, unittest.IsolatedAsyncioTestCase):
 
                 self.assertEqual(result["status"], "invalid_rag")
                 self.assertGreater(result["invalid_parent_count"], 0)
+                self.assertFalse((base / "storage/llm_wiki/proposals/O-9999.md").exists())
+                del compiler
+                gc.collect()
+
+    async def test_compiler_does_not_publish_heuristic_wiki_when_ai_is_unavailable(self):
+        with tempfile.TemporaryDirectory() as temp_dir, self.patch_settings(temp_dir):
+            base = Path(temp_dir)
+            with patch.object(type(settings), "resolve_path", lambda _self, value: base / value):
+                ParentChildIndexer().index_parse_result(
+                    "O-9999",
+                    {"text": "## Alcance\nIngeniería y entregables verificables para la propuesta.", "pages": []},
+                    {
+                        "codigo": "O-9999",
+                        "archivo_nombre": "Oferta Técnica O-9999.pdf",
+                        "source_path": "storage/proposals/O-9999/Oferta Técnica O-9999.pdf",
+                    },
+                )
+                compiler = WikiAutoCompiler()
+                compiler.llm.client = None
+
+                result = await compiler.compile_for_proposal("O-9999", force=True)
+
+                self.assertEqual(result["status"], "ai_retry")
                 self.assertFalse((base / "storage/llm_wiki/proposals/O-9999.md").exists())
                 del compiler
                 gc.collect()
