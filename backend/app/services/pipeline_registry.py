@@ -11,7 +11,7 @@ from pathlib import Path
 from app.core.config import settings
 
 
-PIPELINE_VERSION = "2026.07.21.2"
+PIPELINE_VERSION = "2026.07.21.3"
 RAG_PIPELINE_VERSION = "parent-child-v2"
 WIKI_PIPELINE_VERSION = "wiki-ai-v2"
 
@@ -35,6 +35,8 @@ def compact_source_files(files: list[dict] | None) -> list[dict]:
                 "last_modified": str(item.get("lastModifiedDateTime") or item.get("last_modified") or ""),
                 "etag": str(item.get("eTag") or item.get("etag") or ""),
                 "web_url": item.get("webUrl") or item.get("web_url"),
+                "source_offer_code": item.get("sourceOfferCode") or item.get("source_offer_code"),
+                "source_offer_name": item.get("sourceOfferName") or item.get("source_offer_name"),
             }
         )
     return sorted(compact, key=lambda row: (row["name"].casefold(), row["id"]))
@@ -155,6 +157,7 @@ class PipelineRegistry:
             if result.get("wiki_status") in {"ok", "skipped"}
             and not result.get("embedding_error")
             and not result.get("file_errors")
+            and not result.get("excel_errors")
             else "partial"
         )
         conn = self._connect()
@@ -234,6 +237,44 @@ class PipelineRegistry:
                     (
                         codigo.upper(), str(result.get("status") or "error"),
                         str(result.get("error") or result.get("note") or ""), now, now,
+                    ),
+                )
+        finally:
+            conn.close()
+
+    def record_invalidated(self, codigo: str, error: str) -> None:
+        """Registra que se retiro un indice cuya fuente pertenecia a otro codigo."""
+        now = datetime.now().isoformat(timespec="seconds")
+        details = json.dumps({"reason": error}, ensure_ascii=False)
+        conn = self._connect()
+        try:
+            with conn:
+                conn.execute(
+                    """
+                    insert or ignore into proposal_pipeline_registry
+                        (codigo, created_at, updated_at)
+                    values (?, ?, ?)
+                    """,
+                    (codigo.upper(), now, now),
+                )
+                conn.execute(
+                    """
+                    update proposal_pipeline_registry set
+                        source_signature='', source_files='[]', source_file_count=0,
+                        pdf_count=0, docx_count=0, excel_count=0,
+                        source_last_modified=null, source_checked_at=?, source_synced_at=null,
+                        pipeline_version=?, rag_pipeline_version=?, wiki_pipeline_version=?,
+                        rag_status='removed_invalid_source', parent_count=0, child_count=0,
+                        embedding_count=0, rag_quality_score=null,
+                        wiki_status='removed_invalid_source', wiki_path='', wiki_entry_id='',
+                        wiki_quality_score=null, quality_mode='', quality_summary='',
+                        quality_details=?, status='invalid_source_removed', error=?,
+                        needs_reprocess=1, last_processed_at=?, updated_at=?
+                    where codigo=?
+                    """,
+                    (
+                        now, PIPELINE_VERSION, RAG_PIPELINE_VERSION, WIKI_PIPELINE_VERSION,
+                        details, error, now, now, codigo.upper(),
                     ),
                 )
         finally:

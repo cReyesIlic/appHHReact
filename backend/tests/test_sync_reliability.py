@@ -19,6 +19,7 @@ from app.services.database_runtime import prepare_runtime_database, runtime_data
 from app.services.master_repository import MasterRepository
 from app.services.pipeline_registry import PIPELINE_VERSION, PipelineRegistry, source_signature
 from app.services.proposal_sync_service import ProposalSyncService
+from app.services.sharepoint_client import SharePointClient
 from app.services.structured_wiki import StructuredWikiService
 from app.services.wiki_auto_compiler import WikiAutoCompiler
 
@@ -138,6 +139,109 @@ class QueueReliabilityTests(unittest.TestCase):
         self.assertIn("Ingeniero | 120", text)
 
 
+class SharePointFolderMatchingTests(unittest.IsolatedAsyncioTestCase):
+    async def test_offer_code_never_falls_back_to_fuzzy_neighbor(self):
+        client = object.__new__(SharePointClient)
+        client._children = AsyncMock(
+            return_value=[
+                {"id": "wrong", "name": "O-2370 - Oferta vecina", "folder": {"childCount": 1}},
+                {"id": "other", "name": "O-2638 - Otra oferta", "folder": {"childCount": 1}},
+            ]
+        )
+
+        found = await client._find_child_by_code(Mock(), {}, "drive", "parent", "O-2637")
+
+        self.assertIsNone(found)
+
+    async def test_offer_code_accepts_only_normalized_exact_folder(self):
+        client = object.__new__(SharePointClient)
+        client._children = AsyncMock(
+            return_value=[
+                {"id": "correct", "name": "O 2637 - Extension de plazo", "folder": {"childCount": 1}},
+                {"id": "wrong", "name": "O-2370 - Oferta vecina", "folder": {"childCount": 1}},
+            ]
+        )
+
+        found = await client._find_child_by_code(Mock(), {}, "drive", "parent", "O-2637")
+
+        self.assertEqual(found["id"], "correct")
+
+    async def test_registered_mismatched_source_is_removed_when_exact_folder_is_absent(self):
+        service = object.__new__(ProposalSyncService)
+        service.pipeline = Mock()
+        service.pipeline.get.return_value = {
+            "source_files": [{"web_url": "https://tenant/01%20Ofertas/O-2370%20-%20Vecina/doc.pdf"}],
+            "wiki_entry_id": "wrong-entry",
+        }
+        service.sharepoint = Mock()
+        service.sharepoint.list_emitido_files = AsyncMock(return_value=[])
+        service.sharepoint.list_pdfs = AsyncMock(return_value=[])
+        service.sharepoint.select_latest_pdf.return_value = None
+        service._purge_invalid_index = Mock(return_value={"rag_parent_sections": 1, "wiki_page": True})
+        service._record_manifest = Mock()
+
+        result = await service.sync_code("O-2637")
+
+        self.assertEqual(result["status"], "invalid_source_removed")
+        service._purge_invalid_index.assert_called_once()
+        service.pipeline.record_invalidated.assert_called_once()
+        service.sharepoint.download_file.assert_not_called()
+
+
+class ExcelPipelineTests(SettingsPathsMixin, unittest.IsolatedAsyncioTestCase):
+    async def test_excel_assets_are_parsed_into_hh_tables(self):
+        workbook = Workbook()
+        workbook.active.title = "Estimacion HH"
+        workbook.active.append(["Item", "Cargo", "Horas"])
+        workbook.active.append(["1.1", "Ingeniero", 120])
+
+        with tempfile.TemporaryDirectory() as temp_dir, self.patch_settings(temp_dir):
+            path = Path(temp_dir) / "horas.xlsx"
+            workbook.save(path)
+            service = object.__new__(ProposalSyncService)
+            budget = Mock(available=False)
+            with patch(
+                "app.services.budget_extractor_client.BudgetExtractorClient",
+                return_value=budget,
+            ):
+                result = await service._process_excel_assets(
+                    "O-9999",
+                    [
+                        {
+                            "name": "horas.xlsx",
+                            "source_file": "horas__item1.xlsx",
+                            "kind": "xlsx",
+                            "content": path.read_bytes(),
+                            "local_path": str(path),
+                        }
+                    ],
+                )
+
+            self.assertEqual(result[0]["hh_status"], "ok")
+            self.assertGreater(result[0]["hh_rows"], 0)
+            with closing(sqlite3.connect(settings.sqlite_path)) as conn:
+                rows = conn.execute(
+                    "select count(*) from hh_estimate_rows where codigo = 'O-9999'"
+                ).fetchone()[0]
+            self.assertGreater(rows, 0)
+
+    async def test_duplicate_names_get_distinct_cache_paths(self):
+        with tempfile.TemporaryDirectory() as temp_dir, self.patch_settings(temp_dir):
+            base = Path(temp_dir)
+            with patch.object(
+                type(settings),
+                "resolve_path",
+                lambda _self, value: base / value,
+            ):
+                client = object.__new__(SharePointClient)
+                first = client.save_pdf_locally("O-9999", "Oferta.xlsx", b"first", item_id="ITEM-001")
+                second = client.save_pdf_locally("O-9999", "Oferta.xlsx", b"second", item_id="ITEM-002")
+
+                self.assertNotEqual(first, second)
+                self.assertEqual(first.read_bytes(), b"first")
+                self.assertEqual(second.read_bytes(), b"second")
+
+
 class PipelineRegistryTests(SettingsPathsMixin, unittest.IsolatedAsyncioTestCase):
     async def test_registry_tracks_files_quality_and_detects_source_change(self):
         initial = [
@@ -180,6 +284,13 @@ class PipelineRegistryTests(SettingsPathsMixin, unittest.IsolatedAsyncioTestCase
                 )
                 conn.commit()
             self.assertEqual(registry.status()["needs_reprocess"], 1)
+
+            registry.record_invalidated("O-9999", "fuente asociada a O-1111")
+            invalidated = registry.get("O-9999")
+            self.assertEqual(invalidated["status"], "invalid_source_removed")
+            self.assertEqual((invalidated["pdf_count"], invalidated["excel_count"]), (0, 0))
+            self.assertEqual((invalidated["parent_count"], invalidated["embedding_count"]), (0, 0))
+            self.assertTrue(invalidated["needs_reprocess"])
 
     async def test_invalid_recheck_env_falls_back_without_breaking_cycle(self):
         initial = [

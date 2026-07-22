@@ -161,6 +161,8 @@ class SharePointClient:
                 "lastModifiedDateTime": f.get("lastModifiedDateTime"),
                 "eTag": f.get("eTag"),
                 "kind": (f.get("name", "").lower().rsplit(".", 1)[-1] if "." in f.get("name", "") else ""),
+                "sourceOfferCode": normalize_offer_code(offer.get("name", "")),
+                "sourceOfferName": offer.get("name"),
                 "@microsoft.graph.downloadUrl": f.get("@microsoft.graph.downloadUrl"),
             }
             for f in files
@@ -293,12 +295,20 @@ class SharePointClient:
         if not code:
             return None
         children = await self._children(client, headers, drive_id, parent_id)
-        exact = [child for child in children if normalize_offer_code(child["name"]) == code or normalize_project_code(child["name"]) == code]
+        exact = [
+            child
+            for child in children
+            if child.get("folder") is not None
+            and (
+                normalize_offer_code(child.get("name", "")) == code
+                or normalize_project_code(child.get("name", "")) == code
+            )
+        ]
         if exact:
             return exact[0]
-        ranked = sorted(children, key=lambda child: fuzz.partial_ratio(code, child["name"].upper()), reverse=True)
-        if ranked and fuzz.partial_ratio(code, ranked[0]["name"].upper()) >= 85:
-            return ranked[0]
+        # Un codigo identifica datos comerciales y no admite aproximacion. Por
+        # ejemplo, O-2637 y O-2370 son suficientemente parecidos para un fuzzy
+        # match, pero pertenecen a propuestas distintas.
         return None
 
     async def _find_child_by_names(self, client: httpx.AsyncClient, headers: dict[str, str], drive_id: str, parent_id: str, names: list[str]) -> dict | None:
@@ -397,8 +407,12 @@ class SharePointClient:
 
         return sorted(pdfs, key=score, reverse=True)[0]
 
-    def save_pdf_locally(self, codigo: str, pdf_name: str, content: bytes) -> Path:
+    def save_pdf_locally(self, codigo: str, pdf_name: str, content: bytes, item_id: str | None = None) -> Path:
         safe_name = re.sub(r"[^A-Za-z0-9._ -]+", "_", pdf_name).strip()
+        if item_id:
+            safe_id = re.sub(r"[^A-Za-z0-9]+", "", str(item_id))[-12:]
+            name_path = Path(safe_name)
+            safe_name = f"{name_path.stem}__{safe_id}{name_path.suffix}"
         path = settings.resolve_path(f"storage/proposals/{codigo.upper()}/{safe_name}")
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_bytes(content)

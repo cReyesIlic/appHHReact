@@ -1,6 +1,7 @@
 import re
 import sqlite3
 import unicodedata
+from contextlib import closing
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -37,17 +38,21 @@ class HHExcelExtractor:
         if file_path.suffix.lower() not in {".xlsx", ".xlsm"}:
             return {"codigo": codigo, "status": "unsupported", "rows": 0, "error": f"Formato no soportado: {file_path.suffix}"}
         rows: list[HHRow] = []
+        workbook = None
         try:
             workbook = load_workbook(file_path, read_only=True, data_only=True)
             for sheet in workbook.worksheets:
                 rows.extend(self._extract_sheet(codigo, file_path, sheet))
         except Exception as exc:
             return {"codigo": codigo, "status": "error", "rows": 0, "error": str(exc)}
+        finally:
+            if workbook is not None:
+                workbook.close()
         self.replace_file(codigo, str(file_path), rows)
         return {"codigo": codigo, "status": "ok", "rows": len(rows), "error": ""}
 
     def replace_file(self, codigo: str, file_path: str, rows: list[HHRow]) -> None:
-        with sqlite3.connect(settings.sqlite_path) as conn:
+        with closing(sqlite3.connect(settings.sqlite_path)) as conn, conn:
             conn.execute("delete from hh_estimate_rows where codigo = ? and file_path = ?", (codigo, file_path))
             for row in rows:
                 conn.execute(
@@ -95,7 +100,7 @@ class HHExcelExtractor:
             sql += " where " + " and ".join(where)
         sql += " order by codigo, workbook_name, sheet_name, row_number limit ?"
         params.append(str(limit))
-        with sqlite3.connect(settings.sqlite_path) as conn:
+        with closing(sqlite3.connect(settings.sqlite_path)) as conn:
             conn.row_factory = sqlite3.Row
             return [dict(row) for row in conn.execute(sql, params).fetchall()]
 
@@ -105,7 +110,7 @@ class HHExcelExtractor:
         if codigo:
             where = "where codigo = ?"
             params.append(codigo.upper())
-        with sqlite3.connect(settings.sqlite_path) as conn:
+        with closing(sqlite3.connect(settings.sqlite_path)) as conn:
             row = conn.execute(
                 f"""
                 select count(*) rows,
@@ -335,7 +340,7 @@ class HHExcelExtractor:
 
     def _ensure_tables(self) -> None:
         settings.sqlite_path.parent.mkdir(parents=True, exist_ok=True)
-        with sqlite3.connect(settings.sqlite_path) as conn:
+        with closing(sqlite3.connect(settings.sqlite_path)) as conn, conn:
             conn.execute(
                 """
                 create table if not exists hh_estimate_rows (

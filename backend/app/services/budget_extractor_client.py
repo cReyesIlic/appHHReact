@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import logging
 import sqlite3
+from contextlib import closing
 from datetime import datetime
 from typing import Any
 
@@ -98,7 +99,7 @@ class BudgetExtractorClient:
         proyecto_filas = extracted.get("proyecto_filas") or []
         tarifas_filas = extracted.get("tarifas_filas") or []
         gastos_filas = extracted.get("gastos_filas") or []
-        with sqlite3.connect(settings.sqlite_path, timeout=10) as conn:
+        with closing(sqlite3.connect(settings.sqlite_path, timeout=10)) as conn, conn:
             # Reemplaza el set previo de este (codigo, source_file)
             conn.execute("delete from proyectos_extracted where codigo=? and source_file=?", (codigo, source_file))
             conn.execute("delete from proyecto_tarifas where codigo=? and source_file=?", (codigo, source_file))
@@ -144,7 +145,7 @@ class BudgetExtractorClient:
         # Azure Files monta este directorio en produccion. SQLite no crea por
         # si solo el directorio padre durante el primer request del contenedor.
         settings.sqlite_path.parent.mkdir(parents=True, exist_ok=True)
-        with sqlite3.connect(settings.sqlite_path, timeout=10) as conn:
+        with closing(sqlite3.connect(settings.sqlite_path, timeout=10)) as conn, conn:
             conn.executescript("""
                 create table if not exists proyectos_extracted (
                     id integer primary key autoincrement,
@@ -212,7 +213,7 @@ class BudgetExtractorClient:
     def get_for_codigo(self, codigo: str) -> dict:
         """Devuelve todo lo extraído para un código: filas, tarifas y gastos."""
         codigo = codigo.strip().upper()
-        with sqlite3.connect(settings.sqlite_path, timeout=10) as conn:
+        with closing(sqlite3.connect(settings.sqlite_path, timeout=10)) as conn:
             conn.row_factory = sqlite3.Row
             filas = [dict(r) for r in conn.execute(
                 "select * from proyectos_extracted where codigo=? order by source_file, item", (codigo,)

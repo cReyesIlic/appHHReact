@@ -27,6 +27,7 @@ import json
 import os
 import sqlite3
 import time
+from contextlib import closing
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -48,7 +49,7 @@ from app.services.pipeline_registry import (
 )
 from app.services.proposal_taxonomy import enrich_metadata
 from app.services.rag_store import RagStore
-from app.services.sharepoint_client import SharePointClient
+from app.services.sharepoint_client import SharePointClient, normalize_offer_code
 from app.services.structured_wiki import StructuredWikiService
 from app.services.wiki_auto_compiler import WikiAutoCompiler
 
@@ -262,6 +263,13 @@ class ProposalSyncService:
             "chunks_child": 0,
             "wiki_status": "skipped",
         }
+        previous_state = self.pipeline.get(codigo)
+        previous_source_codes = self._source_offer_codes((previous_state or {}).get("source_files") or [])
+        previous_source_mismatch = bool(previous_source_codes and codigo not in previous_source_codes)
+        if previous_source_mismatch:
+            # La Wiki anterior tampoco se puede reutilizar si fue construida con
+            # documentos de otra propuesta.
+            force_wiki = True
 
         # 1-3. Descargar y parsear (PDF, DOCX, XLSX)
         try:
@@ -271,28 +279,67 @@ class ProposalSyncService:
                 pdfs = await self.sharepoint.list_pdfs(codigo)
                 latest = self.sharepoint.select_latest_pdf(pdfs)
                 if not latest:
+                    if previous_source_mismatch:
+                        mismatch = ", ".join(sorted(previous_source_codes))
+                        error = f"Indice retirado: las fuentes registradas pertenecian a {mismatch}, no a {codigo}"
+                        cleanup = self._purge_invalid_index(codigo, previous_state or {})
+                        result.update({"status": "invalid_source_removed", "error": error, "cleanup": cleanup})
+                        self._record_manifest(result)
+                        self.pipeline.record_invalidated(codigo, error)
+                        return result
                     result.update({"status": "no_files", "note": "carpeta '03 Oferta/02 Emitido' vacía o sin PDF/DOCX/XLSX"})
                     self._record_manifest(result)
                     self.pipeline.record_failure(codigo, result)
                     return result
                 files = [latest]
+            current_source_codes = self._source_offer_codes(files)
+            if current_source_codes and codigo not in current_source_codes:
+                mismatch = ", ".join(sorted(current_source_codes))
+                error = f"Fuente rechazada: corresponde a {mismatch}, no a {codigo}"
+                cleanup = None
+                if previous_source_mismatch:
+                    cleanup = self._purge_invalid_index(codigo, previous_state or {})
+                    self.pipeline.record_invalidated(codigo, error)
+                else:
+                    self.pipeline.record_failure(codigo, {"status": "source_mismatch", "error": error})
+                result.update({"status": "source_mismatch", "error": error})
+                if cleanup is not None:
+                    result["cleanup"] = cleanup
+                self._record_manifest(result)
+                return result
             # Procesar todos los archivos emitidos → concatenar texto
             full_text_parts = []
             processed_files = []
             file_errors = []
+            excel_assets = []
             first_pages_text = ""
             primary_name = None
             primary_path = None
             primary_url = None
             for f in files:
                 content = await self.sharepoint.download_file(f)
-                local_path = self.sharepoint.save_pdf_locally(codigo, f.get("name", "doc.bin"), content)
+                local_path = self.sharepoint.save_pdf_locally(
+                    codigo,
+                    f.get("name", "doc.bin"),
+                    content,
+                    item_id=f.get("id"),
+                )
                 kind = (f.get("name", "").lower().rsplit(".", 1)[-1] if "." in f.get("name", "") else "")
                 file_text = self._extract_text_any(content, kind, f.get("name", ""))
                 if not file_text.strip() or file_text.startswith("[error extrayendo "):
                     file_errors.append(file_text or f"{f.get('name')}: sin texto extraible")
                     continue
                 processed_files.append(f)
+                if kind in {"xlsx", "xlsm", "xls"}:
+                    excel_assets.append(
+                        {
+                            "name": f.get("name") or local_path.name,
+                            "source_file": local_path.name,
+                            "kind": kind,
+                            "content": content,
+                            "local_path": str(local_path),
+                        }
+                    )
                 full_text_parts.append(f"\n\n## Fuente: {f.get('name')}\n\n{file_text}")
                 # primer archivo procesable = "primario" (para metadata + name)
                 if primary_name is None:
@@ -325,6 +372,15 @@ class ProposalSyncService:
             result["kinds_processed"] = sorted(
                 set(f.get("name", "").lower().rsplit(".", 1)[-1] for f in processed_files if "." in f.get("name", ""))
             )
+            if excel_assets:
+                excel_processing = await self._process_excel_assets(codigo, excel_assets)
+                result["excel_processing"] = excel_processing
+                result["excel_parsed_files"] = sum(
+                    1 for row in excel_processing if row.get("hh_status") == "ok" or row.get("budget_persisted")
+                )
+                result["excel_errors"] = [
+                    row["error"] for row in excel_processing if row.get("error")
+                ]
             result["source_signature"] = source_signature(files)
         except Exception as exc:  # noqa: BLE001
             result.update({"status": "error", "error": f"sharepoint: {exc}"})
@@ -486,6 +542,115 @@ class ProposalSyncService:
 
     # ---- internal helpers ----
 
+    async def _process_excel_assets(self, codigo: str, assets: list[dict]) -> list[dict]:
+        """Extrae HH localmente y, si esta configurado, normaliza presupuesto en paralelo."""
+        from app.services.budget_extractor_client import BudgetExtractorClient
+        from app.services.hh_excel_extractor import HHExcelExtractor
+
+        hh = HHExcelExtractor()
+        budget = BudgetExtractorClient()
+        results: list[dict] = []
+        for asset in assets:
+            row = {
+                "name": asset["name"],
+                "source_file": asset["source_file"],
+                "hh_status": "unsupported",
+                "hh_rows": 0,
+            }
+            if asset.get("kind") in {"xlsx", "xlsm"}:
+                hh_result = hh.extract_file(codigo, asset["local_path"])
+                row["hh_status"] = hh_result.get("status")
+                row["hh_rows"] = int(hh_result.get("rows") or 0)
+                if hh_result.get("status") == "error":
+                    row["error"] = f"{asset['name']}: HH: {hh_result.get('error') or 'error'}"
+            results.append(row)
+
+        if not budget.available:
+            return results
+
+        extracted = await asyncio.gather(
+            *(
+                budget.extract_normalized(codigo, asset["content"], asset["source_file"])
+                for asset in assets
+            )
+        )
+        for row, payload in zip(results, extracted):
+            if payload.get("error"):
+                error = f"{row['name']}: presupuesto: {payload['error']}"
+                row["error"] = f"{row['error']}; {error}" if row.get("error") else error
+                continue
+            row["budget_persisted"] = budget.persist(codigo, row["source_file"], payload)
+            row["budget_totals"] = payload.get("totals")
+        return results
+
+    def _source_offer_codes(self, files: list[dict]) -> set[str]:
+        explicit = {
+            str(row.get("sourceOfferCode") or row.get("source_offer_code") or "").upper()
+            for row in files
+            if row.get("sourceOfferCode") or row.get("source_offer_code")
+        }
+        if explicit:
+            return explicit
+        detected: set[str] = set()
+        for row in files:
+            # La URL de los PDFs incluye la carpeta de oferta. No usamos el
+            # nombre del archivo: una oferta valida puede citar otra propuesta.
+            value = str(row.get("webUrl") or row.get("web_url") or "")
+            code = normalize_offer_code(value)
+            if code:
+                detected.add(code)
+        return detected
+
+    def _purge_invalid_index(self, codigo: str, state: dict) -> dict:
+        """Retira RAG/Wiki contaminados, limitado al codigo comprobado."""
+        codigo = codigo.upper()
+        removed: dict[str, int | bool | str] = {}
+        tables = (
+            "rag_child_embeddings",
+            "rag_child_chunks",
+            "rag_parent_sections",
+            "rag_chunks",
+            "proposal_knowledge",
+        )
+        with closing(sqlite3.connect(settings.sqlite_path, timeout=30)) as conn, conn:
+                existing = {
+                    row[0]
+                    for row in conn.execute("select name from sqlite_master where type='table'").fetchall()
+                }
+                for table in tables:
+                    if table not in existing:
+                        removed[table] = 0
+                        continue
+                    count = conn.execute(f"select count(*) from {table} where codigo = ?", (codigo,)).fetchone()[0]
+                    conn.execute(f"delete from {table} where codigo = ?", (codigo,))
+                    removed[table] = int(count or 0)
+
+        entry_id = str(state.get("wiki_entry_id") or "").strip()
+        if entry_id:
+            try:
+                self.wiki.delete_entry(entry_id)
+                removed["wiki_entry"] = entry_id
+            except KeyError:
+                removed["wiki_entry"] = False
+        proposal_page = settings.resolve_path(f"storage/llm_wiki/proposals/{codigo}.md")
+        if proposal_page.exists():
+            proposal_page.unlink()
+            removed["wiki_page"] = True
+        else:
+            removed["wiki_page"] = False
+        cache_dir = settings.resolve_path(f"storage/proposals/{codigo}")
+        cache_files_removed = 0
+        if cache_dir.exists():
+            for path in cache_dir.iterdir():
+                if path.is_file():
+                    path.unlink()
+                    cache_files_removed += 1
+            if not any(cache_dir.iterdir()):
+                cache_dir.rmdir()
+        removed["cache_files"] = cache_files_removed
+        StructuredWikiService.invalidate_sync_cache()
+        return removed
+
     def _ganadas_master_rows(self) -> list[dict]:
         from app.services.proposal_taxonomy import status_category
 
@@ -571,6 +736,8 @@ class ProposalSyncService:
         rag_score += 25 if int(result.get("embedding_count") or 0) > 0 and not result.get("embedding_error") else 0
         if result.get("file_errors"):
             rag_score = max(0, rag_score - 15)
+        if result.get("excel_errors"):
+            rag_score = max(0, rag_score - 10)
         wiki_score = ai_quality.get("wiki_score")
         if wiki_score is None:
             wiki_score = 70 if result.get("wiki_status") == "ok" else 45 if result.get("wiki_status") == "skipped" else 0
@@ -579,7 +746,11 @@ class ProposalSyncService:
             "rag_score": ai_quality.get("rag_score", rag_score),
             "wiki_score": wiki_score,
             "summary": ai_quality.get("summary") or "Calidad calculada con señales objetivas del pipeline.",
-            "issues": [*(ai_quality.get("issues") or []), *result.get("file_errors", [])][:8],
+            "issues": [
+                *(ai_quality.get("issues") or []),
+                *result.get("file_errors", []),
+                *result.get("excel_errors", []),
+            ][:8],
         }
 
     def _bounded_env_int(self, name: str, default: int, *, minimum: int, maximum: int) -> int:
@@ -590,7 +761,7 @@ class ProposalSyncService:
         return max(minimum, min(maximum, value))
 
     def _codigos_with_rag(self) -> set[str]:
-        with sqlite3.connect(settings.sqlite_path, timeout=5) as conn:
+        with closing(sqlite3.connect(settings.sqlite_path, timeout=5)) as conn:
             rows = conn.execute("select distinct codigo from rag_parent_sections").fetchall()
         return {str(r[0]).upper() for r in rows if r[0]}
 
@@ -633,7 +804,7 @@ class ProposalSyncService:
         # HybridRagStore.build() ya filtra por LEFT JOIN sobre embeddings del modelo activo,
         # pero no por codigo. Hacemos una corrida limitada apuntada con un fetch directo.
         model = self.hybrid.embeddings.deployment
-        with sqlite3.connect(settings.sqlite_path, timeout=5) as conn:
+        with closing(sqlite3.connect(settings.sqlite_path, timeout=5)) as conn:
             conn.row_factory = sqlite3.Row
             rows = [
                 dict(r)
