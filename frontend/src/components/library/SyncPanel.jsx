@@ -281,7 +281,7 @@ export function SyncPanel({ onChanged }) {
             Scheduler interno {scheduler?.running ? "· activo" : "· detenido"}
           </div>
           <small className="dim" style={{ display: "block", marginBottom: 8 }}>
-            La app corre cinco ciclos diarios en hora Chile: 02:15, 07:15, 12:15, 17:15 y 22:15.
+            La app corre un ciclo diario a las 02:15, hora de Chile.
           </small>
           {scheduler?.jobs?.length > 0 && (
             <div className="flex-col" style={{ gap: 4, marginBottom: 8 }}>

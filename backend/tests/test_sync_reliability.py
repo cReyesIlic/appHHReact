@@ -532,7 +532,7 @@ class MasterCodeFilterTests(unittest.TestCase):
 
 class SchedulerReliabilityTests(unittest.IsolatedAsyncioTestCase):
     @unittest.skipUnless(importlib.util.find_spec("apscheduler"), "APScheduler no instalado en el Python local")
-    async def test_scheduler_runs_five_times_daily_in_chile_timezone(self):
+    async def test_scheduler_runs_once_daily_in_chile_timezone(self):
         from app.services import scheduler
 
         scheduler.shutdown_scheduler()
@@ -540,7 +540,7 @@ class SchedulerReliabilityTests(unittest.IsolatedAsyncioTestCase):
             os.environ,
             {
                 "SYNC_SCHEDULE_ENABLED": "true",
-                "SYNC_SCHEDULE_HOURS": "2,7,12,17,22",
+                "SYNC_SCHEDULE_HOURS": "2",
                 "SYNC_SCHEDULE_TZ": "America/Santiago",
                 "SYNC_SCHEDULE_MINUTE": "15",
             },
@@ -550,8 +550,8 @@ class SchedulerReliabilityTests(unittest.IsolatedAsyncioTestCase):
             status = scheduler.scheduler_status()
             scheduler.shutdown_scheduler()
 
-        self.assertEqual(info["runs_per_day"], 5)
-        self.assertEqual(info["hours"], [2, 7, 12, 17, 22])
+        self.assertEqual(info["runs_per_day"], 1)
+        self.assertEqual(info["hours"], [2])
         self.assertEqual(status["timezone"], "America/Santiago")
         self.assertEqual(
             {job["id"] for job in status["jobs"]},
@@ -559,7 +559,7 @@ class SchedulerReliabilityTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertTrue(all(job["timezone"] == "America/Santiago" for job in status["jobs"]))
         sync_job = next(job for job in status["jobs"] if job["id"] == "sync_ganadas_periodic")
-        self.assertIn("2,7,12,17,22", sync_job["trigger"])
+        self.assertIn("hour='2'", sync_job["trigger"])
 
 
 if __name__ == "__main__":

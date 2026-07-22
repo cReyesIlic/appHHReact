@@ -2,11 +2,11 @@
 
 Reemplaza al workflow `sync-daily.yml` de GitHub Actions. La app es autónoma:
 arranca con uvicorn, levanta un BackgroundScheduler en el mismo proceso, y dispara
-`sync_ganadas` cinco veces al día (02:15, 07:15, 12:15, 17:15 y 22:15 Chile).
+`sync_ganadas` una vez al día (02:15 Chile).
 
 Config via env:
   SYNC_SCHEDULE_ENABLED   = "true" / "false"  (default true)
-  SYNC_SCHEDULE_HOURS     = horas locales separadas por coma (default 2,7,12,17,22)
+  SYNC_SCHEDULE_HOURS     = horas locales separadas por coma (default 2)
   SYNC_SCHEDULE_MINUTE    = minuto local (default 15)
   SYNC_SCHEDULE_LIMIT     = máximo de propuestas por corrida (default 20)
   SYNC_SOURCE_RECHECK_LIMIT = fuentes ya indexadas a revisar por corrida (default 200)
@@ -49,7 +49,7 @@ def _int_env(name: str, default: int) -> int:
 
 
 def _schedule_hours() -> list[int]:
-    raw = os.getenv("SYNC_SCHEDULE_HOURS", "2,7,12,17,22")
+    raw = os.getenv("SYNC_SCHEDULE_HOURS", "2")
     hours: list[int] = []
     for value in raw.split(","):
         try:
@@ -58,7 +58,7 @@ def _schedule_hours() -> list[int]:
             continue
         if 0 <= hour <= 23 and hour not in hours:
             hours.append(hour)
-    return sorted(hours) or [2, 7, 12, 17, 22]
+    return sorted(hours) or [2]
 
 
 async def _run_sync_ganadas() -> None:
