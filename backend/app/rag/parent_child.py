@@ -407,9 +407,16 @@ class ParentChildIndexer:
             "bases",
             "consideraciones",
         ]
-        if any(term in norm for term in known):
+        if any(norm == term or norm.startswith(f"{term} ") for term in known):
             return True
-        return bool(re.match(r"^(\d+(\.\d+)*|[A-Z])[\). -]+[A-ZÁÉÍÓÚÑ]", line))
+        numbered = re.match(r"^\d+(?:\.\d+)*[\). -]+(.+)$", norm)
+        if not numbered:
+            return False
+        numbered_title = numbered.group(1).strip()
+        return any(
+            numbered_title == term or numbered_title.startswith(f"{term} ")
+            for term in known
+        )
 
     def _ensure_tables(self) -> None:
         settings.sqlite_path.parent.mkdir(parents=True, exist_ok=True)

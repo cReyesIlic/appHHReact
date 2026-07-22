@@ -154,7 +154,15 @@ class WikiAutoCompiler:
         proposals_dir.mkdir(parents=True, exist_ok=True)
         target_file = proposals_dir / f"{codigo_upper}.md"
         if target_file.exists() and not force:
-            return {"codigo": codigo_upper, "status": "skipped", "reason": "ya existe", "path": str(target_file)}
+            published = self._published_ai_page(target_file, codigo_upper)
+            if published:
+                return {
+                    "codigo": codigo_upper,
+                    "status": "skipped",
+                    "reason": "wiki AI evidence-v3 vigente",
+                    "path": str(target_file),
+                    **published,
+                }
 
         rag_payload = self._collect_rag_material(codigo_upper)
         if not rag_payload["parents"]:
@@ -253,6 +261,42 @@ class WikiAutoCompiler:
                 "wiki_score": draft.get("wiki_quality_score"),
                 "summary": draft.get("quality_summary"),
                 "issues": draft.get("quality_issues") or [],
+            },
+        }
+
+    def _published_ai_page(self, path, codigo: str) -> dict | None:
+        """Recupera identidad/calidad sin degradar una Wiki AI ya publicada."""
+        try:
+            text = path.read_text(encoding="utf-8")
+        except OSError:
+            return None
+        if not text.startswith("---"):
+            return None
+        _, _, rest = text.partition("---")
+        frontmatter, separator, _ = rest.partition("---")
+        if not separator:
+            return None
+        meta = {}
+        for line in frontmatter.splitlines():
+            if ":" not in line:
+                continue
+            key, value = line.split(":", 1)
+            meta[key.strip()] = value.strip().strip('"')
+        if meta.get("wiki_schema") != "evidence-v3":
+            return None
+        try:
+            wiki_score = float(meta.get("wiki_quality_score") or 0)
+        except (TypeError, ValueError):
+            wiki_score = 0.0
+        return {
+            "entry_id": meta.get("entry_id") or sha1(
+                f"rag_autocompile:{codigo}".encode("utf-8")
+            ).hexdigest()[:12],
+            "quality": {
+                "mode": "ai",
+                "wiki_score": wiki_score,
+                "summary": "Wiki AI evidence-v3 ya publicada; se conserva su evaluación.",
+                "issues": [],
             },
         }
 

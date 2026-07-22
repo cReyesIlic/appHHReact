@@ -126,6 +126,14 @@ class ParentChildReliabilityTests(SettingsPathsMixin, unittest.TestCase):
                 )]
             self.assertEqual(lengths, [1000, 1000])
 
+    def test_page_heading_detection_ignores_table_cells(self):
+        with tempfile.TemporaryDirectory() as temp_dir, self.patch_settings(temp_dir):
+            indexer = ParentChildIndexer()
+
+            self.assertFalse(indexer._looks_like_heading("x Inmediata x Plazos"))
+            self.assertFalse(indexer._looks_like_heading("200 ADistribucion de VDC a control"))
+            self.assertTrue(indexer._looks_like_heading("3. Alcance del servicio"))
+
 
 class ProposalExtractionTests(unittest.TestCase):
     def test_pdf_extraction_preserves_page_numbers(self):
@@ -569,6 +577,45 @@ class PipelineRegistryTests(SettingsPathsMixin, unittest.IsolatedAsyncioTestCase
 
 
 class WikiReprocessTests(SettingsPathsMixin, unittest.IsolatedAsyncioTestCase):
+    async def test_current_ai_page_is_skipped_without_losing_ai_quality(self):
+        with tempfile.TemporaryDirectory() as temp_dir, self.patch_settings(temp_dir):
+            base = Path(temp_dir)
+            with patch.object(type(settings), "resolve_path", lambda _self, value: base / value):
+                page = base / "storage/llm_wiki/proposals/O-9999.md"
+                page.parent.mkdir(parents=True)
+                page.write_text(
+                    "---\nentry_id: ai-page\nwiki_schema: evidence-v3\nwiki_quality_score: 91\n---\n# vigente",
+                    encoding="utf-8",
+                )
+                compiler = WikiAutoCompiler()
+                compiler._collect_rag_material = Mock(side_effect=AssertionError("no debe recompilar"))
+
+                result = await compiler.compile_for_proposal("O-9999")
+
+                self.assertEqual(result["status"], "skipped")
+                self.assertEqual(result["entry_id"], "ai-page")
+                self.assertEqual(result["quality"]["mode"], "ai")
+                self.assertEqual(result["quality"]["wiki_score"], 91)
+                del compiler
+                gc.collect()
+
+    async def test_legacy_page_is_not_treated_as_current(self):
+        with tempfile.TemporaryDirectory() as temp_dir, self.patch_settings(temp_dir):
+            base = Path(temp_dir)
+            with patch.object(type(settings), "resolve_path", lambda _self, value: base / value):
+                page = base / "storage/llm_wiki/proposals/O-9999.md"
+                page.parent.mkdir(parents=True)
+                page.write_text("---\nwiki_schema: legacy\n---\n# antigua", encoding="utf-8")
+                compiler = WikiAutoCompiler()
+                compiler._collect_rag_material = Mock(return_value={"parents": [], "invalid_parent_count": 0})
+
+                result = await compiler.compile_for_proposal("O-9999")
+
+                self.assertEqual(result["status"], "no_rag")
+                compiler._collect_rag_material.assert_called_once_with("O-9999")
+                del compiler
+                gc.collect()
+
     async def test_reindex_tolerates_duplicate_section_ids(self):
         markdown = """# Wiki\n\n## Grupo\n\n### Repetida\nMismo contenido.\n\n### Repetida\nMismo contenido.\n"""
         with tempfile.TemporaryDirectory() as temp_dir, self.patch_settings(temp_dir):
