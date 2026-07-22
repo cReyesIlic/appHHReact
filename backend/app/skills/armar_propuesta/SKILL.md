@@ -42,7 +42,9 @@ Si el payload incluye `etapa_trabajo`, trabaja solamente esa etapa y deja una se
    nombres de tablas. Usa 3-6 variantes en `search_master.queries` y `search_rag.queries`.
 3. `deliverables`: metodología y matriz de entregables, profundizando en tablas históricas.
 4. `hours`: cuenta primero el registro con `analyze_draft_document_register`; busca benchmarks de
-   **revisión** y solo después parametriza `estimate_draft_review_hours`.
+   **revisión** y solo después parametriza `estimate_draft_review_hours`. Retoma el checkpoint,
+   evita repetir referencias ya cuantificadas y busca al menos 3 proyectos distintos con documentos
+   y HH. Con menor cobertura solo puede emitir escenarios preliminares y debe dejar el gap pendiente.
 5. `proposal`: integra lo ya guardado sin volver a investigar lo resuelto.
 
 En `hours`, jamás traslades las HH necesarias para producir un plano a su revisión. La unidad es el

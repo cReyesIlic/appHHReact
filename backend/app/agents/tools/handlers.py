@@ -757,6 +757,7 @@ async def get_draft_context(ctx: ToolContext, slug: str, include_guide: bool = T
             }
             for section in draft.get("workspace_sections") or []
         ],
+        "agent_checkpoint": draft.get("agent_checkpoint"),
     }
     if include_guide and draft.get("guide_exists"):
         out["guide"] = ctx.drafts.get_guide(user.id, slug)

@@ -736,9 +736,80 @@
   background: var(--status-ganada-bg);
   color: var(--status-ganada-fg);
 }
+.draft-workflow button.partial { border-color: var(--status-proceso-fg); }
+.draft-workflow button.partial > span:first-child {
+  background: var(--status-proceso-bg);
+  color: var(--status-proceso-fg);
+}
 .draft-workflow button b,
 .draft-workflow button small { display: block; }
 .draft-workflow button small { margin-top: 3px; color: var(--text-muted); line-height: 1.3; }
+.draft-checkpoint { display: flex; flex-direction: column; gap: 12px; }
+.draft-checkpoint-head {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px 12px;
+  font-size: 12px;
+}
+.draft-checkpoint-head small { margin-left: auto; }
+.draft-checkpoint-status {
+  padding: 4px 8px;
+  border-radius: 999px;
+  background: var(--status-otro-bg);
+  color: var(--status-otro-fg);
+  font-weight: 700;
+}
+.draft-checkpoint-status.working { background: var(--accent-soft); color: var(--accent-strong); }
+.draft-checkpoint-status.completed { background: var(--status-ganada-bg); color: var(--status-ganada-fg); }
+.draft-checkpoint-status.evidence_needed,
+.draft-checkpoint-status.warning { background: var(--status-proceso-bg); color: var(--status-proceso-fg); }
+.draft-checkpoint-status.failed { background: var(--status-perdida-bg); color: var(--status-perdida-fg); }
+.draft-checkpoint-action {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 12px;
+  border-radius: var(--radius-sm);
+  background: var(--bg-alt);
+}
+.draft-checkpoint-recipe {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+  gap: 7px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+.draft-checkpoint-recipe li {
+  display: flex;
+  gap: 7px;
+  color: var(--text-muted);
+  font-size: 12px;
+}
+.draft-checkpoint-recipe li.completed { color: var(--status-ganada-fg); }
+.draft-checkpoint-recipe li.working { color: var(--accent-strong); font-weight: 700; }
+.draft-checkpoint-recipe li span { flex: 0 0 14px; font-weight: 800; }
+.draft-checkpoint-evidence,
+.draft-checkpoint-gaps {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  padding: 10px 12px;
+  border-left: 3px solid var(--status-proceso-fg);
+  background: var(--status-proceso-bg);
+  border-radius: var(--radius-sm);
+  font-size: 12px;
+}
+.draft-checkpoint-evidence small { color: var(--text-muted); }
+.draft-checkpoint-tools { display: flex; flex-wrap: wrap; gap: 5px; }
+.draft-checkpoint-tools code {
+  padding: 3px 6px;
+  border-radius: 4px;
+  background: var(--bg-alt);
+  color: var(--text-muted);
+  font-size: 10px;
+}
 .draft-workspace-sections { display: flex; flex-direction: column; gap: 14px; }
 .draft-workspace-section {
   padding: 16px;

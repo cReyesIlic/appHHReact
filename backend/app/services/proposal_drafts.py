@@ -28,6 +28,7 @@ from datetime import datetime
 from hashlib import sha1
 from io import BytesIO
 from pathlib import Path
+from uuid import uuid4
 
 import httpx
 
@@ -49,6 +50,48 @@ WORKSPACE_SECTION_TITLES = {
     "hours": "4. Estimación de HH y equipo",
     "proposal": "5. Propuesta integrada",
     "notes": "Notas de trabajo",
+}
+
+AGENT_STAGE_RECIPES = {
+    "scope": [
+        ("context", "Leer brief y antecedentes"),
+        ("requirements", "Extraer alcance, restricciones y plazo"),
+        ("gaps", "Identificar contradicciones y preguntas"),
+        ("publish", "Publicar sección de alcance"),
+    ],
+    "references": [
+        ("context", "Cargar contexto y búsquedas anteriores"),
+        ("discover", "Buscar referencias semánticas amplias"),
+        ("deepen", "Leer PDF, tablas y fuentes de los candidatos"),
+        ("compare", "Comparar alcance, entregables y límites"),
+        ("publish", "Publicar matriz de referencias"),
+    ],
+    "deliverables": [
+        ("context", "Cargar alcance y referencias aprobadas"),
+        ("historical", "Revisar matrices históricas comparables"),
+        ("construct", "Construir metodología y entregables"),
+        ("validate", "Validar responsables y criterios de aceptación"),
+        ("publish", "Publicar matriz de entregables"),
+    ],
+    "hours": [
+        ("context", "Cargar alcance y checkpoint anterior"),
+        ("inventory", "Contar y clasificar documentos a revisar"),
+        ("discover", "Buscar proyectos de revisión comparables"),
+        ("quantify", "Obtener HH y denominadores de al menos 3 proyectos"),
+        ("estimate", "Estimar revisión y escenarios con evidencia"),
+        ("publish", "Publicar HH, supuestos y fuentes"),
+    ],
+    "proposal": [
+        ("context", "Cargar todas las secciones de la Wiki"),
+        ("conflicts", "Resolver contradicciones y pendientes"),
+        ("integrate", "Integrar propuesta técnica"),
+        ("publish", "Publicar propuesta consolidada"),
+    ],
+    "notes": [
+        ("context", "Cargar contexto de la propuesta"),
+        ("answer", "Resolver la consulta específica"),
+        ("publish", "Guardar nota de trabajo"),
+    ],
 }
 
 
@@ -197,6 +240,7 @@ class ProposalDraftService:
             "guide_exists": guia.exists(),
             "guide_path": str(guia) if guia.exists() else None,
             "workspace_sections": self.list_workspace(slug),
+            "agent_checkpoint": self.get_agent_checkpoint(slug),
         }
 
     def update_brief(self, owner_id: str, slug: str, brief_text: str) -> dict:
@@ -227,6 +271,7 @@ class ProposalDraftService:
             conn.execute("delete from proposal_draft_files where slug = ?", (slug,))
             conn.execute("delete from proposal_draft_chunks where slug = ?", (slug,))
             conn.execute("delete from proposal_draft_workspace where slug = ?", (slug,))
+            conn.execute("delete from proposal_draft_checkpoints where slug = ?", (slug,))
         if not n:
             return {"deleted": False}
         # Borrar archivos en disco
@@ -315,6 +360,112 @@ class ProposalDraftService:
             return parsed if isinstance(parsed, list) else []
         except (json.JSONDecodeError, TypeError):
             return []
+
+    # ---- Checkpoint operacional del agente ----
+
+    def get_agent_checkpoint(self, slug: str) -> dict | None:
+        with closing(sqlite3.connect(settings.sqlite_path, timeout=5)) as conn:
+            row = conn.execute(
+                "select payload_json, updated_at from proposal_draft_checkpoints where slug = ?",
+                (slug,),
+            ).fetchone()
+        if not row:
+            return None
+        try:
+            payload = json.loads(row[0] or "{}")
+        except (json.JSONDecodeError, TypeError):
+            payload = {}
+        if not isinstance(payload, dict):
+            payload = {}
+        payload["updated_at"] = row[1]
+        return payload
+
+    def start_agent_checkpoint(
+        self,
+        owner_id: str,
+        slug: str,
+        stage: str,
+        objective: str,
+    ) -> dict:
+        if self._owner_for_slug(slug) != owner_id:
+            raise KeyError(slug)
+        stage_key = stage if stage in AGENT_STAGE_RECIPES else "notes"
+        previous = self.get_agent_checkpoint(slug) or {}
+        resumes_stage = previous.get("stage") == stage_key
+        now = datetime.now().isoformat(timespec="seconds")
+        completed_steps = list(previous.get("completed_steps") or []) if resumes_stage else []
+        payload = {
+            "run_id": uuid4().hex[:12],
+            "run_count": int(previous.get("run_count") or 0) + 1 if resumes_stage else 1,
+            "stage": stage_key,
+            "status": "working",
+            "objective": str(objective or "")[:1000],
+            "iteration": 0,
+            "current_step": "context",
+            "current_action": "Retomando checkpoint anterior" if resumes_stage else "Iniciando receta",
+            "completed_steps": completed_steps,
+            "completed_tools": list(previous.get("completed_tools") or []) if resumes_stage else [],
+            "quantitative_benchmarks": list(previous.get("quantitative_benchmarks") or []) if resumes_stage else [],
+            "benchmark_minimum": 3 if stage_key == "hours" else 0,
+            "evidence_gaps": list(previous.get("evidence_gaps") or []) if resumes_stage else [],
+            "last_error": None,
+            "started_at": now,
+        }
+        payload["recipe"] = self._checkpoint_recipe(stage_key, completed_steps, "context")
+        self._write_agent_checkpoint(slug, payload, now)
+        return {**payload, "updated_at": now}
+
+    def update_agent_checkpoint(
+        self,
+        owner_id: str,
+        slug: str,
+        changes: dict,
+    ) -> dict:
+        if self._owner_for_slug(slug) != owner_id:
+            raise KeyError(slug)
+        payload = self.get_agent_checkpoint(slug) or {}
+        safe_changes = {
+            key: value
+            for key, value in (changes or {}).items()
+            if key in {
+                "status", "iteration", "current_step", "current_action",
+                "completed_steps", "completed_tools", "quantitative_benchmarks",
+                "evidence_gaps", "last_error",
+            }
+        }
+        payload.update(safe_changes)
+        stage = str(payload.get("stage") or "notes")
+        completed = list(dict.fromkeys(payload.get("completed_steps") or []))
+        current = str(payload.get("current_step") or "context")
+        payload["completed_steps"] = completed
+        payload["completed_tools"] = list(dict.fromkeys(payload.get("completed_tools") or []))[-40:]
+        payload["recipe"] = self._checkpoint_recipe(stage, completed, current)
+        now = datetime.now().isoformat(timespec="seconds")
+        self._write_agent_checkpoint(slug, payload, now)
+        return {**payload, "updated_at": now}
+
+    def _checkpoint_recipe(self, stage: str, completed: list[str], current: str) -> list[dict]:
+        return [
+            {
+                "key": key,
+                "label": label,
+                "status": "completed" if key in completed else ("working" if key == current else "pending"),
+            }
+            for key, label in AGENT_STAGE_RECIPES.get(stage, AGENT_STAGE_RECIPES["notes"])
+        ]
+
+    def _write_agent_checkpoint(self, slug: str, payload: dict, now: str) -> None:
+        with closing(sqlite3.connect(settings.sqlite_path, timeout=30)) as conn, conn:
+            conn.execute(
+                """
+                insert into proposal_draft_checkpoints (slug, payload_json, updated_at)
+                values (?, ?, ?)
+                on conflict(slug) do update set
+                    payload_json = excluded.payload_json,
+                    updated_at = excluded.updated_at
+                """,
+                (slug, json.dumps(payload, ensure_ascii=False), now),
+            )
 
     # ---- Files ----
 
@@ -1026,6 +1177,15 @@ class ProposalDraftService:
                     sources_json text default '[]',
                     updated_at text not null,
                     primary key (slug, section_key)
+                )
+                """
+            )
+            conn.execute(
+                """
+                create table if not exists proposal_draft_checkpoints (
+                    slug text primary key,
+                    payload_json text not null default '{}',
+                    updated_at text not null
                 )
                 """
             )

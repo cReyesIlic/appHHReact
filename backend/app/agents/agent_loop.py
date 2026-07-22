@@ -25,6 +25,7 @@ logger = logging.getLogger("shimin.agent_loop")
 from app.schemas import ChatMessage, Source, ToolTrace
 from app.services.llm import LlmService
 from app.services.search_filters import SearchFilters
+from app.services.user_context import get_current_user
 from app.skills import SkillRegistry
 
 
@@ -222,9 +223,12 @@ DRAFT_STAGE_INSTRUCTIONS = {
     ),
     "hours": (
         "Estima HH de REVISIÓN, no de elaboración. Primero usa analyze_draft_document_register. Luego "
-        "busca evidencia histórica específica de revisión de ingeniería, tablas HH licitadas y HH reales. "
+        "retoma el checkpoint y busca evidencia histórica específica de revisión de ingeniería, tablas HH "
+        "licitadas y HH reales. Reúne al menos 3 proyectos distintos con cantidad documental y HH; no "
+        "repitas benchmarks ya validados en el checkpoint. "
         "Finalmente llama estimate_draft_review_hours con tasas justificadas. Separa revisión por documento, "
-        "coordinación, QA/QC, gestión de observaciones e informe final; muestra escenario base y supuestos."
+        "coordinación, QA/QC, gestión de observaciones e informe final; muestra escenarios y supuestos. "
+        "Con menos de 3 benchmarks cuantitativos, la estimación debe quedar rotulada PRELIMINAR."
     ),
     "proposal": (
         "Integra las secciones ya guardadas de la Wiki de trabajo en una propuesta técnica coherente, "
@@ -284,10 +288,53 @@ class AgentLoop:
 
         draft_slug = str((active_draft or {}).get("slug") or "").strip()
         draft_stage = str((active_draft or {}).get("stage") or "notes").strip().casefold()
+        checkpoint_owner = get_current_user().id
+        checkpoint_state: dict[str, Any] = {}
+
+        async def persist_checkpoint(**changes: Any) -> None:
+            nonlocal checkpoint_state
+            if not draft_slug or not hasattr(ctx, "drafts"):
+                return
+            try:
+                checkpoint_state = await asyncio.to_thread(
+                    ctx.drafts.update_agent_checkpoint,
+                    checkpoint_owner,
+                    draft_slug,
+                    changes,
+                )
+            except Exception as exc:  # noqa: BLE001
+                trace.append(
+                    ToolTrace(
+                        tool="agent.checkpoint",
+                        status="warning",
+                        detail=f"{type(exc).__name__}: {exc}",
+                    )
+                )
+
         available_tools = draft_tool_schemas(question, draft_stage) if draft_slug else TOOL_SCHEMAS
         iteration_limit = min(self.max_iterations, DRAFT_MAX_ITERATIONS) if draft_slug else self.max_iterations
         llm_timeout = DRAFT_LLM_TIMEOUT_SECONDS if draft_slug else 45
         if draft_slug:
+            try:
+                if not hasattr(ctx, "drafts"):
+                    raise AttributeError("ToolContext sin servicio de drafts")
+                checkpoint_state = await asyncio.to_thread(
+                    ctx.drafts.start_agent_checkpoint,
+                    checkpoint_owner,
+                    draft_slug,
+                    draft_stage,
+                    question,
+                )
+            except AttributeError:
+                checkpoint_state = {}
+            except Exception as exc:  # noqa: BLE001
+                trace.append(
+                    ToolTrace(
+                        tool="agent.checkpoint",
+                        status="warning",
+                        detail=f"inicio fallido: {type(exc).__name__}: {exc}",
+                    )
+                )
             user_payload["draft_activo"] = {
                 "slug": draft_slug,
                 "title": str((active_draft or {}).get("title") or "")[:300],
@@ -306,6 +353,8 @@ class AgentLoop:
                     "Wiki de trabajo. Incluye tablas y fuentes; distingue evidencia, supuesto y estimación."
                 ),
             }
+            if checkpoint_state:
+                user_payload["checkpoint_agente"] = checkpoint_state
             draft_context: dict[str, dict] = {}
             draft_query = "\n".join(
                 part
@@ -355,6 +404,26 @@ class AgentLoop:
                     forced_outputs.append((name, result))
                     draft_context[name] = self._truncate_result(result)
                     self._absorb_codes(result, seen_codes)
+            checkpoint_tools = list(checkpoint_state.get("completed_tools") or [])
+            checkpoint_tools.extend(name for name, _ in preload_calls)
+            checkpoint_steps = list(checkpoint_state.get("completed_steps") or [])
+            checkpoint_steps.append("context")
+            next_step = "discover"
+            if draft_stage == "hours":
+                checkpoint_steps.append("inventory")
+                next_step = "discover"
+            await persist_checkpoint(
+                completed_tools=list(dict.fromkeys(checkpoint_tools)),
+                completed_steps=list(dict.fromkeys(checkpoint_steps)),
+                current_step=next_step,
+                current_action=(
+                    "Buscando proyectos comparables y evidencia cuantitativa"
+                    if draft_stage == "hours"
+                    else "Planificando la siguiente acción de la receta"
+                ),
+            )
+            if checkpoint_state:
+                user_payload["checkpoint_agente"] = checkpoint_state
             user_payload["contexto_draft"] = draft_context
 
         messages: list[dict] = [
@@ -372,6 +441,11 @@ class AgentLoop:
 
         if not self.llm.client:
             trace.append(ToolTrace(tool="agent.loop", status="warning", detail="sin cliente LLM; fallback"))
+            await persist_checkpoint(
+                status="failed",
+                current_action="No hay cliente LLM disponible",
+                last_error="Sin cliente LLM",
+            )
             return AgentRunResult(
                 answer=f"Sin LLM disponible. Pregunta recibida: {question}",
                 trace=trace,
@@ -380,6 +454,11 @@ class AgentLoop:
         deployment = settings.answer_deployment if self.llm.azure else "gpt-4o-mini"
 
         for iteration in range(iteration_limit):
+            await persist_checkpoint(
+                iteration=iteration + 1,
+                status="working",
+                current_action=f"Iteración {iteration + 1}: decidiendo la siguiente herramienta",
+            )
             t0 = time.time()
             try:
                 message = await asyncio.wait_for(
@@ -394,10 +473,20 @@ class AgentLoop:
                 )
             except Exception as exc:  # noqa: BLE001
                 trace.append(ToolTrace(tool="agent.llm", status="error", detail=f"iter {iteration}: {exc}"))
+                await persist_checkpoint(
+                    status="warning",
+                    current_action="La iteración LLM falló; intentando cerrar con la evidencia disponible",
+                    last_error=f"{type(exc).__name__}: {exc}",
+                )
                 break
 
             if message is None:
                 trace.append(ToolTrace(tool="agent.llm", status="error", detail="respuesta vacía"))
+                await persist_checkpoint(
+                    status="warning",
+                    current_action="Respuesta LLM vacía; intentando cierre de recuperación",
+                    last_error="Respuesta LLM vacía",
+                )
                 break
 
             tool_calls = getattr(message, "tool_calls", None) or []
@@ -504,6 +593,12 @@ class AgentLoop:
                     self._collect_payload(name, payload, sources, tables, charts, seen_codes)
                 self._dedupe_sources(sources)
                 self._dedupe_tables(tables)
+                await self._finish_draft_checkpoint(
+                    persist_checkpoint,
+                    checkpoint_state,
+                    draft_stage,
+                    success=True,
+                )
                 return AgentRunResult(
                     answer=self._append_source_links(content.strip() or "(respuesta vacía)", sources),
                     trace=trace,
@@ -581,6 +676,8 @@ class AgentLoop:
                             "se omitió para responder el draft a tiempo"
                         )
                     }
+                except Exception as exc:  # noqa: BLE001
+                    result = {"error": f"{type(exc).__name__}: {exc}"}
                 return tc, name, args, detail, result, int((time.time() - t_start) * 1000)
 
             if draft_slug:
@@ -590,10 +687,26 @@ class AgentLoop:
                 for call in pending_calls:
                     completed_calls.append(await invoke_tool(call))
 
+            checkpoint_tools = list(checkpoint_state.get("completed_tools") or [])
+            checkpoint_steps = list(checkpoint_state.get("completed_steps") or [])
+            checkpoint_benchmarks = list(checkpoint_state.get("quantitative_benchmarks") or [])
+            tool_errors: list[str] = []
+            last_step = str(checkpoint_state.get("current_step") or "discover")
             for tc, name, args, detail, result, latency_ms in completed_calls:
                 called_tools.add(name)
                 status = "error" if isinstance(result, dict) and result.get("error") else "ok"
                 trace.append(ToolTrace(tool=f"agent.{name}", status=status, detail=f"{detail} ({latency_ms}ms)"))
+                checkpoint_tools.append(name)
+                if status == "ok":
+                    step = self._checkpoint_step_for_tool(draft_stage, name)
+                    if step:
+                        checkpoint_steps.append(step)
+                        last_step = step
+                    checkpoint_benchmarks.extend(
+                        self._extract_quantitative_review_benchmarks(name, args, result)
+                    )
+                else:
+                    tool_errors.append(f"{name}: {result.get('error') if isinstance(result, dict) else 'error'}")
                 self._absorb_codes(result, seen_codes)
                 if draft_slug and isinstance(result, dict):
                     # Conserva tablas completas para la interfaz; el modelo recibe una vista acotada.
@@ -606,6 +719,22 @@ class AgentLoop:
                         "content": json.dumps(self._truncate_result(result), ensure_ascii=False),
                     }
                 )
+            checkpoint_benchmarks = self._dedupe_benchmarks(checkpoint_benchmarks)
+            benchmark_projects = self._benchmark_project_count(checkpoint_benchmarks)
+            next_step = self._checkpoint_next_step(draft_stage, last_step, benchmark_projects)
+            await persist_checkpoint(
+                completed_tools=list(dict.fromkeys(checkpoint_tools)),
+                completed_steps=list(dict.fromkeys(checkpoint_steps)),
+                quantitative_benchmarks=checkpoint_benchmarks,
+                current_step=next_step,
+                current_action=self._checkpoint_action(draft_stage, next_step, benchmark_projects),
+                evidence_gaps=(
+                    [f"Faltan {max(0, 3 - benchmark_projects)} proyectos con documentos + HH comparables"]
+                    if draft_stage == "hours" and benchmark_projects < 3
+                    else []
+                ),
+                last_error="; ".join(tool_errors)[:1000] if tool_errors else None,
+            )
             trace.append(ToolTrace(tool="agent.iter", status="ok", detail=f"iter {iteration} en {int((time.time()-t0)*1000)}ms"))
 
         trace.append(ToolTrace(tool="agent.loop", status="warning", detail="max_iterations alcanzado"))
@@ -615,6 +744,9 @@ class AgentLoop:
         # tasas a partir de toda la evidencia recogida y ejecutar el estimador. No imponemos tasas
         # determinísticas: el modelo decide default, ajustes por tipo/disciplina y actividades.
         if draft_slug and draft_stage == "hours" and "estimate_draft_review_hours" not in called_tools:
+            checkpoint_benchmark_count = self._benchmark_project_count(
+                checkpoint_state.get("quantitative_benchmarks") or []
+            )
             estimator_schema = next(
                 (
                     schema
@@ -637,7 +769,9 @@ class AgentLoop:
                             "cuando correspondan. Si existe un benchmark histórico con cantidad de documentos "
                             "y HH, calcula su tasa implícita y úsala como ancla; cualquier desviación material "
                             "debe quedar justificada por tipo o complejidad. Explica la base y no inventes "
-                            "precisión sin evidencia."
+                            f"precisión sin evidencia. El checkpoint tiene {checkpoint_benchmark_count}/3 "
+                            "proyectos cuantitativos válidos: si son menos de 3, declara explícitamente la "
+                            "estimación como PRELIMINAR y genera escenarios, no una cifra validada."
                         ),
                     }
                 )
@@ -713,6 +847,20 @@ class AgentLoop:
                     charts,
                     seen_codes,
                 )
+                checkpoint_tools = list(checkpoint_state.get("completed_tools") or [])
+                checkpoint_tools.append("estimate_draft_review_hours")
+                checkpoint_steps = list(checkpoint_state.get("completed_steps") or [])
+                checkpoint_steps.append("estimate")
+                await persist_checkpoint(
+                    completed_tools=list(dict.fromkeys(checkpoint_tools)),
+                    completed_steps=list(dict.fromkeys(checkpoint_steps)),
+                    current_step=("publish" if checkpoint_benchmark_count >= 3 else "quantify"),
+                    current_action=(
+                        "Redactando estimación validada"
+                        if checkpoint_benchmark_count >= 3
+                        else f"Estimación preliminar; faltan {3 - checkpoint_benchmark_count} benchmarks cuantitativos"
+                    ),
+                )
                 messages.append(
                     {
                         "role": "tool",
@@ -732,9 +880,23 @@ class AgentLoop:
 
         # Fallback: pedir respuesta final sin tools
         try:
+            checkpoint_benchmark_count = self._benchmark_project_count(
+                checkpoint_state.get("quantitative_benchmarks") or []
+            )
+            checkpoint_quality = (
+                f"Checkpoint cuantitativo: {checkpoint_benchmark_count}/3 proyectos. "
+                + (
+                    "La evidencia mínima está completa. "
+                    if checkpoint_benchmark_count >= 3
+                    else "La evidencia mínima NO está completa: rotula resultados como preliminares y explica qué falta. "
+                )
+                if draft_stage == "hours"
+                else ""
+            )
             close_instruction = (
                 f"Cierra ahora la etapa '{draft_stage}' con la evidencia recogida. "
                 f"{DRAFT_STAGE_INSTRUCTIONS.get(draft_stage, DRAFT_STAGE_INSTRUCTIONS['notes'])} "
+                f"{checkpoint_quality}"
                 "Entrega Markdown autosuficiente y completo en un máximo de 1.200 palabras. Resume las "
                 "tablas estructuradas: no copies las filas por documento ni repitas las URLs de fuentes, "
                 "porque la interfaz las agrega automáticamente. Incluye supuestos, totales y decisiones "
@@ -756,6 +918,7 @@ class AgentLoop:
             )
             answer = (final.content if final else "") or "(respuesta vacía)"
             trace.append(ToolTrace(tool="agent.finalize", status="ok", detail="respuesta final cerrada"))
+            finalize_success = True
         except Exception as exc:  # noqa: BLE001
             trace.append(
                 ToolTrace(
@@ -765,12 +928,19 @@ class AgentLoop:
                 )
             )
             answer = "No fue posible cerrar la respuesta dentro del cupo. Datos recolectados disponibles en sources."
+            finalize_success = False
 
         self._collect_outputs(messages, sources, tables, charts, seen_codes)
         for name, payload in forced_outputs:
             self._collect_payload(name, payload, sources, tables, charts, seen_codes)
         self._dedupe_sources(sources)
         self._dedupe_tables(tables)
+        await self._finish_draft_checkpoint(
+            persist_checkpoint,
+            checkpoint_state,
+            draft_stage,
+            success=finalize_success,
+        )
 
         return AgentRunResult(
             answer=self._append_source_links(answer, sources),
@@ -779,6 +949,160 @@ class AgentLoop:
             tables=tables,
             charts=charts,
             suggested_codes=list(dict.fromkeys(seen_codes))[:20],
+        )
+
+    async def _finish_draft_checkpoint(
+        self,
+        persist_checkpoint,
+        checkpoint_state: dict,
+        draft_stage: str,
+        *,
+        success: bool,
+    ) -> None:
+        if not checkpoint_state:
+            return
+        completed = list(checkpoint_state.get("completed_steps") or [])
+        benchmarks = list(checkpoint_state.get("quantitative_benchmarks") or [])
+        benchmark_projects = self._benchmark_project_count(benchmarks)
+        if not success:
+            await persist_checkpoint(
+                status="failed",
+                completed_steps=list(dict.fromkeys(completed)),
+                current_step="publish",
+                current_action="El cierre falló; se conservaron evidencia y pasos para reintentar",
+                last_error=checkpoint_state.get("last_error") or "No se pudo cerrar la respuesta",
+            )
+            return
+        completed.append("publish")
+        if draft_stage == "hours" and benchmark_projects < 3:
+            await persist_checkpoint(
+                status="evidence_needed",
+                completed_steps=list(dict.fromkeys(completed)),
+                current_step="quantify",
+                current_action=f"Buscar {3 - benchmark_projects} proyectos adicionales con documentos + HH",
+                evidence_gaps=[
+                    f"Cobertura cuantitativa insuficiente: {benchmark_projects}/3 proyectos comparables",
+                    "Obtener denominador documental y HH desde PDF, Excel o tabla estructurada",
+                ],
+                last_error=None,
+            )
+            return
+        if draft_stage == "hours":
+            completed.append("quantify")
+        await persist_checkpoint(
+            status="completed",
+            completed_steps=list(dict.fromkeys(completed)),
+            current_step="publish",
+            current_action="Etapa completada y lista para revisión humana",
+            evidence_gaps=[],
+            last_error=None,
+        )
+
+    def _checkpoint_step_for_tool(self, stage: str, tool_name: str) -> str | None:
+        if tool_name in {"load_skill", "get_draft_context", "search_draft_chunks"}:
+            return "context"
+        if tool_name == "analyze_draft_document_register":
+            return "inventory" if stage == "hours" else "context"
+        if tool_name == "estimate_draft_review_hours":
+            return "estimate"
+        if tool_name in {"search_master", "search_rag", "search_wiki_entries", "search_entities", "search_proposal_index", "compute_proposal_support"}:
+            return {
+                "references": "discover",
+                "deliverables": "historical",
+                "hours": "discover",
+            }.get(stage, "answer")
+        if tool_name in {"get_hh_licitadas", "search_entregables_hh", "get_horas_detalle", "get_proyecto_staffing", "get_proposal_detail", "read_pdf_deep"}:
+            return {
+                "references": "deepen",
+                "deliverables": "historical",
+                "hours": "quantify",
+            }.get(stage, "answer")
+        return None
+
+    def _checkpoint_next_step(self, stage: str, last_step: str, benchmark_projects: int) -> str:
+        if stage == "hours":
+            if last_step in {"context", "inventory"}:
+                return "discover"
+            if last_step == "discover":
+                return "quantify"
+            if last_step == "quantify":
+                return "estimate" if benchmark_projects >= 3 else "quantify"
+            if last_step == "estimate":
+                return "publish" if benchmark_projects >= 3 else "quantify"
+        if stage == "references":
+            return "compare" if last_step == "deepen" else "deepen"
+        if stage == "deliverables":
+            return "construct" if last_step == "historical" else "validate"
+        return last_step or "answer"
+
+    def _checkpoint_action(self, stage: str, step: str, benchmark_projects: int) -> str:
+        if stage == "hours":
+            actions = {
+                "discover": "Buscando proyectos de revisión de ingeniería comparables",
+                "quantify": f"Cuantificando benchmarks ({benchmark_projects}/3 proyectos válidos)",
+                "estimate": "Preparando tasas y escenarios con la evidencia validada",
+                "publish": "Redactando resultados, supuestos y fuentes",
+            }
+            return actions.get(step, "Continuando receta de estimación")
+        return f"Continuando paso: {step}"
+
+    def _extract_quantitative_review_benchmarks(
+        self,
+        tool_name: str,
+        args: dict,
+        result: Any,
+    ) -> list[dict]:
+        if tool_name != "get_hh_licitadas" or not isinstance(result, dict) or result.get("error"):
+            return []
+        code = str(result.get("codigo") or args.get("codigo") or "").upper()
+        benchmarks: list[dict] = []
+        for row in result.get("rows") or []:
+            if not isinstance(row, dict):
+                continue
+            label = str(row.get("key") or row.get("entregable") or row.get("nombre") or "")
+            normalized = label.casefold()
+            if not any(token in normalized for token in ("revisi", "review", "verific", "contraparte")):
+                continue
+            counts = re.findall(
+                r"(\d+(?:[.,]\d+)?)\s*(?:planos?|documentos?|entregables?)",
+                normalized,
+            )
+            documents = int(sum(float(value.replace(",", ".")) for value in counts))
+            try:
+                hours = float(row.get("total_hours") or row.get("horas_totales") or 0)
+            except (TypeError, ValueError):
+                hours = 0.0
+            if documents <= 0 or hours <= 0:
+                continue
+            benchmarks.append(
+                {
+                    "codigo": code,
+                    "actividad": label[:240],
+                    "documentos": documents,
+                    "hh": round(hours, 2),
+                    "hh_por_documento": round(hours / documents, 2),
+                    "source": "get_hh_licitadas",
+                }
+            )
+        return benchmarks
+
+    def _dedupe_benchmarks(self, benchmarks: list[dict]) -> list[dict]:
+        unique: dict[tuple, dict] = {}
+        for item in benchmarks:
+            if not isinstance(item, dict):
+                continue
+            key = (str(item.get("codigo") or "").upper(), str(item.get("actividad") or "").casefold())
+            if key != ("", ""):
+                unique[key] = item
+        return list(unique.values())[-30:]
+
+    def _benchmark_project_count(self, benchmarks: list[dict]) -> int:
+        return len(
+            {
+                str(item.get("codigo") or "").upper()
+                for item in benchmarks
+                if isinstance(item, dict) and item.get("codigo")
+            }
         )
 
     def _truncate_value(self, value: Any) -> str:

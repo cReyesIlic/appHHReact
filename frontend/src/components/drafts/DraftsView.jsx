@@ -82,6 +82,24 @@ export function DraftsView() {
   }, [activeSlug]);
 
   useEffect(() => {
+    if (!consultBusy || !activeSlug) return undefined;
+    let cancelled = false;
+    const refreshCheckpoint = () => {
+      getDraft(activeSlug)
+        .then((draft) => {
+          if (!cancelled) setActive(draft);
+        })
+        .catch(() => {});
+    };
+    refreshCheckpoint();
+    const timer = window.setInterval(refreshCheckpoint, 2000);
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+    };
+  }, [consultBusy, activeSlug]);
+
+  useEffect(() => {
     let cancelled = false;
     setConsultMessages([]);
     setConsultContext({});
@@ -642,6 +660,71 @@ export function DraftsView() {
               </Card>
 
               <Card
+                title="Checkpoint del agente"
+                subtitle="Receta persistente: conserva avance, evidencia, bloqueos y siguiente acción"
+              >
+                {!active.agent_checkpoint ? (
+                  <EmptyState
+                    icon={Sparkles}
+                    title="Sin ejecución registrada"
+                    description="Al iniciar una etapa, el agente irá registrando aquí qué está haciendo y desde dónde debe continuar."
+                  />
+                ) : (
+                  <div className="draft-checkpoint">
+                    <div className="draft-checkpoint-head">
+                      <span className={`draft-checkpoint-status ${active.agent_checkpoint.status}`}>
+                        {checkpointStatusLabel(active.agent_checkpoint.status)}
+                      </span>
+                      <span>
+                        Etapa: <b>{active.agent_checkpoint.stage}</b> · ejecución {active.agent_checkpoint.run_count || 1}
+                        {active.agent_checkpoint.iteration ? ` · iteración ${active.agent_checkpoint.iteration}` : ""}
+                      </span>
+                      <small className="dim">{active.agent_checkpoint.updated_at}</small>
+                    </div>
+                    <div className="draft-checkpoint-action">
+                      {active.agent_checkpoint.status === "working" && <Loader2 size={15} className="spin" />}
+                      <b>{active.agent_checkpoint.current_action || "Esperando siguiente acción"}</b>
+                    </div>
+                    {(active.agent_checkpoint.recipe || []).length > 0 && (
+                      <ol className="draft-checkpoint-recipe">
+                        {(active.agent_checkpoint.recipe || []).map((step) => (
+                          <li className={step.status} key={step.key}>
+                            <span>{step.status === "completed" ? "✓" : step.status === "working" ? "→" : "·"}</span>
+                            {step.label}
+                          </li>
+                        ))}
+                      </ol>
+                    )}
+                    {(active.agent_checkpoint.benchmark_minimum || 0) > 0 && (
+                      <div className="draft-checkpoint-evidence">
+                        <b>
+                          Benchmarks cuantitativos: {countBenchmarkProjects(active.agent_checkpoint.quantitative_benchmarks)}
+                          /{active.agent_checkpoint.benchmark_minimum}
+                        </b>
+                        <small>Solo cuentan proyectos que tengan denominador documental y HH verificables.</small>
+                        {(active.agent_checkpoint.quantitative_benchmarks || []).slice(0, 8).map((item, index) => (
+                          <span key={`${item.codigo}-${item.actividad}-${index}`}>
+                            {item.codigo}: {item.documentos} docs · {item.hh} HH · {item.hh_por_documento} HH/doc
+                          </span>
+                        ))}
+                      </div>
+                    )}
+                    {(active.agent_checkpoint.evidence_gaps || []).length > 0 && (
+                      <div className="draft-checkpoint-gaps">
+                        <b>Pendiente antes de validar</b>
+                        {(active.agent_checkpoint.evidence_gaps || []).map((gap) => <span key={gap}>{gap}</span>)}
+                      </div>
+                    )}
+                    {(active.agent_checkpoint.completed_tools || []).length > 0 && (
+                      <div className="draft-checkpoint-tools">
+                        {(active.agent_checkpoint.completed_tools || []).slice(-12).map((tool) => <code key={tool}>{tool}</code>)}
+                      </div>
+                    )}
+                  </div>
+                )}
+              </Card>
+
+              <Card
                 title="Wiki de trabajo de la propuesta"
                 subtitle={`${(active.workspace_sections || []).length} de ${DRAFT_STAGES.length} etapas desarrolladas`}
               >
@@ -699,17 +782,20 @@ export function DraftsView() {
               >
                 <div className="draft-workflow">
                   {DRAFT_STAGES.map((stage, index) => {
-                    const completed = (active.workspace_sections || []).some((section) => section.key === stage.key);
+                    const stageCheckpoint = active.agent_checkpoint?.stage === stage.key ? active.agent_checkpoint : null;
+                    const evidencePending = stageCheckpoint?.status === "evidence_needed";
+                    const completed = (active.workspace_sections || []).some((section) => section.key === stage.key)
+                      && !evidencePending;
                     return (
                     <button
                       type="button"
                       key={stage.key}
-                      className={completed ? "completed" : ""}
+                      className={completed ? "completed" : evidencePending ? "partial" : ""}
                       onClick={() => handleConsult(stage.prompt, stage.key)}
                       disabled={consultBusy || ((active.files || []).length === 0 && !briefText.trim())}
                     >
-                      <span>{completed ? "✓" : index + 1}</span>
-                      <span><b>{stage.title}</b><small>{stage.description}</small></span>
+                      <span>{completed ? "✓" : evidencePending ? "!" : index + 1}</span>
+                      <span><b>{stage.title}</b><small>{evidencePending ? "Evidencia pendiente; retomar checkpoint" : stage.description}</small></span>
                     </button>
                     );
                   })}
@@ -759,7 +845,7 @@ export function DraftsView() {
                   )}
                   {consultBusy && (
                     <div className="draft-consult-message assistant draft-consult-thinking">
-                      <Loader2 size={15} /> Leyendo brief, documentos y referencias históricas…
+                      <Loader2 size={15} /> {active.agent_checkpoint?.current_action || "Leyendo brief, documentos y referencias históricas…"}
                     </div>
                   )}
                 </div>
@@ -849,6 +935,20 @@ function inferColumns(rows) {
       return value && typeof value === "object" ? JSON.stringify(value) : value;
     },
   }));
+}
+
+function checkpointStatusLabel(status) {
+  return {
+    working: "Trabajando",
+    completed: "Completado",
+    evidence_needed: "Evidencia pendiente",
+    warning: "Con advertencias",
+    failed: "Falló",
+  }[status] || status || "Sin estado";
+}
+
+function countBenchmarkProjects(benchmarks) {
+  return new Set((benchmarks || []).map((item) => item.codigo).filter(Boolean)).size;
 }
 
 function draftSessionKey(slug) {

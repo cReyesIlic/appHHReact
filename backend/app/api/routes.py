@@ -86,7 +86,25 @@ async def chat(request: ChatRequest, http_request: Request) -> ChatResponse:
         if session_id:
             sessions.append_message(user.id, session_id, role="user", content=request.message)
 
-        response = await orchestrator.run(request)
+        try:
+            response = await orchestrator.run(request)
+        except Exception as exc:
+            active_draft = (request.working_context or {}).get("active_draft") or {}
+            draft_slug = str(active_draft.get("slug") or "").strip()
+            if draft_slug:
+                try:
+                    ProposalDraftService().update_agent_checkpoint(
+                        user.id,
+                        draft_slug,
+                        {
+                            "status": "failed",
+                            "current_action": "La ejecución se interrumpió; se puede retomar desde el checkpoint",
+                            "last_error": f"{type(exc).__name__}: {exc}"[:1000],
+                        },
+                    )
+                except (KeyError, OSError, ValueError, sqlite3.Error):
+                    pass
+            raise
         response.session_id = session_id
 
         # La consulta del draft también alimenta su Wiki de trabajo visible.

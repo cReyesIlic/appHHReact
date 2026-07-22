@@ -197,6 +197,49 @@ class ProposalDraftBriefTests(unittest.TestCase):
         self.assertEqual(sections[0]["content"], "Estimación revisada")
         self.assertEqual(sections[0]["tables"][0]["rows"][0]["total"], 120)
 
+    def test_agent_checkpoint_persists_recipe_and_resumes_evidence(self):
+        service = ProposalDraftService()
+        draft = service.create_draft("owner@shimin.cl", "Oferta con checkpoint")
+        started = service.start_agent_checkpoint(
+            "owner@shimin.cl",
+            draft["slug"],
+            "hours",
+            "Estimar revisión documental",
+        )
+        benchmark = {
+            "codigo": "O-1553",
+            "actividad": "Revisión 91 documentos",
+            "documentos": 91,
+            "hh": 455,
+            "hh_por_documento": 5,
+        }
+        service.update_agent_checkpoint(
+            "owner@shimin.cl",
+            draft["slug"],
+            {
+                "status": "evidence_needed",
+                "current_step": "quantify",
+                "completed_steps": ["context", "inventory", "discover"],
+                "completed_tools": ["search_rag", "get_hh_licitadas"],
+                "quantitative_benchmarks": [benchmark],
+                "evidence_gaps": ["Faltan 2 proyectos"],
+            },
+        )
+
+        resumed = service.start_agent_checkpoint(
+            "owner@shimin.cl",
+            draft["slug"],
+            "hours",
+            "Continuar estimación",
+        )
+        checkpoint = service.get_draft("owner@shimin.cl", draft["slug"])["agent_checkpoint"]
+
+        self.assertEqual(started["run_count"], 1)
+        self.assertEqual(resumed["run_count"], 2)
+        self.assertEqual(checkpoint["quantitative_benchmarks"], [benchmark])
+        self.assertIn("get_hh_licitadas", checkpoint["completed_tools"])
+        self.assertEqual(checkpoint["recipe"][0]["status"], "completed")
+
     def test_document_intelligence_ocr_preserves_page_evidence(self):
         service = ProposalDraftService()
         submit = Mock(status_code=202, headers={"operation-location": "https://ocr/jobs/1"})
@@ -243,6 +286,60 @@ class ProposalDraftBriefTests(unittest.TestCase):
 
 
 class ProposalDraftAgentContextTests(unittest.TestCase):
+    def test_hours_checkpoint_requires_three_distinct_quantitative_projects(self):
+        loop = AgentLoop.__new__(AgentLoop)
+        updates = []
+        state = {
+            "completed_steps": ["context", "inventory", "discover", "estimate"],
+            "quantitative_benchmarks": [
+                {"codigo": "O-1553", "actividad": "Revisión A"},
+                {"codigo": "O-1553", "actividad": "Revisión B"},
+            ],
+        }
+
+        async def persist(**changes):
+            updates.append(changes)
+
+        asyncio.run(loop._finish_draft_checkpoint(persist, state, "hours", success=True))
+
+        self.assertEqual(updates[-1]["status"], "evidence_needed")
+        self.assertEqual(updates[-1]["current_step"], "quantify")
+        self.assertIn("1/3", updates[-1]["evidence_gaps"][0])
+
+        state["quantitative_benchmarks"].extend(
+            [
+                {"codigo": "O-1597", "actividad": "Revisión C"},
+                {"codigo": "O-2410", "actividad": "Revisión D"},
+            ]
+        )
+        asyncio.run(loop._finish_draft_checkpoint(persist, state, "hours", success=True))
+        self.assertEqual(updates[-1]["status"], "completed")
+        self.assertEqual(updates[-1]["evidence_gaps"], [])
+
+    def test_quantitative_checkpoint_only_counts_review_rows_with_denominator(self):
+        loop = AgentLoop.__new__(AgentLoop)
+        result = {
+            "codigo": "O-1553",
+            "rows": [
+                {
+                    "key": "Revisión Electricidad (80 planos y 11 documentos)",
+                    "total_hours": 455,
+                },
+                {"key": "Informe final", "total_hours": 39},
+            ],
+        }
+
+        benchmarks = loop._extract_quantitative_review_benchmarks(
+            "get_hh_licitadas",
+            {"codigo": "O-1553"},
+            result,
+        )
+
+        self.assertEqual(len(benchmarks), 1)
+        self.assertEqual(benchmarks[0]["documentos"], 91)
+        self.assertEqual(benchmarks[0]["hh_por_documento"], 5)
+        self.assertEqual(loop._benchmark_project_count(benchmarks), 1)
+
     def test_table_deduplication_keeps_the_most_complete_version(self):
         loop = AgentLoop.__new__(AgentLoop)
         tables = [
