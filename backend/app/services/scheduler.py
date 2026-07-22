@@ -13,6 +13,7 @@ Config via env:
   SYNC_SCHEDULE_TZ        = zona horaria IANA (default America/Santiago)
   WIKI_REBUILD_ON_STARTUP = migra Wiki antigua al arrancar (default true)
   WIKI_REBUILD_DAILY_LIMIT = lote de respaldo dentro del ciclo diario (default 25)
+  RAG_REPAIR_ON_STARTUP  = completa embeddings pendientes al arrancar (default true)
 
 El scheduler es **idempotente**: si el App Service reinicia, la próxima corrida
 agendada al ciclo siguiente seguirá funcionando. No requiere job store persistente
@@ -36,6 +37,8 @@ _last_run: dict | None = None
 _last_master_run: dict | None = None
 _last_wiki_rebuild: dict | None = None
 _wiki_rebuild_running = False
+_last_rag_repair: dict | None = None
+_rag_repair_running = False
 
 
 def _bool_env(name: str, default: bool) -> bool:
@@ -77,6 +80,7 @@ async def _run_sync_ganadas() -> None:
         master_result = await _run_master_refresh(send_email=False)
         svc = ProposalSyncService()
         result = await svc.sync_ganadas(limit=limit)
+        await _run_rag_repair()
         wiki_migration = None
         if not _wiki_rebuild_running:
             wiki_migration = await svc.backfill_wiki(
@@ -94,6 +98,7 @@ async def _run_sync_ganadas() -> None:
             "objetivo": result.get("objetivo_corrida"),
             "email": result.get("email"),
             "master_refresh": master_result,
+            "rag_repair": _last_rag_repair,
             "wiki_migration": {
                 "target_count": wiki_migration.get("target_count"),
                 "wiki_ok": wiki_migration.get("wiki_ok"),
@@ -113,6 +118,48 @@ async def _run_sync_ganadas() -> None:
             "error": f"{type(exc).__name__}: {exc}",
         }
         logger.exception("[scheduler] sync_ganadas failed")
+
+
+async def _run_rag_repair() -> None:
+    """Completa embeddings faltantes sin volver a descargar desde SharePoint."""
+    from app.rag.hybrid_store import HybridRagStore
+
+    global _last_rag_repair, _rag_repair_running
+    if _rag_repair_running:
+        return
+    _rag_repair_running = True
+    started_at = datetime.now()
+    try:
+        result = await HybridRagStore().build(
+            limit=max(0, _int_env("RAG_REPAIR_LIMIT", 0)),
+            force=False,
+        )
+        _last_rag_repair = {
+            "started_at": started_at.isoformat(timespec="seconds"),
+            "finished_at": datetime.now().isoformat(timespec="seconds"),
+            "ok": True,
+            "selected": result.get("selected"),
+            "processed": result.get("processed"),
+            "errors": result.get("errors"),
+        }
+        logger.info("[scheduler] rag repair done: %s", _last_rag_repair)
+    except Exception as exc:  # noqa: BLE001
+        _last_rag_repair = {
+            "started_at": started_at.isoformat(timespec="seconds"),
+            "finished_at": datetime.now().isoformat(timespec="seconds"),
+            "ok": False,
+            "error": f"{type(exc).__name__}: {exc}",
+        }
+        logger.exception("[scheduler] rag repair failed")
+    finally:
+        _rag_repair_running = False
+
+
+async def _run_startup_maintenance(rebuild_wiki: bool) -> None:
+    if _bool_env("RAG_REPAIR_ON_STARTUP", True):
+        await _run_rag_repair()
+    if rebuild_wiki:
+        await _run_wiki_rebuild()
 
 
 async def _run_storage_monitor() -> None:
@@ -281,10 +328,10 @@ def start_scheduler() -> dict:
 
     sched.start()
     _scheduler = sched
-    if _bool_env("WIKI_REBUILD_ON_STARTUP", True):
-        # Es reanudable: el compilador sólo toma páginas sin evidence-v3.
-        # Esto termina la migración aunque App Service reinicie durante el lote.
-        asyncio.create_task(_run_wiki_rebuild())
+    rebuild_wiki = _bool_env("WIKI_REBUILD_ON_STARTUP", True)
+    if rebuild_wiki or _bool_env("RAG_REPAIR_ON_STARTUP", True):
+        # Completa vectores pendientes antes de reanudar Wiki evidence-v3.
+        asyncio.create_task(_run_startup_maintenance(rebuild_wiki))
     logger.info(
         "[scheduler] iniciado tz=%s hours=%s minute=%s limit=%s",
         tz, hours, minute, _int_env("SYNC_SCHEDULE_LIMIT", 20),
@@ -316,6 +363,8 @@ def scheduler_status() -> dict:
             "last_master_run": _last_master_run,
             "last_wiki_rebuild": _last_wiki_rebuild,
             "wiki_rebuild_running": _wiki_rebuild_running,
+            "last_rag_repair": _last_rag_repair,
+            "rag_repair_running": _rag_repair_running,
         }
     jobs = []
     for j in _scheduler.get_jobs():
@@ -334,6 +383,8 @@ def scheduler_status() -> dict:
         "last_master_run": _last_master_run,
         "last_wiki_rebuild": _last_wiki_rebuild,
         "wiki_rebuild_running": _wiki_rebuild_running,
+        "last_rag_repair": _last_rag_repair,
+        "rag_repair_running": _rag_repair_running,
     }
 
 
@@ -354,4 +405,9 @@ async def trigger_now(job: str = "sync_ganadas") -> dict:
             return {"triggered": "wiki_rebuild", "status": "already_running"}
         asyncio.create_task(_run_wiki_rebuild())
         return {"triggered": "wiki_rebuild", "status": "running_in_background"}
-    return {"error": f"job '{job}' desconocido (usar 'sync_ganadas', 'master_refresh', 'storage_monitor' o 'wiki_rebuild')"}
+    if job == "rag_repair":
+        if _rag_repair_running:
+            return {"triggered": "rag_repair", "status": "already_running"}
+        asyncio.create_task(_run_rag_repair())
+        return {"triggered": "rag_repair", "status": "running_in_background"}
+    return {"error": f"job '{job}' desconocido (usar 'sync_ganadas', 'master_refresh', 'storage_monitor', 'wiki_rebuild' o 'rag_repair')"}

@@ -908,6 +908,21 @@ class MasterCodeFilterTests(unittest.TestCase):
 
 
 class SchedulerReliabilityTests(unittest.IsolatedAsyncioTestCase):
+    async def test_rag_repair_completes_pending_embeddings_in_background_job(self):
+        from app.services import scheduler
+
+        store = Mock()
+        store.build = AsyncMock(return_value={"selected": 12, "processed": 12, "errors": 0})
+        scheduler._rag_repair_running = False
+        scheduler._last_rag_repair = None
+        with patch("app.rag.hybrid_store.HybridRagStore", return_value=store):
+            await scheduler._run_rag_repair()
+
+        store.build.assert_awaited_once_with(limit=0, force=False)
+        self.assertFalse(scheduler._rag_repair_running)
+        self.assertTrue(scheduler._last_rag_repair["ok"])
+        self.assertEqual(scheduler._last_rag_repair["processed"], 12)
+
     @unittest.skipUnless(importlib.util.find_spec("apscheduler"), "APScheduler no instalado en el Python local")
     async def test_scheduler_runs_once_daily_in_chile_timezone(self):
         from app.services import scheduler
@@ -921,6 +936,7 @@ class SchedulerReliabilityTests(unittest.IsolatedAsyncioTestCase):
                 "SYNC_SCHEDULE_TZ": "America/Santiago",
                 "SYNC_SCHEDULE_MINUTE": "15",
                 "WIKI_REBUILD_ON_STARTUP": "false",
+                "RAG_REPAIR_ON_STARTUP": "false",
             },
             clear=False,
         ):
