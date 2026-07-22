@@ -315,6 +315,16 @@ export function getEntregablesTiposServicio() {
   return jsonFetch("/api/entregables/tipos-servicio");
 }
 
+export function extractEntregablesFromSharePoint(codigo) {
+  return jsonFetch(`/api/entregables/extract-budget/${encodeURIComponent(codigo)}`, {
+    method: "POST",
+  });
+}
+
+export function getEntregablesExtracted(codigo) {
+  return jsonFetch(`/api/entregables/extracted/${encodeURIComponent(codigo)}`);
+}
+
 export function askEntregablesAgent(payload) {
   return jsonFetch("/api/entregables/ask", {
     method: "POST",

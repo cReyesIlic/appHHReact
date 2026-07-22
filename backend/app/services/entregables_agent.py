@@ -92,6 +92,10 @@ class EntregablesAgent:
         wants_persona = any(k in q_lower for k in ["persona", "profesional", "quién", "quien", "nombre", "responsable"])
         wants_real = any(k in q_lower for k in ["real", "cargada", "ejecuta", "carga", "semanal", "staffing"])
         wants_licit = any(k in q_lower for k in ["licit", "presupuesto", "oferta", "cotiz", "estim"])
+        wants_compare = any(k in q_lower for k in ["compar", "desviaci", "diferencia", "versus", " vs "])
+        if wants_compare:
+            wants_real = True
+            wants_licit = True
         if not wants_real and not wants_licit:
             wants_licit = True
             wants_real = wants_persona  # si pregunta por persona, sí o sí reales
