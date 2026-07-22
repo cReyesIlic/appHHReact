@@ -18,12 +18,16 @@ from __future__ import annotations
 import json
 import re
 import sqlite3
+import time
 import unicodedata
+from contextlib import closing
 from dataclasses import dataclass
 from datetime import datetime
 from hashlib import sha1
 from io import BytesIO
 from pathlib import Path
+
+import httpx
 
 from app.core.config import settings
 
@@ -38,6 +42,7 @@ class DraftFileInfo:
 
 class ProposalDraftService:
     def __init__(self) -> None:
+        self._last_extraction_method = "none"
         self._ensure_tables()
 
     # ---- paths ----
@@ -62,7 +67,7 @@ class ProposalDraftService:
 
     def _owner_for_slug(self, slug: str) -> str | None:
         """Resuelve el owner_id de un slug (consultando BD). Usar en métodos que reciben solo slug."""
-        with sqlite3.connect(settings.sqlite_path, timeout=5) as conn:
+        with closing(sqlite3.connect(settings.sqlite_path, timeout=5)) as conn, conn:
             row = conn.execute(
                 "select owner_id from proposal_drafts where slug = ?", (slug,)
             ).fetchone()
@@ -73,7 +78,7 @@ class ProposalDraftService:
     def create_draft(self, owner_id: str, title: str, cliente: str | None = None) -> dict:
         slug = self._slug(title, owner_id)
         now = datetime.now().isoformat(timespec="seconds")
-        with sqlite3.connect(settings.sqlite_path, timeout=5) as conn:
+        with closing(sqlite3.connect(settings.sqlite_path, timeout=5)) as conn, conn:
             conn.execute(
                 """
                 insert or ignore into proposal_drafts
@@ -88,7 +93,7 @@ class ProposalDraftService:
         return self.get_draft(owner_id, slug)
 
     def list_drafts(self, owner_id: str, limit: int = 100) -> list[dict]:
-        with sqlite3.connect(settings.sqlite_path, timeout=5) as conn:
+        with closing(sqlite3.connect(settings.sqlite_path, timeout=5)) as conn, conn:
             rows = conn.execute(
                 """
                 select slug, title, cliente, status, created_at, updated_at,
@@ -109,9 +114,10 @@ class ProposalDraftService:
         ]
 
     def get_draft(self, owner_id: str, slug: str) -> dict:
-        with sqlite3.connect(settings.sqlite_path, timeout=5) as conn:
+        with closing(sqlite3.connect(settings.sqlite_path, timeout=5)) as conn, conn:
             row = conn.execute(
-                "select slug, title, cliente, status, created_at, updated_at from proposal_drafts "
+                "select slug, title, cliente, status, created_at, updated_at, "
+                "coalesce(brief_text, '') from proposal_drafts "
                 "where slug = ? and owner_id = ?",
                 (slug, owner_id),
             ).fetchone()
@@ -122,10 +128,25 @@ class ProposalDraftService:
         return {
             "slug": row[0], "title": row[1], "cliente": row[2], "status": row[3],
             "created_at": row[4], "updated_at": row[5],
+            "brief_text": row[6],
             "files": files,
             "guide_exists": guia.exists(),
             "guide_path": str(guia) if guia.exists() else None,
         }
+
+    def update_brief(self, owner_id: str, slug: str, brief_text: str) -> dict:
+        """Guarda el texto de trabajo del usuario e invalida una guía ya obsoleta."""
+        self.get_draft(owner_id, slug)
+        brief = str(brief_text or "").strip()[:20000]
+        now = datetime.now().isoformat(timespec="seconds")
+        with closing(sqlite3.connect(settings.sqlite_path, timeout=5)) as conn, conn:
+            conn.execute(
+                "update proposal_drafts set brief_text = ?, status = 'draft', updated_at = ? "
+                "where slug = ? and owner_id = ?",
+                (brief, now, slug, owner_id),
+            )
+        self._invalidate_guide(owner_id, slug)
+        return self.get_draft(owner_id, slug)
 
     def get_guide(self, owner_id: str, slug: str) -> str:
         path = self._guia_path(owner_id, slug)
@@ -133,7 +154,7 @@ class ProposalDraftService:
 
     def delete_draft(self, owner_id: str, slug: str) -> dict:
         # Borrar BD primero (rápido)
-        with sqlite3.connect(settings.sqlite_path, timeout=5) as conn:
+        with closing(sqlite3.connect(settings.sqlite_path, timeout=5)) as conn, conn:
             n = conn.execute(
                 "delete from proposal_drafts where slug = ? and owner_id = ?",
                 (slug, owner_id),
@@ -152,7 +173,7 @@ class ProposalDraftService:
     # ---- Files ----
 
     def list_files(self, slug: str) -> list[dict]:
-        with sqlite3.connect(settings.sqlite_path, timeout=5) as conn:
+        with closing(sqlite3.connect(settings.sqlite_path, timeout=5)) as conn, conn:
             rows = conn.execute(
                 """
                 select id, filename, kind, size, chars_extracted, uploaded_at
@@ -188,7 +209,7 @@ class ProposalDraftService:
 
         # Index en chunks
         chunks = self._chunkify(text, max_chars=1600, overlap=200)
-        with sqlite3.connect(settings.sqlite_path, timeout=5) as conn:
+        with closing(sqlite3.connect(settings.sqlite_path, timeout=5)) as conn, conn:
             conn.execute(
                 """
                 insert into proposal_draft_files (slug, filename, kind, size, chars_extracted, uploaded_at)
@@ -210,9 +231,11 @@ class ProposalDraftService:
                     (slug, clean_name, chunk_text, idx * (1600 - 200), idx),
                 )
             conn.execute(
-                "update proposal_drafts set updated_at = ? where slug = ?",
+                "update proposal_drafts set status = 'draft', updated_at = ? where slug = ?",
                 (datetime.now().isoformat(timespec="seconds"), slug),
             )
+
+        self._invalidate_guide(owner_id, slug)
 
         return {
             "filename": clean_name,
@@ -220,6 +243,12 @@ class ProposalDraftService:
             "size": len(content),
             "chars_extracted": len(text),
             "chunks_created": len(chunks),
+            "extraction_method": self._last_extraction_method,
+            "extraction_warning": (
+                None
+                if chunks
+                else "No se pudo extraer texto. Si el archivo está escaneado, verifica OCR/Document Intelligence."
+            ),
         }
 
     def file_path(self, owner_id: str, slug: str, filename: str) -> Path:
@@ -289,7 +318,7 @@ class ProposalDraftService:
         terms = [self._norm(t) for t in (query or "").split() if len(t) >= 3]
         if not terms:
             return []
-        with sqlite3.connect(settings.sqlite_path, timeout=5) as conn:
+        with closing(sqlite3.connect(settings.sqlite_path, timeout=5)) as conn, conn:
             rows = conn.execute(
                 "select id, source_file, text, char_start from proposal_draft_chunks where slug = ?",
                 (slug,),
@@ -309,7 +338,7 @@ class ProposalDraftService:
 
     def all_text(self, slug: str, max_chars: int = 80000) -> str:
         """Texto completo concatenado (truncado) para enviar al LLM."""
-        with sqlite3.connect(settings.sqlite_path, timeout=5) as conn:
+        with closing(sqlite3.connect(settings.sqlite_path, timeout=5)) as conn, conn:
             rows = conn.execute(
                 """
                 select source_file, text from proposal_draft_chunks
@@ -335,12 +364,17 @@ class ProposalDraftService:
         path = self._guia_path(owner_id, slug)
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(markdown, encoding="utf-8")
-        with sqlite3.connect(settings.sqlite_path, timeout=5) as conn:
+        with closing(sqlite3.connect(settings.sqlite_path, timeout=5)) as conn, conn:
             conn.execute(
                 "update proposal_drafts set status = 'guided', updated_at = ? where slug = ? and owner_id = ?",
                 (datetime.now().isoformat(timespec="seconds"), slug, owner_id),
             )
         return path
+
+    def _invalidate_guide(self, owner_id: str, slug: str) -> None:
+        path = self._guia_path(owner_id, slug)
+        if path.exists():
+            path.unlink()
 
     # ---- Internals ----
 
@@ -360,10 +394,22 @@ class ProposalDraftService:
                 pages = []
                 for idx, page in enumerate(reader.pages, start=1):
                     try:
-                        pages.append(f"[página {idx}]\n{page.extract_text() or ''}")
+                        page_text = (page.extract_text() or "").strip()
+                        if page_text:
+                            pages.append(f"[página {idx}]\n{page_text}")
                     except Exception:
                         continue
-                return "\n\n".join(pages)
+                local_text = "\n\n".join(pages)
+                minimum_useful_chars = max(120, len(reader.pages) * 35)
+                if len(local_text) >= minimum_useful_chars:
+                    self._last_extraction_method = "pypdf2"
+                    return local_text
+                ocr_text = self._extract_pdf_with_document_intelligence(content)
+                if ocr_text:
+                    self._last_extraction_method = "document_intelligence"
+                    return ocr_text
+                self._last_extraction_method = "pypdf2_low_text" if local_text else "no_text"
+                return local_text
             if kind == "docx":
                 from docx import Document
                 doc = Document(BytesIO(content))
@@ -377,10 +423,68 @@ class ProposalDraftService:
                         cells = [c.text.strip() for c in row.cells if c.text.strip()]
                         if cells:
                             blocks.append(" | ".join(cells))
+                self._last_extraction_method = "python_docx"
                 return "\n".join(blocks)
-        except Exception as exc:
-            return f"[error extrayendo {filename}: {exc}]"
+        except Exception:
+            self._last_extraction_method = "error"
+            return ""
+        self._last_extraction_method = "unsupported"
         return ""
+
+    def _extract_pdf_with_document_intelligence(self, content: bytes) -> str:
+        endpoint = str(settings.document_intelligence_endpoint or "").strip().rstrip("/")
+        key = str(settings.document_intelligence_key or "").strip()
+        if not endpoint or not key:
+            return ""
+        analyze_url = (
+            f"{endpoint}/documentintelligence/documentModels/prebuilt-layout:analyze"
+            "?api-version=2024-11-30"
+        )
+        headers = {
+            "Ocp-Apim-Subscription-Key": key,
+            "Content-Type": "application/pdf",
+        }
+        try:
+            with httpx.Client(timeout=45) as client:
+                response = client.post(analyze_url, headers=headers, content=content)
+                response.raise_for_status()
+                if response.status_code == 200:
+                    return self._document_intelligence_text(response.json())
+                operation_url = response.headers.get("operation-location")
+                if not operation_url:
+                    return ""
+                poll_headers = {"Ocp-Apim-Subscription-Key": key}
+                for _ in range(30):
+                    poll = client.get(operation_url, headers=poll_headers)
+                    poll.raise_for_status()
+                    payload = poll.json()
+                    status = str(payload.get("status") or "").casefold()
+                    if status == "succeeded":
+                        return self._document_intelligence_text(payload)
+                    if status in {"failed", "canceled", "cancelled"}:
+                        return ""
+                    time.sleep(min(float(poll.headers.get("retry-after") or 1), 3.0))
+        except (httpx.HTTPError, ValueError, TypeError):
+            return ""
+        return ""
+
+    def _document_intelligence_text(self, payload: dict) -> str:
+        result = payload.get("analyzeResult") or payload.get("analyze_result") or {}
+        pages = result.get("pages") or []
+        parts: list[str] = []
+        for index, page in enumerate(pages, start=1):
+            lines = page.get("lines") or []
+            text = "\n".join(
+                str(line.get("content") or "").strip()
+                for line in lines
+                if str(line.get("content") or "").strip()
+            )
+            if text:
+                page_number = page.get("pageNumber") or page.get("page_number") or index
+                parts.append(f"[página {page_number}]\n{text}")
+        if parts:
+            return "\n\n".join(parts)
+        return str(result.get("content") or "").strip()
 
     def _chunkify(self, text: str, max_chars: int = 1600, overlap: int = 200) -> list[str]:
         if not text:
@@ -407,7 +511,7 @@ class ProposalDraftService:
 
     def _ensure_tables(self) -> None:
         settings.sqlite_path.parent.mkdir(parents=True, exist_ok=True)
-        with sqlite3.connect(settings.sqlite_path) as conn:
+        with closing(sqlite3.connect(settings.sqlite_path)) as conn, conn:
             conn.execute(
                 """
                 create table if not exists proposal_drafts (
@@ -415,12 +519,18 @@ class ProposalDraftService:
                     owner_id text not null,
                     title text not null,
                     cliente text,
+                    brief_text text default '',
                     status text default 'draft',
                     created_at text not null,
                     updated_at text not null
                 )
                 """
             )
+            draft_columns = {
+                row[1] for row in conn.execute("pragma table_info(proposal_drafts)").fetchall()
+            }
+            if "brief_text" not in draft_columns:
+                conn.execute("alter table proposal_drafts add column brief_text text default ''")
             conn.execute(
                 """
                 create table if not exists proposal_draft_files (

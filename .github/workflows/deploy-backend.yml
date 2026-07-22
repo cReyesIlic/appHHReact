@@ -16,6 +16,7 @@ env:
   RG: appHH
   APP_SERVICE: apphhshimin
   ACR_NAME: apphshimin
+  DOCINTEL_ACCOUNT: docIntelhhSHIMIN
   IMAGE_NAME: shimin-backend
   WORKDIR: backend
 
@@ -75,12 +76,20 @@ jobs:
 
       - name: Configure application identity policy
         run: |
+          DOCINTEL_ENDPOINT=$(az cognitiveservices account show \
+            -g $RG -n $DOCINTEL_ACCOUNT --query properties.endpoint -o tsv)
+          DOCINTEL_KEY=$(az cognitiveservices account keys list \
+            -g $RG -n $DOCINTEL_ACCOUNT --query key1 -o tsv)
+          test -n "$DOCINTEL_ENDPOINT"
+          test -n "$DOCINTEL_KEY"
           az webapp config appsettings set -g $RG -n $APP_SERVICE \
             --settings \
               AUTH_REQUIRED=true \
               AUTH_ALLOW_LOCAL_DEV=false \
               AUTH_ALLOWED_EMAIL_DOMAINS=shimin.cl \
               AUTH_ADMIN_EMAILS=cristian.reyes@shimin.cl \
+              DOCUMENT_INTELLIGENCE_ENDPOINT="$DOCINTEL_ENDPOINT" \
+              DOCUMENT_INTELLIGENCE_KEY="$DOCINTEL_KEY" \
             --output none
 
       - name: Restart web app
@@ -108,16 +117,19 @@ jobs:
       - name: Enforce linked Static Web Apps authentication
         run: |
           set -eo pipefail
-          # `auth update` lee y conserva el proveedor azureStaticWebApps enlazado;
-          # sólo endurece la validación global y mantiene /health público.
-          az webapp auth update -g $RG -n $APP_SERVICE \
-            --enabled true \
-            --action Return401 \
-            --excluded-paths '["/health"]' \
-            --set globalValidation.requireAuthentication=true \
-            --output none
+          # La CLI `az webapp auth update --action` no acepta Return401 aunque
+          # authsettingsV2 sí. Actualizamos el recurso ARM completo para conservar
+          # el proveedor Static Web Apps enlazado y el resto de su configuración.
+          SUBSCRIPTION_ID=$(az account show --query id -o tsv)
+          AUTH_URI="https://management.azure.com/subscriptions/$SUBSCRIPTION_ID/resourceGroups/$RG/providers/Microsoft.Web/sites/$APP_SERVICE/config/authsettingsV2?api-version=2022-03-01"
+          AUTH_FILE=$(mktemp)
+          az rest --method get --uri "$AUTH_URI" \
+            | jq '{properties: (.properties | .platform.enabled = true | .globalValidation.requireAuthentication = true | .globalValidation.unauthenticatedClientAction = "Return401" | .globalValidation.excludedPaths = ["/health"])}' \
+            > "$AUTH_FILE"
+          az rest --method put --uri "$AUTH_URI" --body "@$AUTH_FILE" --output none
+          rm -f "$AUTH_FILE"
 
-          AUTH_STATE=$(az webapp auth show -g $RG -n $APP_SERVICE \
+          AUTH_STATE=$(az rest --method get --uri "$AUTH_URI" \
             --query "properties.[globalValidation.requireAuthentication,globalValidation.unauthenticatedClientAction,identityProviders.azureStaticWebApps.enabled]" \
             -o tsv)
           echo "App Service auth: $AUTH_STATE"

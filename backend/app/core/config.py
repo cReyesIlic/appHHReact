@@ -48,6 +48,8 @@ class Settings(BaseSettings):
     azure_openai_answer_deployment: str | None = Field(default=None, alias="AZURE_OPENAI_ANSWER_DEPLOYMENT")
     azure_openai_embedding_deployment: str | None = Field(default=None, alias="AZURE_OPENAI_EMBEDDING_DEPLOYMENT")
     azure_openai_api_version: str = Field(default="2024-12-01-preview", validation_alias=AliasChoices("AZURE_OPENAI_API_VERSION", "OPENAI_API_VERSION"))
+    document_intelligence_endpoint: str | None = Field(default=None, alias="DOCUMENT_INTELLIGENCE_ENDPOINT")
+    document_intelligence_key: str | None = Field(default=None, alias="DOCUMENT_INTELLIGENCE_KEY")
 
     tenant_id: str | None = Field(default=None, alias="TENANT_ID")
     client_id: str | None = Field(default=None, alias="CLIENT_ID")

@@ -19,7 +19,7 @@ const VIEW_META = {
   master: { title: "Planilla Master v2", subtitle: "datos tabulares de propuestas" },
   entregables: { title: "Entregables / HH", subtitle: "HH licitadas + reales · pivots + sub-agente" },
   library: { title: "Wiki / Librería curada", subtitle: "espacio entre Master y RAG" },
-  drafts: { title: "Propuestas en armado", subtitle: "antecedentes del cliente + guía LLM" },
+  drafts: { title: "Propuestas en armado", subtitle: "brief + antecedentes + copiloto IA" },
   ops: { title: "Ajustes", subtitle: "estado del sistema, índices y operación" },
 };
 

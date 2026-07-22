@@ -938,6 +938,17 @@ def drafts_get(slug: str, http_request: Request) -> dict:
     return draft
 
 
+@router.patch("/drafts/{slug}")
+def drafts_update(slug: str, payload: dict, http_request: Request) -> dict:
+    user = user_from_request(http_request)
+    if "brief_text" not in payload:
+        raise HTTPException(status_code=400, detail="brief_text requerido")
+    try:
+        return ProposalDraftService().update_brief(user.id, slug, payload.get("brief_text") or "")
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="Draft no encontrado") from exc
+
+
 @router.delete("/drafts/{slug}")
 def drafts_delete(slug: str, http_request: Request) -> dict:
     user = user_from_request(http_request)
@@ -1008,16 +1019,26 @@ async def drafts_build_guide(slug: str, http_request: Request) -> dict:
         draft = service.get_draft(user.id, slug)
     except KeyError as exc:
         raise HTTPException(status_code=404, detail="Draft no encontrado") from exc
-    if not draft["files"]:
-        raise HTTPException(status_code=400, detail="No hay archivos subidos. Sube PDF/DOCX antes.")
+    brief_text = str(draft.get("brief_text") or "").strip()
+    if not draft["files"] and not brief_text:
+        raise HTTPException(
+            status_code=400,
+            detail="No hay contexto. Escribe el brief o sube PDF/DOCX antes.",
+        )
 
     from app.services.llm import LlmService
     import json as _json
 
     llm = LlmService()
-    text = service.all_text(slug, max_chars=80000)
+    document_text = service.all_text(slug, max_chars=80000)
+    context_parts = []
+    if brief_text:
+        context_parts.append(f"## Brief e instrucciones del usuario\n{brief_text}")
+    if document_text.strip():
+        context_parts.append(f"## Antecedentes documentales\n{document_text}")
+    text = "\n\n".join(context_parts)
     if not text.strip():
-        raise HTTPException(status_code=400, detail="No se extrajo texto de los archivos")
+        raise HTTPException(status_code=400, detail="No se extrajo texto utilizable del draft")
 
     system = (
         "Eres un analista senior de propuestas SHIMIN. El usuario te entrega los antecedentes "
@@ -1050,7 +1071,7 @@ async def drafts_build_guide(slug: str, http_request: Request) -> dict:
     user_payload = (
         f"Trabajo: {draft['title']}\n"
         f"Cliente: {draft['cliente'] or 'no especificado'}\n\n"
-        f"Antecedentes (texto extraído de {len(draft['files'])} archivos):\n\n{text}"
+        f"Contexto del usuario y antecedentes ({len(draft['files'])} archivos):\n\n{text}"
     )
 
     if not llm.client:

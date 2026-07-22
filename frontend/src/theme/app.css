@@ -643,6 +643,132 @@
   border-color: var(--accent);
   background: var(--bg-alt);
 }
+.draft-brief-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin-top: 14px;
+  padding: 14px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  background: var(--bg-alt);
+}
+.draft-brief-textarea,
+.draft-consult-composer textarea {
+  width: 100%;
+  resize: vertical;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-sm);
+  padding: 10px 12px;
+  background: var(--bg-surface);
+  color: var(--text-primary);
+  font: inherit;
+  line-height: 1.5;
+}
+.draft-brief-textarea:focus,
+.draft-consult-composer textarea:focus {
+  border-color: var(--accent);
+  outline: 2px solid var(--accent-soft);
+}
+.draft-unsaved {
+  color: var(--status-proceso-fg);
+  font-size: 11px;
+}
+.draft-quick-prompts {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 7px;
+  margin-bottom: 12px;
+}
+.draft-quick-prompts button {
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  padding: 6px 10px;
+  background: var(--bg-alt);
+  color: var(--text-secondary);
+  font: inherit;
+  font-size: 12px;
+  cursor: pointer;
+}
+.draft-quick-prompts button:hover:not(:disabled) {
+  border-color: var(--accent);
+  color: var(--text-primary);
+}
+.draft-quick-prompts button:disabled { opacity: 0.5; cursor: not-allowed; }
+.draft-consult-thread {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  min-height: 180px;
+  max-height: 620px;
+  overflow: auto;
+  padding: 12px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  background: var(--bg-alt);
+}
+.draft-consult-message {
+  max-width: 92%;
+  padding: 11px 13px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  background: var(--bg-surface);
+  color: var(--text-primary);
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+}
+.draft-consult-message.user {
+  align-self: flex-end;
+  background: var(--accent-soft);
+  border-color: var(--accent);
+}
+.draft-consult-message.assistant { align-self: flex-start; }
+.draft-consult-message > :last-child { margin-bottom: 0; }
+.draft-consult-role {
+  margin-bottom: 5px;
+  color: var(--text-muted);
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+.draft-consult-thinking {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  color: var(--text-secondary);
+}
+.draft-consult-thinking svg { animation: spin 1s linear infinite; }
+.draft-consult-sources {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 10px;
+  padding-top: 8px;
+  border-top: 1px solid var(--border);
+}
+.draft-consult-sources a {
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  padding: 3px 8px;
+  font-size: 11px;
+  text-decoration: none;
+}
+.draft-consult-composer {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  gap: 10px;
+  align-items: end;
+  margin-top: 12px;
+}
+@keyframes spin { to { transform: rotate(360deg); } }
+
+@media (max-width: 900px) {
+  .drafts-layout { grid-template-columns: 1fr; overflow: auto; }
+  .drafts-sidebar,
+  .drafts-main { overflow: visible; }
+  .draft-consult-composer { grid-template-columns: 1fr; }
+}
 
 /* Library */
 .library-grid {

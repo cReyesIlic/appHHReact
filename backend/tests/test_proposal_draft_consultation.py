@@ -1,0 +1,214 @@
+import asyncio
+import json
+import sqlite3
+import tempfile
+import unittest
+from contextlib import closing
+from io import BytesIO
+from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, Mock, patch
+
+from docx import Document
+
+from app.agents.agent_loop import AgentLoop
+from app.core.config import settings
+from app.services.proposal_drafts import ProposalDraftService
+
+
+class ProposalDraftBriefTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.root = Path(self.temp.name)
+        self.database_patch = patch.object(
+            settings,
+            "database_dir",
+            str(self.root / "drafts.sqlite"),
+        )
+        self.database_patch.start()
+        self.storage_patch = patch.object(
+            ProposalDraftService,
+            "_owner_root",
+            lambda _service, owner_id: self.root / "proposal_drafts" / str(owner_id),
+        )
+        self.storage_patch.start()
+
+    def tearDown(self):
+        self.storage_patch.stop()
+        self.database_patch.stop()
+        self.temp.cleanup()
+
+    def test_legacy_database_is_migrated_and_brief_invalidates_old_guide(self):
+        with closing(sqlite3.connect(settings.sqlite_path)) as conn, conn:
+            conn.execute(
+                """
+                create table proposal_drafts (
+                    slug text primary key,
+                    owner_id text not null,
+                    title text not null,
+                    cliente text,
+                    status text default 'draft',
+                    created_at text not null,
+                    updated_at text not null
+                )
+                """
+            )
+
+        service = ProposalDraftService()
+        draft = service.create_draft("owner@shimin.cl", "Nueva restitución", "Collahuasi")
+        service.save_guide("owner@shimin.cl", draft["slug"], "# Guía antigua")
+
+        updated = service.update_brief(
+            "owner@shimin.cl",
+            draft["slug"],
+            "Preparar ingeniería de detalle y validar HH por disciplina.",
+        )
+
+        self.assertEqual(updated["status"], "draft")
+        self.assertIn("validar HH", updated["brief_text"])
+        self.assertFalse(updated["guide_exists"])
+        with closing(sqlite3.connect(settings.sqlite_path)) as conn:
+            columns = {row[1] for row in conn.execute("pragma table_info(proposal_drafts)")}
+        self.assertIn("brief_text", columns)
+
+    def test_uploaded_docx_is_extracted_and_searchable(self):
+        service = ProposalDraftService()
+        draft = service.create_draft("owner@shimin.cl", "Sistema de bombeo")
+        document = Document()
+        document.add_heading("Requisitos del cliente", level=1)
+        document.add_paragraph("El plazo contractual es de doce semanas y exige un informe final.")
+        buffer = BytesIO()
+        document.save(buffer)
+
+        result = service.add_file(
+            "owner@shimin.cl",
+            draft["slug"],
+            "Bases técnicas.docx",
+            buffer.getvalue(),
+        )
+        hits = service.search_chunks(draft["slug"], "plazo contractual informe", limit=5)
+
+        self.assertGreater(result["chars_extracted"], 20)
+        self.assertGreater(result["chunks_created"], 0)
+        self.assertTrue(hits)
+        self.assertIn("doce semanas", hits[0]["snippet"])
+
+    def test_document_intelligence_ocr_preserves_page_evidence(self):
+        service = ProposalDraftService()
+        submit = Mock(status_code=202, headers={"operation-location": "https://ocr/jobs/1"})
+        submit.raise_for_status = Mock()
+        poll = Mock(
+            headers={},
+            json=Mock(
+                return_value={
+                    "status": "succeeded",
+                    "analyzeResult": {
+                        "pages": [
+                            {
+                                "pageNumber": 3,
+                                "lines": [
+                                    {"content": "Alcance del servicio"},
+                                    {"content": "Plazo de doce semanas"},
+                                ],
+                            }
+                        ]
+                    },
+                }
+            ),
+        )
+        poll.raise_for_status = Mock()
+        client = Mock()
+        client.__enter__ = Mock(return_value=client)
+        client.__exit__ = Mock(return_value=False)
+        client.post.return_value = submit
+        client.get.return_value = poll
+
+        with patch.object(
+            settings,
+            "document_intelligence_endpoint",
+            "https://docintel.example",
+        ), patch.object(settings, "document_intelligence_key", "test-key"), patch(
+            "app.services.proposal_drafts.httpx.Client",
+            return_value=client,
+        ):
+            text = service._extract_pdf_with_document_intelligence(b"pdf-scanned")
+
+        self.assertIn("[página 3]", text)
+        self.assertIn("Plazo de doce semanas", text)
+        self.assertEqual(client.post.call_args.kwargs["content"], b"pdf-scanned")
+
+
+class ProposalDraftAgentContextTests(unittest.TestCase):
+    def test_active_draft_is_preloaded_before_the_model_answers(self):
+        loop = AgentLoop.__new__(AgentLoop)
+        loop.max_iterations = 1
+        loop.skill_registry = Mock()
+        loop.skill_registry.catalog.return_value = ""
+        loop.llm = Mock(client=object(), azure=False)
+        loop.llm.chat_with_tools = AsyncMock(
+            return_value=SimpleNamespace(
+                tool_calls=[],
+                content="Sugiero estructurar alcance, entregables, riesgos y HH.",
+            )
+        )
+
+        dispatcher = Mock()
+
+        async def dispatch(name, args):
+            if name == "get_draft_context":
+                return {
+                    "slug": "restitucion-abc123",
+                    "title": "Restitución",
+                    "brief_text": "Necesito preparar la oferta.",
+                    "chunks_preview": "El cliente solicita ingeniería de detalle.",
+                    "source_assets": [
+                        {
+                            "title": "Bases técnicas.pdf",
+                            "url": "/api/drafts/restitucion-abc123/files/Bases%20t%C3%A9cnicas.pdf",
+                        }
+                    ],
+                }
+            if name == "search_draft_chunks":
+                return {
+                    "count": 1,
+                    "hits": [
+                        {
+                            "title": "Bases técnicas.pdf",
+                            "url": "/api/drafts/restitucion-abc123/files/Bases%20t%C3%A9cnicas.pdf",
+                            "snippet": "El cliente solicita ingeniería de detalle.",
+                            "score": 2.0,
+                        }
+                    ],
+                }
+            raise AssertionError(name)
+
+        dispatcher.dispatch = AsyncMock(side_effect=dispatch)
+        with patch("app.agents.agent_loop.ToolContext.build", return_value=object()), patch(
+            "app.agents.agent_loop.ToolDispatcher", return_value=dispatcher
+        ):
+            result = asyncio.run(
+                loop.run(
+                    "¿Cómo debería armar esta propuesta?",
+                    active_draft={
+                        "slug": "restitucion-abc123",
+                        "title": "Restitución",
+                        "cliente": "Collahuasi",
+                        "brief_text": "Necesito preparar la oferta.",
+                    },
+                )
+            )
+
+        self.assertEqual(
+            [call.args[0] for call in dispatcher.dispatch.await_args_list],
+            ["get_draft_context", "search_draft_chunks"],
+        )
+        model_messages = loop.llm.chat_with_tools.await_args.kwargs["messages"]
+        payload = json.loads(model_messages[-1]["content"])
+        self.assertEqual(payload["draft_activo"]["slug"], "restitucion-abc123")
+        self.assertIn("contexto_draft", payload)
+        self.assertIn("/api/drafts/restitucion-abc123/files/", result.answer)
+        self.assertTrue(any(source.url for source in result.sources))
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 from dataclasses import dataclass
 from typing import Any
+from urllib.parse import quote
 
 from app.rag.hybrid_store import HybridRagStore
 from app.rag.parent_child import ParentChildIndexer
@@ -660,17 +661,26 @@ async def get_draft_context(ctx: ToolContext, slug: str, include_guide: bool = T
         "slug": draft["slug"],
         "title": draft["title"],
         "cliente": draft["cliente"],
+        "brief_text": draft.get("brief_text") or "",
         "status": draft["status"],
         "files_count": len(draft.get("files") or []),
         "files": [
             {"filename": f["filename"], "kind": f["kind"], "chars_extracted": f["chars_extracted"]}
             for f in draft.get("files") or []
         ],
+        "source_assets": [
+            {
+                "title": f["filename"],
+                "url": f"/api/drafts/{quote(slug, safe='')}/files/{quote(f['filename'], safe='')}",
+                "kind": f["kind"],
+            }
+            for f in draft.get("files") or []
+        ],
     }
     if include_guide and draft.get("guide_exists"):
         out["guide"] = ctx.drafts.get_guide(user.id, slug)
     if include_chunks_preview:
-        out["chunks_preview"] = ctx.drafts.all_text(slug, max_chars=6000)
+        out["chunks_preview"] = ctx.drafts.all_text(slug, max_chars=12000)
     return out
 
 
@@ -685,6 +695,10 @@ async def search_draft_chunks(ctx: ToolContext, slug: str, query: str, limit: in
     except KeyError:
         return {"error": f"draft '{slug}' no encontrado"}
     hits = ctx.drafts.search_chunks(slug, query, limit=limit)
+    for hit in hits:
+        filename = str(hit.get("source_file") or "")
+        hit["title"] = filename or f"Antecedente {slug}"
+        hit["url"] = f"/api/drafts/{quote(slug, safe='')}/files/{quote(filename, safe='')}"
     return {"count": len(hits), "hits": hits}
 
 

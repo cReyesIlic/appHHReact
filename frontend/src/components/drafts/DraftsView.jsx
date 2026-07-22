@@ -1,17 +1,20 @@
 import { useEffect, useRef, useState } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
-import { FilePlus, Trash2, Upload, Sparkles, FileText, File as FileIcon, Loader2, Cloud, Search } from "lucide-react";
+import { FilePlus, Trash2, Upload, Sparkles, FileText, File as FileIcon, Loader2, Cloud, Search, Send, Save, MessageSquareText, RotateCcw } from "lucide-react";
 import {
   listDrafts,
   createDraft,
   getDraft,
+  updateDraft,
   deleteDraft,
   uploadDraftFile,
   buildDraftGuide,
   getDraftFileUrl,
   previewSharepointAntecedentes,
   importDraftFromSharepoint,
+  sendChat,
+  getSession,
 } from "../../lib/api.js";
 import { Button } from "../shared/Button.jsx";
 import { Card } from "../shared/Card.jsx";
@@ -28,6 +31,13 @@ export function DraftsView() {
   const [newCliente, setNewCliente] = useState("");
   const [spCode, setSpCode] = useState("");
   const [spPreview, setSpPreview] = useState(null);
+  const [briefText, setBriefText] = useState("");
+  const [briefDirty, setBriefDirty] = useState(false);
+  const [consultInput, setConsultInput] = useState("");
+  const [consultMessages, setConsultMessages] = useState([]);
+  const [consultBusy, setConsultBusy] = useState(false);
+  const [consultSessionId, setConsultSessionId] = useState(null);
+  const [consultContext, setConsultContext] = useState({});
   const fileInputRef = useRef(null);
 
   const reload = async () => {
@@ -39,6 +49,8 @@ export function DraftsView() {
         try {
           const d = await getDraft(activeSlug);
           setActive(d);
+          setBriefText(d.brief_text || "");
+          setBriefDirty(false);
         } catch {
           setActiveSlug(null);
           setActive(null);
@@ -55,7 +67,42 @@ export function DraftsView() {
 
   useEffect(() => {
     if (!activeSlug) return;
-    getDraft(activeSlug).then(setActive).catch(() => setActive(null));
+    getDraft(activeSlug)
+      .then((draft) => {
+        setActive(draft);
+        setBriefText(draft.brief_text || "");
+        setBriefDirty(false);
+      })
+      .catch(() => setActive(null));
+  }, [activeSlug]);
+
+  useEffect(() => {
+    let cancelled = false;
+    setConsultMessages([]);
+    setConsultContext({});
+    setConsultInput("");
+    setConsultSessionId(null);
+    if (!activeSlug) return () => { cancelled = true; };
+
+    const storageKey = draftSessionKey(activeSlug);
+    const storedSession = localStorage.getItem(storageKey);
+    if (!storedSession) return () => { cancelled = true; };
+
+    getSession(storedSession)
+      .then((session) => {
+        if (cancelled) return;
+        setConsultSessionId(storedSession);
+        setConsultContext(session.working_context || {});
+        setConsultMessages(
+          (session.messages || []).map((message) => ({
+            role: message.role,
+            content: message.content,
+            sources: message.sources || [],
+          })),
+        );
+      })
+      .catch(() => localStorage.removeItem(storageKey));
+    return () => { cancelled = true; };
   }, [activeSlug]);
 
   const handleCreate = async (e) => {
@@ -79,6 +126,7 @@ export function DraftsView() {
     try {
       await deleteDraft(slug);
       if (activeSlug === slug) {
+        localStorage.removeItem(draftSessionKey(slug));
         setActiveSlug(null);
         setActive(null);
       }
@@ -92,10 +140,15 @@ export function DraftsView() {
     if (!activeSlug || !files?.length) return;
     setBusy("upload");
     try {
+      const warnings = [];
       for (const f of files) {
-        await uploadDraftFile(activeSlug, f);
+        const result = await uploadDraftFile(activeSlug, f);
+        if (result.extraction_warning) {
+          warnings.push(`${result.filename}: ${result.extraction_warning}`);
+        }
       }
       await reload();
+      if (warnings.length) alert(warnings.join("\n"));
     } catch (exc) {
       alert(`Error subiendo: ${exc.message}`);
     } finally {
@@ -147,6 +200,16 @@ export function DraftsView() {
     if (!activeSlug) return;
     setBusy("guide");
     try {
+      if (briefDirty) {
+        const updatedDraft = await updateDraft(activeSlug, { brief_text: briefText });
+        setActive((current) => ({
+          ...(current || {}),
+          ...updatedDraft,
+          guide_exists: false,
+          guide_markdown: "",
+        }));
+        setBriefDirty(false);
+      }
       await buildDraftGuide(activeSlug);
       await reload();
     } catch (exc) {
@@ -154,6 +217,86 @@ export function DraftsView() {
     } finally {
       setBusy(null);
     }
+  };
+
+  const handleSaveBrief = async () => {
+    if (!activeSlug) return;
+    setBusy("brief");
+    try {
+      await updateDraft(activeSlug, { brief_text: briefText });
+      setBriefDirty(false);
+      await reload();
+    } catch (exc) {
+      alert(`Error guardando el brief: ${exc.message}`);
+    } finally {
+      setBusy(null);
+    }
+  };
+
+  const handleConsult = async (suggestedQuestion = null) => {
+    const text = String(suggestedQuestion || consultInput || "").trim();
+    if (!activeSlug || !active || !text) return;
+    setConsultBusy(true);
+    setConsultInput("");
+    const previousMessages = consultMessages;
+    setConsultMessages((current) => [...current, { role: "user", content: text }]);
+    try {
+      if (briefDirty) {
+        const updatedDraft = await updateDraft(activeSlug, { brief_text: briefText });
+        setActive((current) => ({
+          ...(current || {}),
+          ...updatedDraft,
+          guide_exists: false,
+          guide_markdown: "",
+        }));
+        setBriefDirty(false);
+      }
+      const activeDraftContext = {
+        slug: active.slug,
+        title: active.title,
+        cliente: active.cliente || "",
+        brief_text: briefText,
+      };
+      const response = await sendChat({
+        message: text,
+        history: previousMessages.slice(-12).map(({ role, content }) => ({ role, content })),
+        selected_codes: consultContext.suggested_codes || [],
+        deep_pdf_read: true,
+        working_context: { ...consultContext, active_draft: activeDraftContext },
+        filters: {},
+        session_id: consultSessionId,
+        create_session_if_missing: true,
+      });
+      setConsultMessages((current) => [
+        ...current,
+        {
+          role: "assistant",
+          content: response.answer || "(sin respuesta)",
+          sources: response.sources || [],
+        },
+      ]);
+      setConsultContext(response.working_context || { active_draft: activeDraftContext });
+      if (response.session_id) {
+        setConsultSessionId(response.session_id);
+        localStorage.setItem(draftSessionKey(activeSlug), response.session_id);
+      }
+    } catch (exc) {
+      setConsultMessages((current) => [
+        ...current,
+        { role: "assistant", content: `❌ Error consultando la propuesta: ${exc.message}` },
+      ]);
+    } finally {
+      setConsultBusy(false);
+    }
+  };
+
+  const resetConsult = () => {
+    if (!activeSlug) return;
+    localStorage.removeItem(draftSessionKey(activeSlug));
+    setConsultSessionId(null);
+    setConsultContext({});
+    setConsultMessages([]);
+    setConsultInput("");
   };
 
   return (
@@ -219,7 +362,7 @@ export function DraftsView() {
             <EmptyState
               icon={FilePlus}
               title="Sube los antecedentes para una propuesta nueva"
-              description="Crea un draft a la izquierda, sube PDFs o DOCX del cliente (RFP, especificaciones, bases técnicas) y el agente extraerá los puntos clave en una guía .md que podrás usar para armar la propuesta."
+              description="Crea un draft, escribe tu brief y sube los PDF/DOCX del cliente. Podrás generar una guía y conversar con la IA usando esos antecedentes y propuestas históricas."
             />
           ) : (
             <>
@@ -258,15 +401,51 @@ export function DraftsView() {
                     variant="accent"
                     icon={busy === "guide" ? Loader2 : Sparkles}
                     onClick={handleBuildGuide}
-                    disabled={busy === "guide" || (active.files || []).length === 0}
+                    disabled={
+                      busy === "guide"
+                      || ((active.files || []).length === 0 && !briefText.trim())
+                    }
                     title={
-                      (active.files || []).length === 0
-                        ? "Sube archivos primero"
-                        : "Generar guía con LLM a partir de los antecedentes"
+                      (active.files || []).length === 0 && !briefText.trim()
+                        ? "Escribe el brief o sube archivos primero"
+                        : "Generar guía con LLM a partir del brief y los antecedentes"
                     }
                   >
                     {busy === "guide" ? "Generando guía…" : "Generar guía con LLM"}
                   </Button>
+                </div>
+
+                <div className="draft-brief-panel">
+                  <div className="card-title" style={{ fontSize: 13 }}>
+                    Brief e instrucciones para la propuesta
+                  </div>
+                  <small className="dim">
+                    Describe qué necesitas ofertar, tus ideas, restricciones y dudas. La IA combinará
+                    este texto con los documentos cargados y las propuestas históricas.
+                  </small>
+                  <textarea
+                    className="draft-brief-textarea"
+                    value={briefText}
+                    onChange={(event) => {
+                      setBriefText(event.target.value);
+                      setBriefDirty(true);
+                    }}
+                    placeholder="Ej.: preparar una ingeniería de detalle para el sistema de restitución; necesito sugerencias de alcance, entregables, HH, riesgos y exclusiones…"
+                    rows={6}
+                  />
+                  <div className="flex-row" style={{ gap: 8, alignItems: "center" }}>
+                    <Button
+                      variant="ghost"
+                      icon={busy === "brief" ? Loader2 : Save}
+                      onClick={handleSaveBrief}
+                      disabled={busy === "brief" || !briefDirty}
+                    >
+                      {busy === "brief" ? "Guardando…" : "Guardar brief"}
+                    </Button>
+                    <small className={briefDirty ? "draft-unsaved" : "dim"}>
+                      {briefDirty ? "Cambios sin guardar" : "Brief guardado"}
+                    </small>
+                  </div>
                 </div>
 
                 {/* Sección: importar desde SharePoint */}
@@ -379,8 +558,112 @@ export function DraftsView() {
                   <EmptyState
                     icon={Sparkles}
                     title="Sin guía aún"
-                    description="Sube los antecedentes del cliente (PDFs/DOCX del RFP, bases técnicas) y haz click en 'Generar guía con LLM'. Tarda ~30 s y produce un .md con: alcance, entregables, disciplinas, criterios, riesgos y próximos pasos."
+                    description="Escribe el brief o sube antecedentes del cliente y haz click en 'Generar guía con LLM'. Produce una síntesis Markdown con alcance, entregables, disciplinas, criterios, riesgos y próximos pasos."
                   />
+                )}
+              </Card>
+
+              <Card
+                title="Consulta IA de esta propuesta"
+                subtitle="Lee el brief, la guía y los PDF/DOCX; además contrasta propuestas históricas"
+                actions={
+                  <Button
+                    variant="ghost"
+                    icon={RotateCcw}
+                    onClick={resetConsult}
+                    disabled={consultBusy || consultMessages.length === 0}
+                  >
+                    Nueva consulta
+                  </Button>
+                }
+              >
+                <div className="draft-quick-prompts">
+                  {DRAFT_PROMPTS.map((prompt) => (
+                    <button
+                      type="button"
+                      key={prompt}
+                      onClick={() => handleConsult(prompt)}
+                      disabled={consultBusy || ((active.files || []).length === 0 && !briefText.trim())}
+                    >
+                      {prompt}
+                    </button>
+                  ))}
+                </div>
+
+                <div className="draft-consult-thread">
+                  {consultMessages.length === 0 ? (
+                    <EmptyState
+                      icon={MessageSquareText}
+                      title="Pregunta sobre esta propuesta"
+                      description="La conversación queda vinculada únicamente a este draft. La IA recibe automáticamente tu brief y los antecedentes cargados."
+                    />
+                  ) : (
+                    consultMessages.map((message, index) => (
+                      <div
+                        key={`${message.role}-${index}`}
+                        className={`draft-consult-message ${message.role}`}
+                      >
+                        <div className="draft-consult-role">
+                          {message.role === "user" ? "Tú" : "Agente SHIMIN"}
+                        </div>
+                        <ReactMarkdown remarkPlugins={[remarkGfm]}>
+                          {message.content || "(sin contenido)"}
+                        </ReactMarkdown>
+                        {(message.sources || []).some((source) => source.url) && (
+                          <div className="draft-consult-sources">
+                            {(message.sources || []).filter((source) => source.url).slice(0, 8).map((source, sourceIndex) => (
+                              <a
+                                key={`${source.url}-${sourceIndex}`}
+                                href={source.url}
+                                target="_blank"
+                                rel="noreferrer"
+                              >
+                                {source.title || source.codigo || "Abrir fuente"}
+                              </a>
+                            ))}
+                          </div>
+                        )}
+                      </div>
+                    ))
+                  )}
+                  {consultBusy && (
+                    <div className="draft-consult-message assistant draft-consult-thinking">
+                      <Loader2 size={15} /> Leyendo brief, documentos y referencias históricas…
+                    </div>
+                  )}
+                </div>
+
+                <div className="draft-consult-composer">
+                  <textarea
+                    value={consultInput}
+                    onChange={(event) => setConsultInput(event.target.value)}
+                    onKeyDown={(event) => {
+                      if (event.key === "Enter" && (event.ctrlKey || event.metaKey)) {
+                        event.preventDefault();
+                        handleConsult();
+                      }
+                    }}
+                    placeholder="Ej.: ¿Cómo debería estructurar el alcance y qué entregables faltan?"
+                    rows={3}
+                    disabled={consultBusy}
+                  />
+                  <Button
+                    variant="accent"
+                    icon={consultBusy ? Loader2 : Send}
+                    onClick={() => handleConsult()}
+                    disabled={
+                      consultBusy
+                      || !consultInput.trim()
+                      || ((active.files || []).length === 0 && !briefText.trim())
+                    }
+                  >
+                    {consultBusy ? "Analizando…" : "Consultar"}
+                  </Button>
+                </div>
+                {(active.files || []).length === 0 && !briefText.trim() && (
+                  <small className="draft-unsaved">
+                    Escribe el brief o carga al menos un documento para habilitar la consulta.
+                  </small>
                 )}
               </Card>
             </>
@@ -389,6 +672,17 @@ export function DraftsView() {
       </div>
     </div>
   );
+}
+
+const DRAFT_PROMPTS = [
+  "¿Cómo debería armar esta propuesta?",
+  "Sugiere alcance y entregables",
+  "Detecta riesgos, vacíos y preguntas al cliente",
+  "Busca propuestas ganadas similares",
+];
+
+function draftSessionKey(slug) {
+  return `shimin_draft_session_${slug}`;
 }
 
 function formatBytes(bytes) {

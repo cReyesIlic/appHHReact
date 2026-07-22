@@ -367,6 +367,14 @@ export function getDraft(slug) {
   return jsonFetch(`/api/drafts/${encodeURIComponent(slug)}`);
 }
 
+export function updateDraft(slug, payload) {
+  return jsonFetch(`/api/drafts/${encodeURIComponent(slug)}`, {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+}
+
 export function deleteDraft(slug) {
   return jsonFetch(`/api/drafts/${encodeURIComponent(slug)}`, { method: "DELETE" });
 }

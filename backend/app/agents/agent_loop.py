@@ -65,6 +65,7 @@ Si ninguna skill aplica claramente, procede con tu juicio usando los principios 
 8. **Enlaces obligatorios**: cuando una tool entregue `url`, inclúyela como enlace Markdown al PDF/documento original. Las entradas Wiki deben quedar identificadas para que la interfaz muestre “Abrir Wiki”. No inventes ni reconstruyas URLs.
 9. **Desglose HH obligatorio**: nunca respondas que no existe un desglose de HH estimadas de una `O-XXXX` mirando sólo el total de Master, Wiki o RAG. Primero usa `get_hh_licitadas` con la vista pedida. Si devuelve cero filas o el detalle no responde la pregunta, busca dentro del PDF con `search_rag` y `read_pdf_deep` en el mismo turno.
 10. **Ficha completa de propuesta**: si piden “detalle de la propuesta/oferta O-XXXX”, combina en una sola respuesta `get_proposal_detail` y `get_hh_licitadas(view="entregable")`. Incluye ficha comercial, alcance y entregables documentales, tabla HH por partida/rol, vacíos y enlaces PDF/Excel/Wiki. No fragmentes la ficha ni respondas sólo columnas del Master.
+11. **Propuesta en armado activa**: si el payload trae `draft_activo`, trabaja siempre sobre ese draft sin pedir el slug ni volver a listarlo. Usa el brief, la guía y los chunks precargados como contexto primario. Para preguntas de cómo armarla, carga la skill `armar_propuesta` y combina los antecedentes del cliente con propuestas históricas comparables, priorizando PG. Distingue claramente: requisito del archivo, sugerencia SHIMIN e inferencia. Cita el archivo cargado mediante su URL cuando esté disponible.
 
 # JERARQUÍA GANADA / PERDIDA (regla de negocio crítica)
 
@@ -173,6 +174,7 @@ class AgentLoop:
         filters: SearchFilters | None = None,
         memory_summary: str = "",
         candidate_codes: list[str] | None = None,
+        active_draft: dict[str, Any] | None = None,
     ) -> AgentRunResult:
         ctx = ToolContext.build()
         dispatcher = ToolDispatcher(ctx, skill_registry=self.skill_registry)
@@ -193,6 +195,60 @@ class AgentLoop:
             user_payload["memoria"] = memory_summary[:2000]
         if candidate_codes:
             user_payload["candidatos_de_contexto"] = candidate_codes[:8]
+
+        draft_slug = str((active_draft or {}).get("slug") or "").strip()
+        if draft_slug:
+            user_payload["draft_activo"] = {
+                "slug": draft_slug,
+                "title": str((active_draft or {}).get("title") or "")[:300],
+                "cliente": str((active_draft or {}).get("cliente") or "")[:200],
+                "brief_text": str((active_draft or {}).get("brief_text") or "")[:20000],
+            }
+            draft_context: dict[str, dict] = {}
+            draft_query = "\n".join(
+                part
+                for part in [
+                    question,
+                    str((active_draft or {}).get("title") or ""),
+                    str((active_draft or {}).get("brief_text") or "")[:2000],
+                ]
+                if part
+            )
+            preload_calls = [
+                (
+                    "get_draft_context",
+                    {
+                        "slug": draft_slug,
+                        "include_guide": True,
+                        "include_chunks_preview": True,
+                    },
+                ),
+                (
+                    "search_draft_chunks",
+                    {"slug": draft_slug, "query": draft_query, "limit": 10},
+                ),
+            ]
+            for name, args in preload_calls:
+                started = time.time()
+                try:
+                    result = await dispatcher.dispatch(name, args)
+                except Exception as exc:  # noqa: BLE001
+                    result = {"error": str(exc)}
+                called_tools.add(name)
+                latency_ms = int((time.time() - started) * 1000)
+                status_value = "error" if isinstance(result, dict) and result.get("error") else "ok"
+                trace.append(
+                    ToolTrace(
+                        tool=f"agent.{name}",
+                        status=status_value,
+                        detail=f"contexto automático del draft {draft_slug} ({latency_ms}ms)",
+                    )
+                )
+                if isinstance(result, dict):
+                    forced_outputs.append((name, result))
+                    draft_context[name] = self._truncate_result(result)
+                    self._absorb_codes(result, seen_codes)
+            user_payload["contexto_draft"] = draft_context
 
         messages: list[dict] = [
             {"role": "system", "content": build_system_prompt(self.skill_registry)},

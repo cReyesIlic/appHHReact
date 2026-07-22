@@ -49,6 +49,9 @@ class AgentOrchestrator:
             trace.append(ToolTrace(tool="memory.personal", status="ok", detail="memoria personal cargada"))
 
         candidate_seed = list(dict.fromkeys([*request.selected_codes, *memory["codes"]]))
+        active_draft = (request.working_context or {}).get("active_draft")
+        if not isinstance(active_draft, dict):
+            active_draft = None
         loop = AgentLoop(max_iterations=6)
         try:
             result = await loop.run(
@@ -57,6 +60,7 @@ class AgentOrchestrator:
                 filters=request.filters,
                 memory_summary=memory["summary"],
                 candidate_codes=candidate_seed,
+                active_draft=active_draft,
             )
         except Exception as exc:  # noqa: BLE001
             trace.append(ToolTrace(tool="agent.loop", status="error", detail=str(exc)))
@@ -79,6 +83,8 @@ class AgentOrchestrator:
             keywords=[],
             alternatives=[],
         )
+        if active_draft:
+            working_context["active_draft"] = active_draft
         return ChatResponse(
             answer=result.answer,
             tables=result.tables,
