@@ -709,6 +709,35 @@ export function DraftsView() {
                         ))}
                       </div>
                     )}
+                    {(active.agent_checkpoint.research_candidates || []).length > 0 && (
+                      <div className="draft-checkpoint-candidates">
+                        <b>Candidatos investigados</b>
+                        {(active.agent_checkpoint.research_candidates || []).slice(0, 12).map((item) => (
+                          <div key={item.codigo}>
+                            <span className={`draft-candidate-status ${item.status || "pending"}`}>
+                              {candidateStatusLabel(item.status)}
+                            </span>
+                            <span>
+                              <b>{item.codigo}</b>{item.estado ? ` · ${item.estado}` : ""} — {item.title}
+                              <small>{item.reason}</small>
+                            </span>
+                          </div>
+                        ))}
+                      </div>
+                    )}
+                    {(active.agent_checkpoint.research_log || []).length > 0 && (
+                      <details className="draft-checkpoint-log">
+                        <summary>Ver búsquedas y documentos abiertos ({active.agent_checkpoint.research_log.length})</summary>
+                        {(active.agent_checkpoint.research_log || []).slice(-16).map((item, index) => (
+                          <span key={`${item.iteration}-${item.tool}-${index}`}>
+                            Iter. {item.iteration} · <code>{item.tool}</code>
+                            {(item.queries || []).length ? ` · “${item.queries.join("” / “")}”` : ""}
+                            {item.codes?.length ? ` · ${item.codes.join(", ")}` : ""}
+                            {item.detail ? ` · ${item.detail}` : ""}
+                          </span>
+                        ))}
+                      </details>
+                    )}
                     {(active.agent_checkpoint.evidence_gaps || []).length > 0 && (
                       <div className="draft-checkpoint-gaps">
                         <b>Pendiente antes de validar</b>
@@ -945,6 +974,15 @@ function checkpointStatusLabel(status) {
     warning: "Con advertencias",
     failed: "Falló",
   }[status] || status || "Sin estado";
+}
+
+function candidateStatusLabel(status) {
+  return {
+    accepted: "Aceptado",
+    rejected: "Descartado",
+    needs_pdf: "Falta PDF/Excel",
+    pending: "Pendiente",
+  }[status] || "Pendiente";
 }
 
 function countBenchmarkProjects(benchmarks) {

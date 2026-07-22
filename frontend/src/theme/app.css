@@ -802,6 +802,44 @@
   font-size: 12px;
 }
 .draft-checkpoint-evidence small { color: var(--text-muted); }
+.draft-checkpoint-candidates,
+.draft-checkpoint-log {
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+  font-size: 12px;
+}
+.draft-checkpoint-candidates > div {
+  display: grid;
+  grid-template-columns: max-content 1fr;
+  gap: 8px;
+  align-items: start;
+  padding: 7px 8px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+}
+.draft-checkpoint-candidates small {
+  display: block;
+  margin-top: 2px;
+  color: var(--text-muted);
+}
+.draft-candidate-status {
+  padding: 2px 6px;
+  border-radius: 999px;
+  background: var(--status-otro-bg);
+  color: var(--status-otro-fg);
+  font-size: 10px;
+  font-weight: 700;
+}
+.draft-candidate-status.accepted { background: var(--status-ganada-bg); color: var(--status-ganada-fg); }
+.draft-candidate-status.rejected { background: var(--status-perdida-bg); color: var(--status-perdida-fg); }
+.draft-candidate-status.needs_pdf { background: var(--status-proceso-bg); color: var(--status-proceso-fg); }
+.draft-checkpoint-log summary { cursor: pointer; font-weight: 700; }
+.draft-checkpoint-log > span {
+  display: block;
+  padding-left: 8px;
+  color: var(--text-muted);
+}
 .draft-checkpoint-tools { display: flex; flex-wrap: wrap; gap: 5px; }
 .draft-checkpoint-tools code {
   padding: 3px 6px;

@@ -185,6 +185,7 @@ DRAFT_TOOL_TIMEOUTS = {
 DRAFT_LLM_TIMEOUT_SECONDS = 20
 DRAFT_FINAL_TIMEOUT_SECONDS = 60
 DRAFT_MAX_ITERATIONS = 3
+DRAFT_HOURS_MAX_ITERATIONS = 6
 
 
 def draft_tool_schemas(question: str, stage: str | None = None) -> list[dict]:
@@ -223,12 +224,15 @@ DRAFT_STAGE_INSTRUCTIONS = {
     ),
     "hours": (
         "Estima HH de REVISIÓN, no de elaboración. Primero usa analyze_draft_document_register. Luego "
-        "retoma el checkpoint y busca evidencia histórica específica de revisión de ingeniería, tablas HH "
-        "licitadas y HH reales. Reúne al menos 3 proyectos distintos con cantidad documental y HH; no "
-        "repitas benchmarks ya validados en el checkpoint. "
+        "retoma el checkpoint y continúa una investigación multi-fuente: descubre candidatos con consultas "
+        "semánticas distintas en Wiki, Master e índice/RAG; prioriza propuestas PG y luego abre su tabla HH "
+        "licitada, Excel o PDF. No basta repetir el mismo código ni citar una Wiki. Reúne al menos 3 proyectos "
+        "distintos con cantidad documental y HH verificables; no repitas benchmarks ya validados. Registra "
+        "qué candidatos aceptaste o descartaste y por qué. "
         "Finalmente llama estimate_draft_review_hours con tasas justificadas. Separa revisión por documento, "
         "coordinación, QA/QC, gestión de observaciones e informe final; muestra escenarios y supuestos. "
-        "Con menos de 3 benchmarks cuantitativos, la estimación debe quedar rotulada PRELIMINAR."
+        "Con menos de 3 benchmarks cuantitativos, la estimación debe quedar rotulada PRELIMINAR y debe "
+        "mostrar las fuentes consultadas, candidatos sin denominador y la evidencia que aún falta."
     ),
     "proposal": (
         "Integra las secciones ya guardadas de la Wiki de trabajo en una propuesta técnica coherente, "
@@ -276,6 +280,7 @@ class AgentLoop:
         called_tools: set[str] = set()
         forced_outputs: list[tuple[str, dict]] = []
         evidence_followups = 0
+        estimate_benchmark_count = -1
 
         seed_filters_dict = filters.model_dump(exclude_none=True) if filters and not filters.is_empty() else None
         user_payload: dict[str, Any] = {"pregunta": question}
@@ -312,7 +317,12 @@ class AgentLoop:
                 )
 
         available_tools = draft_tool_schemas(question, draft_stage) if draft_slug else TOOL_SCHEMAS
-        iteration_limit = min(self.max_iterations, DRAFT_MAX_ITERATIONS) if draft_slug else self.max_iterations
+        if draft_slug and draft_stage == "hours":
+            iteration_limit = min(self.max_iterations, DRAFT_HOURS_MAX_ITERATIONS)
+        elif draft_slug:
+            iteration_limit = min(self.max_iterations, DRAFT_MAX_ITERATIONS)
+        else:
+            iteration_limit = self.max_iterations
         llm_timeout = DRAFT_LLM_TIMEOUT_SECONDS if draft_slug else 45
         if draft_slug:
             try:
@@ -493,10 +503,97 @@ class AgentLoop:
             content = getattr(message, "content", None) or ""
 
             if not tool_calls:
+                checkpoint_benchmark_count = self._benchmark_project_count(
+                    checkpoint_state.get("quantitative_benchmarks") or []
+                )
+                missing_research_sources = self._missing_research_sources(
+                    checkpoint_state.get("research_log") or []
+                )
                 if (
                     draft_slug
                     and draft_stage == "hours"
-                    and "estimate_draft_review_hours" not in called_tools
+                    and (checkpoint_benchmark_count < 3 or missing_research_sources)
+                    and evidence_followups < 3
+                ):
+                    evidence_followups += 1
+                    benchmark_codes = {
+                        str(item.get("codigo") or "").upper()
+                        for item in checkpoint_state.get("quantitative_benchmarks") or []
+                        if isinstance(item, dict) and item.get("codigo")
+                    }
+                    pending_candidates = [
+                        item
+                        for item in checkpoint_state.get("research_candidates") or []
+                        if isinstance(item, dict)
+                        and str(item.get("codigo") or "").upper() not in benchmark_codes
+                        and item.get("status") not in {"rejected", "accepted"}
+                    ][:8]
+                    messages.append({"role": "assistant", "content": content})
+                    messages.append(
+                        {
+                            "role": "user",
+                            "content": json.dumps(
+                                {
+                                    "continuacion_obligatoria": (
+                                        "No cierres ni recalcules todavía. La justificación cuantitativa "
+                                        f"sigue incompleta ({checkpoint_benchmark_count}/3 proyectos; "
+                                        f"fuentes pendientes: {', '.join(missing_research_sources) or 'ninguna'}). "
+                                        "Continúa investigando ahora con herramientas. Si no hay candidatos, "
+                                        "haz búsquedas semánticas diferentes en search_master, "
+                                        "search_wiki_entries y search_rag, priorizando PG y revisión de "
+                                        "ingeniería de detalle/constructibilidad/entregables. Si ya hay "
+                                        "candidatos, abre get_hh_licitadas(view='entregable') para códigos "
+                                        "nuevos y usa read_pdf_deep cuando la tabla no explique el alcance "
+                                        "o el denominador. No repitas códigos ya validados."
+                                    ),
+                                    "codigos_ya_validados": sorted(benchmark_codes),
+                                    "fuentes_de_busqueda_pendientes": missing_research_sources,
+                                    "candidatos_pendientes": pending_candidates,
+                                    "busquedas_previas": (checkpoint_state.get("research_log") or [])[-10:],
+                                },
+                                ensure_ascii=False,
+                            ),
+                        }
+                    )
+                    await persist_checkpoint(
+                        current_step="discover" if not pending_candidates else "quantify",
+                        current_action=(
+                            "Ampliando búsqueda multi-fuente de proyectos comparables"
+                            if not pending_candidates
+                            else f"Abriendo HH/Excel/PDF de {len(pending_candidates)} candidatos nuevos"
+                        ),
+                        evidence_gaps=[
+                            *(
+                                [f"Faltan {3 - checkpoint_benchmark_count} proyectos con documentos + HH comparables"]
+                                if checkpoint_benchmark_count < 3
+                                else []
+                            ),
+                            *(
+                                [f"Falta cubrir búsqueda en: {', '.join(missing_research_sources)}"]
+                                if missing_research_sources
+                                else []
+                            ),
+                        ],
+                    )
+                    trace.append(
+                        ToolTrace(
+                            tool="agent.hours_research_guard",
+                            status="warning",
+                            detail=(
+                                f"la IA intentó cerrar con {checkpoint_benchmark_count}/3 y "
+                                f"{len(missing_research_sources)} fuentes pendientes; "
+                                f"continuación investigativa {evidence_followups}/3"
+                            ),
+                        )
+                    )
+                    continue
+                if (
+                    draft_slug
+                    and draft_stage == "hours"
+                    and (
+                        "estimate_draft_review_hours" not in called_tools
+                        or checkpoint_benchmark_count > estimate_benchmark_count
+                    )
                 ):
                     # Una respuesta narrativa no puede cerrar esta etapa sin la tabla auditable.
                     # La IA elegirá los parámetros en el paso forzado posterior usando la evidencia
@@ -690,6 +787,8 @@ class AgentLoop:
             checkpoint_tools = list(checkpoint_state.get("completed_tools") or [])
             checkpoint_steps = list(checkpoint_state.get("completed_steps") or [])
             checkpoint_benchmarks = list(checkpoint_state.get("quantitative_benchmarks") or [])
+            research_candidates = list(checkpoint_state.get("research_candidates") or [])
+            research_log = list(checkpoint_state.get("research_log") or [])
             tool_errors: list[str] = []
             last_step = str(checkpoint_state.get("current_step") or "discover")
             for tc, name, args, detail, result, latency_ms in completed_calls:
@@ -702,11 +801,29 @@ class AgentLoop:
                     if step:
                         checkpoint_steps.append(step)
                         last_step = step
-                    checkpoint_benchmarks.extend(
-                        self._extract_quantitative_review_benchmarks(name, args, result)
+                    research_candidates = self._merge_research_candidates(
+                        research_candidates,
+                        self._extract_review_candidates(name, result),
                     )
+                    new_benchmarks = self._extract_quantitative_review_benchmarks(
+                        name,
+                        args,
+                        result,
+                        research_candidates,
+                    )
+                    checkpoint_benchmarks.extend(new_benchmarks)
+                    if name == "get_hh_licitadas":
+                        research_candidates = self._mark_candidate_from_hh(
+                            research_candidates,
+                            str(args.get("codigo") or ""),
+                            result,
+                            new_benchmarks,
+                        )
                 else:
                     tool_errors.append(f"{name}: {result.get('error') if isinstance(result, dict) else 'error'}")
+                log_entry = self._research_log_entry(iteration + 1, name, args, result, status)
+                if log_entry:
+                    research_log.append(log_entry)
                 self._absorb_codes(result, seen_codes)
                 if draft_slug and isinstance(result, dict):
                     # Conserva tablas completas para la interfaz; el modelo recibe una vista acotada.
@@ -721,11 +838,15 @@ class AgentLoop:
                 )
             checkpoint_benchmarks = self._dedupe_benchmarks(checkpoint_benchmarks)
             benchmark_projects = self._benchmark_project_count(checkpoint_benchmarks)
+            if "estimate_draft_review_hours" in {item[1] for item in completed_calls}:
+                estimate_benchmark_count = benchmark_projects
             next_step = self._checkpoint_next_step(draft_stage, last_step, benchmark_projects)
             await persist_checkpoint(
                 completed_tools=list(dict.fromkeys(checkpoint_tools)),
                 completed_steps=list(dict.fromkeys(checkpoint_steps)),
                 quantitative_benchmarks=checkpoint_benchmarks,
+                research_candidates=research_candidates,
+                research_log=research_log,
                 current_step=next_step,
                 current_action=self._checkpoint_action(draft_stage, next_step, benchmark_projects),
                 evidence_gaps=(
@@ -743,7 +864,15 @@ class AgentLoop:
         # Al agotarse el ciclo general, damos a la IA una llamada exclusiva para seleccionar las
         # tasas a partir de toda la evidencia recogida y ejecutar el estimador. No imponemos tasas
         # determinísticas: el modelo decide default, ajustes por tipo/disciplina y actividades.
-        if draft_slug and draft_stage == "hours" and "estimate_draft_review_hours" not in called_tools:
+        if (
+            draft_slug
+            and draft_stage == "hours"
+            and (
+                "estimate_draft_review_hours" not in called_tools
+                or self._benchmark_project_count(checkpoint_state.get("quantitative_benchmarks") or [])
+                > estimate_benchmark_count
+            )
+        ):
             checkpoint_benchmark_count = self._benchmark_project_count(
                 checkpoint_state.get("quantitative_benchmarks") or []
             )
@@ -820,6 +949,7 @@ class AgentLoop:
                 )
                 latency_ms = int((time.time() - started) * 1000)
                 called_tools.add("estimate_draft_review_hours")
+                estimate_benchmark_count = checkpoint_benchmark_count
                 estimate_status = (
                     "error"
                     if isinstance(estimate_result, dict) and estimate_result.get("error")
@@ -893,10 +1023,26 @@ class AgentLoop:
                 if draft_stage == "hours"
                 else ""
             )
+            research_trace = ""
+            if draft_stage == "hours":
+                research_trace = (
+                    "Incluye una sección 'Trazabilidad de la investigación' con candidatos aceptados, "
+                    "descartados o pendientes y su razón; no presentes como validada una tasa que solo "
+                    "aparece en una síntesis Wiki. Datos del checkpoint: "
+                    + json.dumps(
+                        {
+                            "candidatos": (checkpoint_state.get("research_candidates") or [])[-20:],
+                            "busquedas": (checkpoint_state.get("research_log") or [])[-20:],
+                        },
+                        ensure_ascii=False,
+                    )
+                    + ". "
+                )
             close_instruction = (
                 f"Cierra ahora la etapa '{draft_stage}' con la evidencia recogida. "
                 f"{DRAFT_STAGE_INSTRUCTIONS.get(draft_stage, DRAFT_STAGE_INSTRUCTIONS['notes'])} "
                 f"{checkpoint_quality}"
+                f"{research_trace}"
                 "Entrega Markdown autosuficiente y completo en un máximo de 1.200 palabras. Resume las "
                 "tablas estructuradas: no copies las filas por documento ni repitas las URLs de fuentes, "
                 "porque la interfaz las agrega automáticamente. Incluye supuestos, totales y decisiones "
@@ -964,6 +1110,9 @@ class AgentLoop:
         completed = list(checkpoint_state.get("completed_steps") or [])
         benchmarks = list(checkpoint_state.get("quantitative_benchmarks") or [])
         benchmark_projects = self._benchmark_project_count(benchmarks)
+        missing_research_sources = self._missing_research_sources(
+            checkpoint_state.get("research_log") or []
+        )
         if not success:
             await persist_checkpoint(
                 status="failed",
@@ -974,16 +1123,27 @@ class AgentLoop:
             )
             return
         completed.append("publish")
-        if draft_stage == "hours" and benchmark_projects < 3:
+        if draft_stage == "hours" and (benchmark_projects < 3 or missing_research_sources):
+            gaps = []
+            if benchmark_projects < 3:
+                gaps.extend(
+                    [
+                        f"Cobertura cuantitativa insuficiente: {benchmark_projects}/3 proyectos comparables",
+                        "Obtener denominador documental y HH desde PDF, Excel o tabla estructurada",
+                    ]
+                )
+            if missing_research_sources:
+                gaps.append(f"Falta contrastar en: {', '.join(missing_research_sources)}")
             await persist_checkpoint(
                 status="evidence_needed",
                 completed_steps=list(dict.fromkeys(completed)),
-                current_step="quantify",
-                current_action=f"Buscar {3 - benchmark_projects} proyectos adicionales con documentos + HH",
-                evidence_gaps=[
-                    f"Cobertura cuantitativa insuficiente: {benchmark_projects}/3 proyectos comparables",
-                    "Obtener denominador documental y HH desde PDF, Excel o tabla estructurada",
-                ],
+                current_step="quantify" if benchmark_projects < 3 else "discover",
+                current_action=(
+                    f"Buscar {3 - benchmark_projects} proyectos adicionales con documentos + HH"
+                    if benchmark_projects < 3
+                    else f"Contrastar referencias en {', '.join(missing_research_sources)}"
+                ),
+                evidence_gaps=gaps,
                 last_error=None,
             )
             return
@@ -1051,6 +1211,7 @@ class AgentLoop:
         tool_name: str,
         args: dict,
         result: Any,
+        research_candidates: list[dict] | None = None,
     ) -> list[dict]:
         if tool_name != "get_hh_licitadas" or not isinstance(result, dict) or result.get("error"):
             return []
@@ -1084,7 +1245,238 @@ class AgentLoop:
                     "source": "get_hh_licitadas",
                 }
             )
+        if benchmarks:
+            return benchmarks
+
+        candidate = next(
+            (
+                item
+                for item in research_candidates or []
+                if isinstance(item, dict) and str(item.get("codigo") or "").upper() == code
+            ),
+            None,
+        )
+        candidate_title = str((candidate or {}).get("title") or "")
+        if not candidate or not self._looks_like_review_project(candidate_title):
+            return []
+
+        # Algunos presupuestos (p. ej. O-1537) traen una fila por documento/plano
+        # y no escriben literalmente "revisión" en cada fila. En esos casos el
+        # título de la propuesta prueba el tipo de servicio y la tabla aporta el
+        # denominador. Agrupamos por código documental para no contar dos veces
+        # un mismo plano revisado por más de una disciplina.
+        document_groups: dict[str, float] = {}
+        for row in result.get("rows") or []:
+            if not isinstance(row, dict):
+                continue
+            classification = str(row.get("clasificacion") or "").casefold()
+            kind = str(row.get("tipo_entregable") or "").casefold()
+            is_document = classification in {"documento", "plano", "mixto"} or any(
+                token in kind
+                for token in ("plano", "memoria", "documento tecnico", "especificacion")
+            )
+            if not is_document or "informe cierre" in kind:
+                continue
+            key = " ".join(str(row.get("key") or "").casefold().split())
+            if not key:
+                continue
+            try:
+                hours = float(row.get("total_hours") or 0)
+            except (TypeError, ValueError):
+                hours = 0.0
+            if hours > 0:
+                document_groups[key] = document_groups.get(key, 0.0) + hours
+        documents = len(document_groups)
+        hours = sum(document_groups.values())
+        if documents >= 3 and hours > 0:
+            benchmarks.append(
+                {
+                    "codigo": code,
+                    "actividad": candidate_title[:240],
+                    "documentos": documents,
+                    "hh": round(hours, 2),
+                    "hh_por_documento": round(hours / documents, 2),
+                    "source": "get_hh_licitadas:filas_documentales",
+                }
+            )
         return benchmarks
+
+    def _looks_like_review_project(self, text: str) -> bool:
+        normalized = " ".join(str(text or "").casefold().split())
+        review = any(
+            token in normalized
+            for token in ("revisi", "validaci", "verificaci", "auditor", "constructib", "contraparte")
+        )
+        engineering = any(
+            token in normalized
+            for token in ("ingenier", "document", "entregable", "planos", "diseño", "detalle", "fel")
+        )
+        return review and engineering
+
+    def _extract_review_candidates(self, tool_name: str, result: Any) -> list[dict]:
+        if not isinstance(result, dict) or result.get("error"):
+            return []
+        candidates: list[dict] = []
+
+        def append(code: Any, title: Any, estado: Any = None, context: Any = None) -> None:
+            normalized_code = str(code or "").strip().upper()
+            candidate_title = str(title or "").strip()
+            searchable = " ".join(part for part in (candidate_title, str(context or "")) if part)
+            if not re.fullmatch(r"O-\d{2,6}", normalized_code):
+                return
+            if not self._looks_like_review_project(searchable):
+                return
+            candidates.append(
+                {
+                    "codigo": normalized_code,
+                    "title": candidate_title or normalized_code,
+                    "estado": str(estado or "").strip().upper() or None,
+                    "sources": [tool_name],
+                    "status": "pending",
+                    "reason": "Candidato semántico; falta verificar tabla HH y denominador documental",
+                }
+            )
+
+        if tool_name == "search_master":
+            for item in result.get("rows") or []:
+                if isinstance(item, dict):
+                    append(item.get("codigo"), item.get("titulo"), item.get("estado"), item.get("tipo_servicio"))
+        elif tool_name in {"search_rag", "search_proposal_index", "search_entities"}:
+            for item in result.get("hits") or []:
+                if not isinstance(item, dict):
+                    continue
+                metadata = item.get("metadata") or {}
+                append(
+                    item.get("codigo"),
+                    item.get("title") or metadata.get("titulo"),
+                    metadata.get("estado") or metadata.get("estado_categoria"),
+                    item.get("summary"),
+                )
+        elif tool_name == "search_wiki_entries":
+            for item in result.get("entries") or []:
+                if not isinstance(item, dict):
+                    continue
+                for code in item.get("propuestas_referenciadas") or re.findall(
+                    r"\bO-\d{2,6}\b", f"{item.get('title', '')} {item.get('content', '')}", re.I
+                ):
+                    append(code, item.get("title"), None, item.get("content"))
+        return self._merge_research_candidates([], candidates)
+
+    def _merge_research_candidates(self, current: list[dict], discovered: list[dict]) -> list[dict]:
+        merged: dict[str, dict] = {}
+        for item in [*(current or []), *(discovered or [])]:
+            if not isinstance(item, dict):
+                continue
+            code = str(item.get("codigo") or "").upper()
+            if not code:
+                continue
+            previous = merged.get(code, {})
+            sources = list(dict.fromkeys([*(previous.get("sources") or []), *(item.get("sources") or [])]))
+            status = previous.get("status") if previous.get("status") in {"accepted", "rejected", "needs_pdf"} else item.get("status")
+            merged[code] = {
+                **previous,
+                **item,
+                "codigo": code,
+                "title": item.get("title") or previous.get("title") or code,
+                "estado": item.get("estado") or previous.get("estado"),
+                "sources": sources,
+                "status": status or "pending",
+                "reason": previous.get("reason") if status == previous.get("status") else item.get("reason"),
+            }
+        return sorted(
+            merged.values(),
+            key=lambda item: (
+                item.get("status") != "accepted",
+                item.get("estado") != "PG",
+                item.get("codigo") or "",
+            ),
+        )[:40]
+
+    def _mark_candidate_from_hh(
+        self,
+        candidates: list[dict],
+        code: str,
+        result: Any,
+        benchmarks: list[dict],
+    ) -> list[dict]:
+        normalized_code = str(code or "").upper()
+        updated = list(candidates or [])
+        index = next(
+            (i for i, item in enumerate(updated) if str((item or {}).get("codigo") or "").upper() == normalized_code),
+            None,
+        )
+        if index is None:
+            return updated
+        item = dict(updated[index])
+        if benchmarks:
+            project_rows = [row for row in benchmarks if row.get("codigo") == normalized_code]
+            documents = max((int(row.get("documentos") or 0) for row in project_rows), default=0)
+            hours = max((float(row.get("hh") or 0) for row in project_rows), default=0.0)
+            item.update(
+                status="accepted",
+                reason=f"Tabla HH verificable: {documents} documentos y {hours:g} HH",
+            )
+        elif isinstance(result, dict) and result.get("rows"):
+            item.update(
+                status="needs_pdf",
+                reason="Hay HH, pero la tabla no entrega un denominador documental comparable; revisar PDF/Excel",
+            )
+        else:
+            item.update(status="rejected", reason="Sin desglose HH licitado disponible")
+        updated[index] = item
+        return self._merge_research_candidates([], updated)
+
+    def _research_log_entry(
+        self,
+        iteration: int,
+        tool_name: str,
+        args: dict,
+        result: Any,
+        status: str,
+    ) -> dict | None:
+        if tool_name not in {
+            "search_master", "search_wiki_entries", "search_rag", "search_proposal_index",
+            "search_entities", "get_hh_licitadas", "read_pdf_deep",
+        }:
+            return None
+        queries = args.get("queries") or ([args.get("query")] if args.get("query") else [])
+        codes: list[str] = []
+        if tool_name in {"get_hh_licitadas", "read_pdf_deep"}:
+            codes = [str(args.get("codigo") or "").upper()]
+        elif isinstance(result, dict):
+            for key in ("rows", "hits"):
+                for item in result.get(key) or []:
+                    if isinstance(item, dict) and item.get("codigo"):
+                        codes.append(str(item.get("codigo")).upper())
+            for item in result.get("entries") or []:
+                if isinstance(item, dict):
+                    codes.extend(str(code).upper() for code in item.get("propuestas_referenciadas") or [])
+        rows = len(result.get("rows") or []) if isinstance(result, dict) else 0
+        return {
+            "iteration": iteration,
+            "tool": tool_name,
+            "queries": [str(value) for value in queries if value],
+            "codes": list(dict.fromkeys(code for code in codes if code))[:12],
+            "status": status,
+            "detail": (
+                f"{rows} filas HH" if tool_name == "get_hh_licitadas" else f"{len(set(codes))} códigos encontrados"
+            ),
+        }
+
+    def _missing_research_sources(self, research_log: list[dict]) -> list[str]:
+        used = {
+            str(item.get("tool") or "")
+            for item in research_log or []
+            if isinstance(item, dict) and item.get("status") == "ok"
+        }
+        missing: list[str] = []
+        if "search_master" not in used:
+            missing.append("Master")
+        if "search_wiki_entries" not in used:
+            missing.append("Wiki")
+        if not ({"search_rag", "search_proposal_index"} & used):
+            missing.append("RAG/índice")
+        return missing
 
     def _dedupe_benchmarks(self, benchmarks: list[dict]) -> list[dict]:
         unique: dict[tuple, dict] = {}

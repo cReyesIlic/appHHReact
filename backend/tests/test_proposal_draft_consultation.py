@@ -213,6 +213,13 @@ class ProposalDraftBriefTests(unittest.TestCase):
             "hh": 455,
             "hh_por_documento": 5,
         }
+        candidate = {
+            "codigo": "O-1537",
+            "title": "Revisión Ingeniería Supresor de Ariete",
+            "estado": "PG",
+            "status": "pending",
+            "sources": ["search_master"],
+        }
         service.update_agent_checkpoint(
             "owner@shimin.cl",
             draft["slug"],
@@ -222,6 +229,8 @@ class ProposalDraftBriefTests(unittest.TestCase):
                 "completed_steps": ["context", "inventory", "discover"],
                 "completed_tools": ["search_rag", "get_hh_licitadas"],
                 "quantitative_benchmarks": [benchmark],
+                "research_candidates": [candidate],
+                "research_log": [{"iteration": 1, "tool": "search_master"}],
                 "evidence_gaps": ["Faltan 2 proyectos"],
             },
         )
@@ -237,6 +246,8 @@ class ProposalDraftBriefTests(unittest.TestCase):
         self.assertEqual(started["run_count"], 1)
         self.assertEqual(resumed["run_count"], 2)
         self.assertEqual(checkpoint["quantitative_benchmarks"], [benchmark])
+        self.assertEqual(checkpoint["research_candidates"], [candidate])
+        self.assertEqual(checkpoint["research_log"][0]["tool"], "search_master")
         self.assertIn("get_hh_licitadas", checkpoint["completed_tools"])
         self.assertEqual(checkpoint["recipe"][0]["status"], "completed")
 
@@ -312,9 +323,24 @@ class ProposalDraftAgentContextTests(unittest.TestCase):
                 {"codigo": "O-2410", "actividad": "Revisión D"},
             ]
         )
+        state["research_log"] = [
+            {"tool": "search_master", "status": "ok"},
+            {"tool": "search_wiki_entries", "status": "ok"},
+            {"tool": "search_rag", "status": "ok"},
+        ]
         asyncio.run(loop._finish_draft_checkpoint(persist, state, "hours", success=True))
         self.assertEqual(updates[-1]["status"], "completed")
         self.assertEqual(updates[-1]["evidence_gaps"], [])
+
+    def test_hours_checkpoint_requires_master_wiki_and_rag_coverage(self):
+        loop = AgentLoop.__new__(AgentLoop)
+        self.assertEqual(loop._missing_research_sources([]), ["Master", "Wiki", "RAG/índice"])
+        log = [
+            {"tool": "search_master", "status": "ok"},
+            {"tool": "search_wiki_entries", "status": "ok"},
+            {"tool": "search_proposal_index", "status": "ok"},
+        ]
+        self.assertEqual(loop._missing_research_sources(log), [])
 
     def test_quantitative_checkpoint_only_counts_review_rows_with_denominator(self):
         loop = AgentLoop.__new__(AgentLoop)
@@ -339,6 +365,76 @@ class ProposalDraftAgentContextTests(unittest.TestCase):
         self.assertEqual(benchmarks[0]["documentos"], 91)
         self.assertEqual(benchmarks[0]["hh_por_documento"], 5)
         self.assertEqual(loop._benchmark_project_count(benchmarks), 1)
+
+    def test_review_candidate_is_discovered_from_master_and_structured_rows_become_benchmark(self):
+        loop = AgentLoop.__new__(AgentLoop)
+        candidates = loop._extract_review_candidates(
+            "search_master",
+            {
+                "rows": [
+                    {
+                        "codigo": "O-1537",
+                        "titulo": "Revisión Ingeniería Supresor de Ariete 1 y 2",
+                        "estado": "PG",
+                    },
+                    {
+                        "codigo": "O-9999",
+                        "titulo": "Elaboración de ingeniería de detalle",
+                        "estado": "PG",
+                    },
+                ]
+            },
+        )
+        result = {
+            "codigo": "O-1537",
+            "rows": [
+                {"key": "PLN-001", "clasificacion": "Plano", "tipo_entregable": "planos", "total_hours": 8},
+                {"key": "PLN-002", "clasificacion": "Plano", "tipo_entregable": "planos", "total_hours": 8},
+                {"key": "PLN-002", "clasificacion": "Plano", "tipo_entregable": "planos", "total_hours": 4},
+                {"key": "MEM-001", "clasificacion": "Documento", "tipo_entregable": "memoria de calculo", "total_hours": 15},
+                {"key": "Coordinación", "clasificacion": "Actividad", "tipo_entregable": "coordinacion", "total_hours": 20},
+            ],
+        }
+
+        benchmarks = loop._extract_quantitative_review_benchmarks(
+            "get_hh_licitadas",
+            {"codigo": "O-1537"},
+            result,
+            candidates,
+        )
+        marked = loop._mark_candidate_from_hh(candidates, "O-1537", result, benchmarks)
+
+        self.assertEqual([item["codigo"] for item in candidates], ["O-1537"])
+        self.assertEqual(benchmarks[0]["documentos"], 3)
+        self.assertEqual(benchmarks[0]["hh"], 35)
+        self.assertEqual(benchmarks[0]["hh_por_documento"], 11.67)
+        self.assertEqual(marked[0]["status"], "accepted")
+
+    def test_review_budget_without_document_denominator_requires_pdf(self):
+        loop = AgentLoop.__new__(AgentLoop)
+        candidates = [
+            {
+                "codigo": "O-1779",
+                "title": "Revisión Ingeniería de Detalles Restitución Sector Poniente",
+                "estado": "PG",
+                "status": "pending",
+            }
+        ]
+        result = {
+            "codigo": "O-1779",
+            "rows": [
+                {"key": "Revisión de antecedentes", "clasificacion": "Actividad", "total_hours": 52},
+                {"key": "Informe final", "clasificacion": "Documento", "tipo_entregable": "informe cierre de proyecto", "total_hours": 52},
+            ],
+        }
+
+        benchmarks = loop._extract_quantitative_review_benchmarks(
+            "get_hh_licitadas", {"codigo": "O-1779"}, result, candidates
+        )
+        marked = loop._mark_candidate_from_hh(candidates, "O-1779", result, benchmarks)
+
+        self.assertEqual(benchmarks, [])
+        self.assertEqual(marked[0]["status"], "needs_pdf")
 
     def test_table_deduplication_keeps_the_most_complete_version(self):
         loop = AgentLoop.__new__(AgentLoop)

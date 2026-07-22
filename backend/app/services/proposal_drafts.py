@@ -406,6 +406,8 @@ class ProposalDraftService:
             "completed_steps": completed_steps,
             "completed_tools": list(previous.get("completed_tools") or []) if resumes_stage else [],
             "quantitative_benchmarks": list(previous.get("quantitative_benchmarks") or []) if resumes_stage else [],
+            "research_candidates": list(previous.get("research_candidates") or []) if resumes_stage else [],
+            "research_log": list(previous.get("research_log") or []) if resumes_stage else [],
             "benchmark_minimum": 3 if stage_key == "hours" else 0,
             "evidence_gaps": list(previous.get("evidence_gaps") or []) if resumes_stage else [],
             "last_error": None,
@@ -430,7 +432,7 @@ class ProposalDraftService:
             if key in {
                 "status", "iteration", "current_step", "current_action",
                 "completed_steps", "completed_tools", "quantitative_benchmarks",
-                "evidence_gaps", "last_error",
+                "research_candidates", "research_log", "evidence_gaps", "last_error",
             }
         }
         payload.update(safe_changes)
@@ -439,6 +441,8 @@ class ProposalDraftService:
         current = str(payload.get("current_step") or "context")
         payload["completed_steps"] = completed
         payload["completed_tools"] = list(dict.fromkeys(payload.get("completed_tools") or []))[-40:]
+        payload["research_candidates"] = list(payload.get("research_candidates") or [])[-40:]
+        payload["research_log"] = list(payload.get("research_log") or [])[-40:]
         payload["recipe"] = self._checkpoint_recipe(stage, completed, current)
         now = datetime.now().isoformat(timespec="seconds")
         self._write_agent_checkpoint(slug, payload, now)
