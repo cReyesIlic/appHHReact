@@ -512,6 +512,8 @@ class ProposalSyncService:
                     outcome = await self.wiki_compiler.compile_for_proposal(codigo, force=force)
                 except Exception as exc:  # noqa: BLE001
                     outcome = {"codigo": codigo, "status": "error", "error": str(exc)}
+                if outcome.get("status") == "ok":
+                    self.pipeline.record_wiki_success(codigo, outcome)
                 async with progress_lock:
                     progress["done"] += 1
                     if progress["done"] % 25 == 0 or progress["done"] == total:
@@ -673,7 +675,8 @@ class ProposalSyncService:
         unique: dict[str, dict] = {}
         for row in self.master.all_offers():
             estado = str(row.get("estado") or "").strip().upper()
-            codigo = str(row.get("codigo") or "").strip().upper()
+            raw_codigo = str(row.get("codigo") or "").strip().upper()
+            codigo = normalize_offer_code(raw_codigo) or raw_codigo
             if status_category(estado) != "ganada" or not codigo.startswith("O-"):
                 continue
             unique[codigo] = {

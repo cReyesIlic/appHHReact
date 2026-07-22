@@ -40,7 +40,7 @@ class StructuredWikiService:
 
     def build(self, markdown: str) -> dict:
         document = self.parse(markdown)
-        with closing(sqlite3.connect(settings.sqlite_path)) as conn, conn:
+        with closing(sqlite3.connect(settings.sqlite_path, timeout=30)) as conn, conn:
             conn.execute("delete from wiki_sections")
             for section in document.sections:
                 conn.execute(
@@ -73,7 +73,7 @@ class StructuredWikiService:
 
     def list_entries(self) -> list[dict]:
         self._sync_entries_from_files()
-        with closing(sqlite3.connect(settings.sqlite_path)) as conn:
+        with closing(sqlite3.connect(settings.sqlite_path, timeout=30)) as conn:
             rows = conn.execute(
                 f"""
                 select {self._ENTRY_COLUMNS}
@@ -85,7 +85,7 @@ class StructuredWikiService:
 
     def get_entry(self, entry_id: str) -> dict:
         self._sync_entries_from_files()
-        with closing(sqlite3.connect(settings.sqlite_path)) as conn:
+        with closing(sqlite3.connect(settings.sqlite_path, timeout=30)) as conn:
             row = conn.execute(
                 f"select {self._ENTRY_COLUMNS} from wiki_entries where id = ?",
                 (entry_id,),
@@ -114,7 +114,7 @@ class StructuredWikiService:
         propuestas_norm = [str(c).strip().upper() for c in propuestas_referenciadas or [] if str(c).strip()]
         filtros_norm = filtros_aplicables or {}
         existing = None
-        with closing(sqlite3.connect(settings.sqlite_path)) as conn:
+        with closing(sqlite3.connect(settings.sqlite_path, timeout=30)) as conn:
             existing = conn.execute(
                 "select created_at, propuestas_referenciadas, filtros_aplicables, times_used, file_path "
                 "from wiki_entries where id = ?",
@@ -146,7 +146,7 @@ class StructuredWikiService:
             encoding="utf-8",
         )
         prev_times_used = int(existing[3]) if existing and len(existing) > 3 and existing[3] is not None else 0
-        with closing(sqlite3.connect(settings.sqlite_path)) as conn, conn:
+        with closing(sqlite3.connect(settings.sqlite_path, timeout=30)) as conn, conn:
             conn.execute(
                 """
                 insert or replace into wiki_entries
@@ -199,7 +199,7 @@ class StructuredWikiService:
         path = Path(entry.get("file_path") or "")
         if path.exists() and path.is_file():
             path.unlink()
-        with closing(sqlite3.connect(settings.sqlite_path)) as conn, conn:
+        with closing(sqlite3.connect(settings.sqlite_path, timeout=30)) as conn, conn:
             conn.execute("delete from wiki_entries where id = ?", (entry_id,))
         self.reindex_entries()
         return {"deleted": entry_id}
@@ -284,7 +284,7 @@ class StructuredWikiService:
         return WikiDocument(title=title, sections=sections)
 
     def list_sections(self) -> list[dict]:
-        with closing(sqlite3.connect(settings.sqlite_path)) as conn:
+        with closing(sqlite3.connect(settings.sqlite_path, timeout=30)) as conn:
             rows = conn.execute("select id, title, level, path, content, keywords from wiki_sections order by rowid").fetchall()
         return [self._row(row).model_dump() for row in rows]
 
@@ -371,7 +371,7 @@ class StructuredWikiService:
         return ranked[:limit]
 
     def bump_usage(self, entry_id: str) -> dict:
-        with closing(sqlite3.connect(settings.sqlite_path)) as conn, conn:
+        with closing(sqlite3.connect(settings.sqlite_path, timeout=30)) as conn, conn:
             conn.execute(
                 "update wiki_entries set times_used = coalesce(times_used, 0) + 1 where id = ?",
                 (entry_id,),
@@ -391,7 +391,7 @@ class StructuredWikiService:
         missing = [c for c in refs if c not in valid_set]
         status = "ok" if not refs or not missing else ("partial" if existing else "broken")
         now = datetime.now().isoformat(timespec="seconds")
-        with closing(sqlite3.connect(settings.sqlite_path)) as conn, conn:
+        with closing(sqlite3.connect(settings.sqlite_path, timeout=30)) as conn, conn:
             conn.execute(
                 "update wiki_entries set validated_at = ?, validation_status = ? where id = ?",
                 (now, status, entry_id),
@@ -442,7 +442,7 @@ class StructuredWikiService:
 
     def _ensure_table(self) -> None:
         settings.sqlite_path.parent.mkdir(parents=True, exist_ok=True)
-        with closing(sqlite3.connect(settings.sqlite_path)) as conn, conn:
+        with closing(sqlite3.connect(settings.sqlite_path, timeout=30)) as conn, conn:
             conn.execute(
                 """
                 create table if not exists wiki_sections (
@@ -551,7 +551,7 @@ class StructuredWikiService:
         # Si la BD ya tiene entries, no re-sincronizar al arrancar (evita lock con 800+ archivos).
         # El sync solo corre si la BD está vacía (caso primer arranque tras reset).
         try:
-            with closing(sqlite3.connect(settings.sqlite_path, timeout=5)) as conn:
+            with closing(sqlite3.connect(settings.sqlite_path, timeout=30)) as conn:
                 count = conn.execute("select count(*) from wiki_entries").fetchone()[0]
             if count > 0:
                 StructuredWikiService._sync_done = True
@@ -562,7 +562,7 @@ class StructuredWikiService:
             parsed = self._parse_entry_file(path)
             if not parsed:
                 continue
-            with closing(sqlite3.connect(settings.sqlite_path)) as conn, conn:
+            with closing(sqlite3.connect(settings.sqlite_path, timeout=30)) as conn, conn:
                 # Conservar times_used / validated_at si la entrada ya existía
                 existing = conn.execute(
                     "select times_used, validated_at, validation_status from wiki_entries where id = ?",

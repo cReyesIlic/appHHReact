@@ -140,6 +140,20 @@ class QueueReliabilityTests(unittest.TestCase):
         self.assertIn("## Hoja: HH", text)
         self.assertIn("Ingeniero | 120", text)
 
+    def test_master_winner_codes_are_normalized_and_deduplicated(self):
+        service = object.__new__(ProposalSyncService)
+        service.master = Mock()
+        service.master.all_offers.return_value = [
+            {"codigo": "O-274", "estado": "PG", "titulo": "Primera"},
+            {"codigo": "O-0274", "estado": "PG", "titulo": "Segunda"},
+            {"codigo": "O-2749", "estado": "EP", "titulo": "No ganada"},
+        ]
+
+        rows = service._ganadas_master_rows()
+
+        self.assertEqual([row["codigo"] for row in rows], ["O-0274"])
+        self.assertEqual(rows[0]["titulo"], "Segunda")
+
 
 class SharePointFolderMatchingTests(unittest.IsolatedAsyncioTestCase):
     async def test_offer_code_never_falls_back_to_fuzzy_neighbor(self):
@@ -312,6 +326,58 @@ class PipelineRegistryTests(SettingsPathsMixin, unittest.IsolatedAsyncioTestCase
             ):
                 detected = await service._discover_changed_sources([{"codigo": "O-9999"}])
             self.assertEqual(detected, [])
+
+    async def test_wiki_failure_stays_pending_until_backfill_succeeds(self):
+        files = [
+            {"id": "1", "name": "oferta.pdf", "kind": "pdf", "size": 100,
+             "lastModifiedDateTime": "2026-07-20T10:00:00Z"}
+        ]
+        with tempfile.TemporaryDirectory() as temp_dir, self.patch_settings(temp_dir):
+            registry = PipelineRegistry()
+            registry.record_success(
+                "O-9999",
+                files,
+                {
+                    "chunks_parent": 2,
+                    "chunks_child": 5,
+                    "embedding_count": 5,
+                    "wiki_status": "error",
+                    "wiki_error": "database is locked",
+                    "quality": {"mode": "heuristic", "rag_score": 80, "wiki_score": 0},
+                },
+            )
+            pending = registry.get("O-9999")
+            self.assertEqual(pending["status"], "partial")
+            self.assertTrue(pending["needs_reprocess"])
+
+            registry.record_wiki_success(
+                "O-9999",
+                {
+                    "status": "ok",
+                    "path": "/tmp/O-9999.md",
+                    "entry_id": "wiki-1",
+                    "quality": {"mode": "ai", "rag_score": 89, "wiki_score": 93, "summary": "bien"},
+                },
+            )
+            completed = registry.get("O-9999")
+            self.assertEqual(completed["status"], "ok")
+            self.assertFalse(completed["needs_reprocess"])
+            self.assertEqual((completed["rag_quality_score"], completed["wiki_quality_score"]), (89, 93))
+
+    async def test_wiki_backfill_updates_pipeline_registry(self):
+        service = object.__new__(ProposalSyncService)
+        service.wiki_compiler = Mock()
+        outcome = {
+            "codigo": "O-9999", "status": "ok", "path": "/tmp/O-9999.md",
+            "entry_id": "wiki-1", "quality": {"rag_score": 88, "wiki_score": 90},
+        }
+        service.wiki_compiler.compile_for_proposal = AsyncMock(return_value=outcome)
+        service.pipeline = Mock()
+
+        result = await service.backfill_wiki(codigos=["O-9999"], force=True, concurrency=1)
+
+        self.assertEqual(result["wiki_ok"], 1)
+        service.pipeline.record_wiki_success.assert_called_once_with("O-9999", outcome)
 
 
 class WikiReprocessTests(SettingsPathsMixin, unittest.IsolatedAsyncioTestCase):

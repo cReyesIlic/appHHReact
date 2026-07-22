@@ -195,7 +195,7 @@ class WikiAutoCompiler:
 
     def _collect_rag_material(self, codigo: str, max_parents: int = 4, parent_chars: int = 1800) -> dict:
         """Lee hasta `max_parents` secciones más representativas de `rag_parent_sections`."""
-        with sqlite3.connect(settings.sqlite_path, timeout=5) as conn:
+        with sqlite3.connect(settings.sqlite_path, timeout=30) as conn:
             rows = conn.execute(
                 """
                 select parent_id, title, text, page_start, page_end, metadata

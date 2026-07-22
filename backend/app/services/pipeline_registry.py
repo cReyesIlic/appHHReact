@@ -160,6 +160,11 @@ class PipelineRegistry:
             and not result.get("excel_errors")
             else "partial"
         )
+        needs_reprocess = bool(
+            result.get("wiki_status") not in {"ok", "skipped"}
+            or result.get("embedding_error")
+            or result.get("excel_errors")
+        )
         conn = self._connect()
         try:
             with conn:
@@ -173,7 +178,7 @@ class PipelineRegistry:
                          wiki_status, wiki_path, wiki_entry_id, wiki_quality_score,
                          quality_mode, quality_summary, quality_details, status, error,
                          needs_reprocess, last_processed_at, created_at, updated_at)
-                    values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '', 0, ?, ?, ?)
+                    values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '', ?, ?, ?, ?)
                     on conflict(codigo) do update set
                         source_signature=excluded.source_signature,
                         source_files=excluded.source_files,
@@ -201,7 +206,7 @@ class PipelineRegistry:
                         quality_details=excluded.quality_details,
                         status=excluded.status,
                         error='',
-                        needs_reprocess=0,
+                        needs_reprocess=excluded.needs_reprocess,
                         last_processed_at=excluded.last_processed_at,
                         updated_at=excluded.updated_at
                     """,
@@ -215,7 +220,55 @@ class PipelineRegistry:
                         str(result.get("wiki_status") or ""), str(result.get("wiki_path") or ""),
                         str(result.get("wiki_entry_id") or ""), self._score(quality.get("wiki_score")),
                         str(quality.get("mode") or "heuristic"), str(quality.get("summary") or ""),
-                        json.dumps(quality, ensure_ascii=False), status, now, now, now,
+                        json.dumps(quality, ensure_ascii=False), status, int(needs_reprocess), now, now, now,
+                    ),
+                )
+        finally:
+            conn.close()
+
+    def record_wiki_success(self, codigo: str, result: dict) -> None:
+        """Cierra un reproceso Wiki sin perder el estado RAG ya persistido."""
+        now = datetime.now().isoformat(timespec="seconds")
+        quality = result.get("quality") or {}
+        codigo = codigo.upper()
+        conn = self._connect()
+        try:
+            with conn:
+                conn.execute(
+                    """
+                    insert or ignore into proposal_pipeline_registry
+                        (codigo, status, needs_reprocess, created_at, updated_at)
+                    values (?, 'partial', 1, ?, ?)
+                    """,
+                    (codigo, now, now),
+                )
+                current = conn.execute(
+                    "select * from proposal_pipeline_registry where codigo = ?",
+                    (codigo,),
+                ).fetchone()
+                rag_current = bool(
+                    current
+                    and current["rag_status"] == "ok"
+                    and current["pipeline_version"] == PIPELINE_VERSION
+                    and current["rag_pipeline_version"] == RAG_PIPELINE_VERSION
+                )
+                conn.execute(
+                    """
+                    update proposal_pipeline_registry set
+                        wiki_pipeline_version=?, wiki_status='ok', wiki_path=?, wiki_entry_id=?,
+                        rag_quality_score=coalesce(?, rag_quality_score),
+                        wiki_quality_score=?, quality_mode=?, quality_summary=?, quality_details=?,
+                        status=?, error=case when ? then '' else error end,
+                        needs_reprocess=?, last_processed_at=?, updated_at=?
+                    where codigo=?
+                    """,
+                    (
+                        WIKI_PIPELINE_VERSION, str(result.get("path") or ""),
+                        str(result.get("entry_id") or ""), self._score(quality.get("rag_score")),
+                        self._score(quality.get("wiki_score")), str(quality.get("mode") or "heuristic"),
+                        str(quality.get("summary") or ""), json.dumps(quality, ensure_ascii=False),
+                        "ok" if rag_current else "partial", int(rag_current),
+                        0 if rag_current else 1, now, now, codigo,
                     ),
                 )
         finally:
