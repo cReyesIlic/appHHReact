@@ -155,6 +155,47 @@ class ParentChildReliabilityTests(SettingsPathsMixin, unittest.TestCase):
             self.assertEqual(status["parent_only_codes_preview"], ["O-9996"])
 
 
+class DirectedEmbeddingReliabilityTests(SettingsPathsMixin, unittest.IsolatedAsyncioTestCase):
+    async def test_code_embeddings_are_sent_in_bounded_batches(self):
+        with tempfile.TemporaryDirectory() as temp_dir, self.patch_settings(temp_dir):
+            indexer = ParentChildIndexer()
+            indexed = indexer.index_parse_result(
+                "O-9995",
+                {"text": "contenido tecnico verificable " * 2500, "pages": []},
+                {},
+            )
+            with closing(sqlite3.connect(settings.sqlite_path)) as conn:
+                conn.execute(
+                    """
+                    create table rag_child_embeddings (
+                        child_id text primary key, parent_id text, codigo text,
+                        embedding blob, dim integer, model text, content_hash text
+                    )
+                    """
+                )
+                conn.commit()
+
+            service = object.__new__(ProposalSyncService)
+            service.hybrid = Mock()
+            service.hybrid.embeddings.deployment = "embedding-test"
+            service.hybrid.embeddings.content_hash.return_value = "hash"
+            service.hybrid.embeddings.embed_texts = AsyncMock(
+                side_effect=lambda texts: [[0.1, 0.2] for _ in texts]
+            )
+            service.hybrid._embedding_text.return_value = "texto para embedding"
+
+            with patch.dict(os.environ, {"EMBEDDING_BATCH_SIZE": "32"}, clear=False):
+                result = await service._build_embeddings_for_code("O-9995")
+
+            batch_sizes = [len(call.args[0]) for call in service.hybrid.embeddings.embed_texts.await_args_list]
+            self.assertEqual(result["selected"], indexed["children"])
+            self.assertEqual(result["processed"], indexed["children"])
+            self.assertEqual(result["errors"], 0)
+            self.assertGreater(len(batch_sizes), 1)
+            self.assertLessEqual(max(batch_sizes), 32)
+            self.assertEqual(sum(batch_sizes), indexed["children"])
+
+
 class ProposalExtractionTests(unittest.TestCase):
     def test_pdf_extraction_preserves_page_numbers(self):
         service = object.__new__(ProposalSyncService)

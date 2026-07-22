@@ -533,6 +533,10 @@ class ProposalSyncService:
                 # Solo procesa chunks de este codigo si están sin embedding
                 embedding_result = await self._build_embeddings_for_code(codigo)
                 result["embedding_count"] = int(embedding_result.get("processed") or 0)
+                if int(embedding_result.get("errors") or 0) > 0:
+                    result["embedding_error"] = (
+                        f"{embedding_result['errors']} chunks no pudieron generar embedding"
+                    )
             except Exception as exc:  # noqa: BLE001
                 result["embedding_error"] = str(exc)
 
@@ -1022,9 +1026,25 @@ class ProposalSyncService:
             row["parent_metadata_dict"] = parent_metadata
             row["embedding_text"] = self.hybrid._embedding_text(row, metadata, parent_metadata)
             row["content_hash"] = self.hybrid.embeddings.content_hash(row["embedding_text"])
-        vectors = await self.hybrid.embeddings.embed_texts([r["embedding_text"] for r in rows])
-        self.hybrid._save_batch(rows, vectors)
-        return {"selected": len(rows), "processed": len(rows)}
+        batch_size = self._bounded_env_int(
+            "EMBEDDING_BATCH_SIZE",
+            32,
+            minimum=1,
+            maximum=128,
+        )
+        processed = 0
+        errors = 0
+        for start in range(0, len(rows), batch_size):
+            batch = rows[start : start + batch_size]
+            try:
+                vectors = await self.hybrid.embeddings.embed_texts(
+                    [row["embedding_text"] for row in batch]
+                )
+                await asyncio.to_thread(self.hybrid._save_batch, batch, vectors)
+                processed += len(batch)
+            except Exception:  # noqa: BLE001
+                errors += len(batch)
+        return {"selected": len(rows), "processed": processed, "errors": errors}
 
     async def ingest_local_file(self, codigo: str, content: bytes, filename: str) -> dict:
         """Ingesta un archivo subido manualmente: PDF/DOCX → RAG; XLSX → RAG + HH extractor.
