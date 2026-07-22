@@ -146,7 +146,7 @@ async def _run_master_refresh(send_email: bool = True) -> dict:
         rows = int(result.get("rows_loaded") or 0)
         email = EmailClient()
         if send_email and email.configured:
-            subject, text, html = master_refresh_report(rows)
+            subject, text, html = master_refresh_report(rows, metadata=result)
             result["email"] = email.send(subject, text, html)
         _last_master_run = {
             "started_at": started_at.isoformat(timespec="seconds"),

@@ -74,6 +74,7 @@ class SyncCounters:
     ingested: int = 0
     skipped: int = 0
     errors: int = 0
+    partial: int = 0
     wiki_ok: int = 0
     wiki_skipped: int = 0
     wiki_no_rag: int = 0
@@ -177,6 +178,12 @@ class ProposalSyncService:
             counters.by_code.append({**outcome, "titulo": ganada.get("titulo"), "cliente": ganada.get("cliente")})
             if outcome["status"] == "ok":
                 counters.ingested += 1
+                if (
+                    outcome.get("wiki_status") not in {"ok", "skipped"}
+                    or outcome.get("embedding_error")
+                    or outcome.get("excel_errors")
+                ):
+                    counters.partial += 1
             elif outcome["status"] in {"skipped", "no_pdf", "no_files"}:
                 counters.skipped += 1
             else:
@@ -194,15 +201,34 @@ class ProposalSyncService:
             "pipeline_version": PIPELINE_VERSION,
             "sources_changed": len(changed),
             "pipeline_stale": len(stale),
+            "pending_new_before": int(gap.get("pendientes_rag_count") or len(gap.get("pendientes_rag") or [])),
+            "pending_reprocess_before": int(gap.get("pendientes_reprocess_count") or len(stale)),
+            "queue_before": int(gap.get("pendientes_rag_count") or len(gap.get("pendientes_rag") or []))
+            + int(gap.get("pendientes_reprocess_count") or len(stale))
+            + len(changed),
             "objetivo_corrida": len(pendientes),
             "ingested": counters.ingested,
             "skipped": counters.skipped,
             "errors": counters.errors,
+            "partial": counters.partial,
             "wiki_ok": counters.wiki_ok,
             "wiki_no_rag": counters.wiki_no_rag,
             "wiki_error": counters.wiki_error,
             "details": counters.by_code,
         }
+        try:
+            remaining = self.discover_ganadas_pendientes(include_excel=include_excel)
+            summary.update(
+                {
+                    "pending_new_remaining": int(remaining.get("pendientes_rag_count") or 0),
+                    "pending_reprocess_remaining": int(remaining.get("pendientes_reprocess_count") or 0),
+                    "pending_wiki_remaining": int(remaining.get("pendientes_wiki_count") or 0),
+                    "queue_remaining": int(remaining.get("pendientes_rag_count") or 0)
+                    + int(remaining.get("pendientes_reprocess_count") or 0),
+                }
+            )
+        except Exception as exc:  # noqa: BLE001
+            summary["queue_status_warning"] = f"{type(exc).__name__}: {exc}"
         # Reporte por email — best effort, no rompe el sync si falla
         try:
             email = EmailClient()

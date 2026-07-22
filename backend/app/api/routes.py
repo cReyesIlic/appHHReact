@@ -254,7 +254,7 @@ async def master_refresh() -> dict:
         from app.services.ingestion_reporter import master_refresh_report
         email = EmailClient()
         if email.configured:
-            subject, text, html = master_refresh_report(count)
+            subject, text, html = master_refresh_report(count, metadata=payload)
             payload["email"] = email.send(subject, text, html)
     except Exception as exc:  # noqa: BLE001
         payload["email"] = {"sent": False, "reason": f"{type(exc).__name__}: {exc}"}
@@ -543,10 +543,11 @@ def admin_email_test(payload: dict | None = None) -> dict:
             "configured": False,
             "reason": "Define ACS_CONNECTION_STRING y ACS_SENDER_ADDRESS en variables de entorno",
         }
-    subject = payload.get("subject") or "SHIMIN · Test de Azure Communication Services"
     body = payload.get("body") or "Este es un email de prueba enviado desde la app SHIMIN (Proposal Intelligence)."
-    html = f"<p>{body}</p><p style='color:#5f747d;font-size:12px;'>Si recibiste este correo, ACS está bien configurado.</p>"
-    result = email.send(subject, body, html, to=payload.get("to"))
+    from app.services.ingestion_reporter import email_test_report
+    subject, plain, html = email_test_report(body)
+    subject = payload.get("subject") or subject
+    result = email.send(subject, plain, html, to=payload.get("to"))
     return {"configured": True, **result}
 
 

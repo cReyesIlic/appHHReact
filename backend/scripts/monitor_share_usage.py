@@ -28,7 +28,6 @@ from __future__ import annotations
 import argparse
 import os
 import sys
-from datetime import datetime
 
 
 def human_bytes(n: float) -> str:
@@ -119,26 +118,9 @@ def _dir_size(account: str, share: str, key: str | None, conn_str: str | None, p
 
 
 def render_report(stats: dict, top_dirs: list[dict], threshold: float) -> tuple[str, str, str]:
-    pct = stats["utilization"] * 100
-    over = stats["utilization"] >= threshold
-    status_text = "⚠️  ATENCIÓN" if over else "✅ OK"
+    from app.services.ingestion_reporter import storage_usage_report
 
-    lines = [
-        f"{status_text} — File Share `{stats['share']}` en `{stats['account']}`",
-        f"Uso: {human_bytes(stats['used_bytes'])} / {stats['quota_gb']} GB ({pct:.1f}%)",
-        f"Umbral configurado: {threshold * 100:.0f}%",
-        f"Generado: {datetime.now().isoformat(timespec='seconds')}",
-    ]
-    if top_dirs:
-        lines.append("")
-        lines.append("Top carpetas por tamaño:")
-        for d in top_dirs:
-            lines.append(f"  {human_bytes(d['bytes']):>10}  {d['name']}")
-    plain = "\n".join(lines)
-
-    subject = f"[storage-monitor] {stats['share']} {pct:.0f}% ({'over' if over else 'ok'})"
-    html = "<pre style='font-family:Consolas,monospace'>" + plain + "</pre>"
-    return subject, plain, html
+    return storage_usage_report(stats, top_dirs, threshold)
 
 
 def main() -> int:
