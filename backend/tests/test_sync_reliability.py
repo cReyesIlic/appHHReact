@@ -923,6 +923,35 @@ class SchedulerReliabilityTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(scheduler._last_rag_repair["ok"])
         self.assertEqual(scheduler._last_rag_repair["processed"], 12)
 
+    async def test_legacy_rag_repair_reindexes_parent_only_codes(self):
+        from app.services import scheduler
+
+        service = Mock()
+        service.parent_child.status.side_effect = [
+            {
+                "parent_only_count": 2,
+                "parent_only_codes_preview": ["O-1001", "O-1002"],
+            },
+            {"parent_only_count": 0, "parent_only_codes_preview": []},
+        ]
+        service.sync_code = AsyncMock(
+            side_effect=[
+                {"status": "ok", "chunks_child": 12, "embedding_count": 12, "wiki_status": "ok"},
+                {"status": "ok", "chunks_child": 9, "embedding_count": 9, "wiki_status": "ok"},
+            ]
+        )
+        scheduler._legacy_rag_repair_running = False
+        scheduler._last_legacy_rag_repair = None
+        with patch("app.services.proposal_sync_service.ProposalSyncService", return_value=service):
+            await scheduler._run_legacy_rag_repair()
+
+        self.assertEqual(service.sync_code.await_count, 2)
+        service.wiki.reindex_entries.assert_called_once_with()
+        self.assertFalse(scheduler._legacy_rag_repair_running)
+        self.assertTrue(scheduler._last_legacy_rag_repair["ok"])
+        self.assertEqual(scheduler._last_legacy_rag_repair["processed"], 2)
+        self.assertEqual(scheduler._last_legacy_rag_repair["remaining"], 0)
+
     @unittest.skipUnless(importlib.util.find_spec("apscheduler"), "APScheduler no instalado en el Python local")
     async def test_scheduler_runs_once_daily_in_chile_timezone(self):
         from app.services import scheduler
@@ -937,6 +966,7 @@ class SchedulerReliabilityTests(unittest.IsolatedAsyncioTestCase):
                 "SYNC_SCHEDULE_MINUTE": "15",
                 "WIKI_REBUILD_ON_STARTUP": "false",
                 "RAG_REPAIR_ON_STARTUP": "false",
+                "LEGACY_RAG_REPAIR_ON_STARTUP": "false",
             },
             clear=False,
         ):

@@ -14,6 +14,8 @@ Config via env:
   WIKI_REBUILD_ON_STARTUP = migra Wiki antigua al arrancar (default true)
   WIKI_REBUILD_DAILY_LIMIT = lote de respaldo dentro del ciclo diario (default 25)
   RAG_REPAIR_ON_STARTUP  = completa embeddings pendientes al arrancar (default true)
+  LEGACY_RAG_REPAIR_ON_STARTUP = reindexa propuestas con padres pero sin chunks (default true)
+  LEGACY_RAG_REPAIR_LIMIT = maximo de propuestas antiguas por corrida (default 5)
 
 El scheduler es **idempotente**: si el App Service reinicia, la próxima corrida
 agendada al ciclo siguiente seguirá funcionando. No requiere job store persistente
@@ -39,6 +41,8 @@ _last_wiki_rebuild: dict | None = None
 _wiki_rebuild_running = False
 _last_rag_repair: dict | None = None
 _rag_repair_running = False
+_last_legacy_rag_repair: dict | None = None
+_legacy_rag_repair_running = False
 
 
 def _bool_env(name: str, default: bool) -> bool:
@@ -80,6 +84,7 @@ async def _run_sync_ganadas() -> None:
         master_result = await _run_master_refresh(send_email=False)
         svc = ProposalSyncService()
         result = await svc.sync_ganadas(limit=limit)
+        await _run_legacy_rag_repair()
         await _run_rag_repair()
         wiki_migration = None
         if not _wiki_rebuild_running:
@@ -99,6 +104,7 @@ async def _run_sync_ganadas() -> None:
             "email": result.get("email"),
             "master_refresh": master_result,
             "rag_repair": _last_rag_repair,
+            "legacy_rag_repair": _last_legacy_rag_repair,
             "wiki_migration": {
                 "target_count": wiki_migration.get("target_count"),
                 "wiki_ok": wiki_migration.get("wiki_ok"),
@@ -155,8 +161,78 @@ async def _run_rag_repair() -> None:
         _rag_repair_running = False
 
 
+async def _run_legacy_rag_repair() -> None:
+    """Reprocesa propuestas legacy que tienen padres RAG pero cero chunks buscables.
+
+    Corre en segundo plano y de forma reanudable. Cada propuesta terminada deja de
+    aparecer en ``parent_only_codes_preview``; si la app reinicia, la siguiente
+    corrida continua solamente con las restantes.
+    """
+    from app.services.proposal_sync_service import ProposalSyncService
+
+    global _last_legacy_rag_repair, _legacy_rag_repair_running
+    if _legacy_rag_repair_running:
+        return
+    _legacy_rag_repair_running = True
+    started_at = datetime.now()
+    try:
+        svc = ProposalSyncService()
+        limit = max(1, _int_env("LEGACY_RAG_REPAIR_LIMIT", 5))
+        before = svc.parent_child.status()
+        codes = list(before.get("parent_only_codes_preview") or [])[:limit]
+        details = []
+        for codigo in codes:
+            outcome = await svc.sync_code(
+                codigo,
+                force_wiki=True,
+                defer_wiki_reindex=True,
+            )
+            details.append(
+                {
+                    "codigo": codigo,
+                    "status": outcome.get("status"),
+                    "chunks_child": outcome.get("chunks_child"),
+                    "embedding_count": outcome.get("embedding_count"),
+                    "wiki_status": outcome.get("wiki_status"),
+                    "error": outcome.get("error") or outcome.get("wiki_error"),
+                }
+            )
+        if any(row.get("wiki_status") == "ok" for row in details):
+            svc.wiki.reindex_entries()
+        after = svc.parent_child.status()
+        processed = sum(
+            1 for row in details
+            if row.get("status") == "ok" and int(row.get("chunks_child") or 0) > 0
+        )
+        _last_legacy_rag_repair = {
+            "started_at": started_at.isoformat(timespec="seconds"),
+            "finished_at": datetime.now().isoformat(timespec="seconds"),
+            "ok": True,
+            "selected": len(codes),
+            "processed": processed,
+            "errors": len(codes) - processed,
+            "remaining": after.get("parent_only_count"),
+            "remaining_codes_preview": after.get("parent_only_codes_preview"),
+            "details": details,
+        }
+        logger.info("[scheduler] legacy RAG repair done: %s", _last_legacy_rag_repair)
+    except Exception as exc:  # noqa: BLE001
+        _last_legacy_rag_repair = {
+            "started_at": started_at.isoformat(timespec="seconds"),
+            "finished_at": datetime.now().isoformat(timespec="seconds"),
+            "ok": False,
+            "error": f"{type(exc).__name__}: {exc}",
+        }
+        logger.exception("[scheduler] legacy RAG repair failed")
+    finally:
+        _legacy_rag_repair_running = False
+
+
 async def _run_startup_maintenance(rebuild_wiki: bool) -> None:
     if _bool_env("RAG_REPAIR_ON_STARTUP", True):
+        await _run_rag_repair()
+    if _bool_env("LEGACY_RAG_REPAIR_ON_STARTUP", True):
+        await _run_legacy_rag_repair()
         await _run_rag_repair()
     if rebuild_wiki:
         await _run_wiki_rebuild()
@@ -329,8 +405,12 @@ def start_scheduler() -> dict:
     sched.start()
     _scheduler = sched
     rebuild_wiki = _bool_env("WIKI_REBUILD_ON_STARTUP", True)
-    if rebuild_wiki or _bool_env("RAG_REPAIR_ON_STARTUP", True):
-        # Completa vectores pendientes antes de reanudar Wiki evidence-v3.
+    if (
+        rebuild_wiki
+        or _bool_env("RAG_REPAIR_ON_STARTUP", True)
+        or _bool_env("LEGACY_RAG_REPAIR_ON_STARTUP", True)
+    ):
+        # Repara el RAG antes de reanudar Wiki evidence-v3.
         asyncio.create_task(_run_startup_maintenance(rebuild_wiki))
     logger.info(
         "[scheduler] iniciado tz=%s hours=%s minute=%s limit=%s",
@@ -365,6 +445,8 @@ def scheduler_status() -> dict:
             "wiki_rebuild_running": _wiki_rebuild_running,
             "last_rag_repair": _last_rag_repair,
             "rag_repair_running": _rag_repair_running,
+            "last_legacy_rag_repair": _last_legacy_rag_repair,
+            "legacy_rag_repair_running": _legacy_rag_repair_running,
         }
     jobs = []
     for j in _scheduler.get_jobs():
@@ -385,6 +467,8 @@ def scheduler_status() -> dict:
         "wiki_rebuild_running": _wiki_rebuild_running,
         "last_rag_repair": _last_rag_repair,
         "rag_repair_running": _rag_repair_running,
+        "last_legacy_rag_repair": _last_legacy_rag_repair,
+        "legacy_rag_repair_running": _legacy_rag_repair_running,
     }
 
 
@@ -410,4 +494,9 @@ async def trigger_now(job: str = "sync_ganadas") -> dict:
             return {"triggered": "rag_repair", "status": "already_running"}
         asyncio.create_task(_run_rag_repair())
         return {"triggered": "rag_repair", "status": "running_in_background"}
-    return {"error": f"job '{job}' desconocido (usar 'sync_ganadas', 'master_refresh', 'storage_monitor', 'wiki_rebuild' o 'rag_repair')"}
+    if job == "legacy_rag_repair":
+        if _legacy_rag_repair_running:
+            return {"triggered": "legacy_rag_repair", "status": "already_running"}
+        asyncio.create_task(_run_legacy_rag_repair())
+        return {"triggered": "legacy_rag_repair", "status": "running_in_background"}
+    return {"error": f"job '{job}' desconocido (usar 'sync_ganadas', 'master_refresh', 'storage_monitor', 'wiki_rebuild', 'rag_repair' o 'legacy_rag_repair')"}
