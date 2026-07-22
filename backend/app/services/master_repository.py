@@ -1,4 +1,5 @@
 import asyncio
+import re
 import sqlite3
 import unicodedata
 from io import BytesIO
@@ -111,36 +112,33 @@ class MasterRepository:
     def _filter_mask(self, df: pd.DataFrame, filters: SearchFilters) -> pd.Series:
         mask = pd.Series([True] * len(df), index=df.index)
         if filters.codigos and "codigo" in df.columns:
-            codes_upper = [c.upper() for c in filters.codigos]
-            # Match flexible: exact en codigo, contiene en codigo, exact/contiene en cod_proy.
-            # Permite "O-2200", "SH-428", "SH-0428", "428" → cualquier columna que contenga el patrón.
+            # Los identificadores son claves, no texto libre. Nunca usar contains:
+            # O-0274 no puede devolver O-2749 ni O-1274.
             cod_norm = df["codigo"].astype(str).str.upper()
             proy_norm = df["cod_proy"].astype(str).str.upper() if "cod_proy" in df.columns else None
+            cod_ids = cod_norm.map(self._identifier)
+            proy_ids = proy_norm.map(self._identifier) if proy_norm is not None else None
             row_mask = pd.Series([False] * len(df), index=df.index)
-            for raw in codes_upper:
-                # Variantes: literal, sin guion, sin ceros a la izquierda, con padding 4 dígitos
-                variants = {raw}
-                clean = raw.replace("-", "")
-                variants.add(clean)
-                # Detectar prefijo letra(s) + numero
-                import re as _re
-                m = _re.match(r"^([A-Z]+)?-?(\d+)$", raw)
-                if m:
-                    prefix = m.group(1) or ""
-                    number = m.group(2)
-                    number_int = int(number)
-                    variants.add(f"{prefix}-{number}" if prefix else number)
-                    variants.add(f"{prefix}-{number_int:04d}" if prefix else f"{number_int:04d}")
-                    variants.add(f"{prefix}{number}" if prefix else number)
-                    # cod_proy a veces viene como "428.0" o "428" (sin prefijo)
-                    variants.add(str(number_int))
-                    variants.add(f"{number_int}.0")
-                    variants.add(f"{number_int:04d}.0")
-                # Match: substring en codigo OR cod_proy
-                for v in variants:
-                    row_mask |= cod_norm.str.contains(v, regex=False, na=False)
+            for raw in filters.codigos:
+                parsed = self._identifier(raw)
+                if not parsed:
+                    row_mask |= cod_norm == str(raw).strip().upper()
                     if proy_norm is not None:
-                        row_mask |= proy_norm.str.contains(v, regex=False, na=False)
+                        row_mask |= proy_norm == str(raw).strip().upper()
+                    continue
+                prefix, number = parsed
+                if prefix == "O":
+                    row_mask |= cod_ids.map(lambda value: value == ("O", number))
+                elif prefix == "SH":
+                    row_mask |= cod_ids.map(lambda value: value == ("SH", number))
+                    if proy_ids is not None:
+                        row_mask |= proy_ids.map(
+                            lambda value: bool(value and value[1] == number and value[0] in {"", "SH"})
+                        )
+                else:
+                    row_mask |= cod_ids.map(lambda value: bool(value and value[1] == number))
+                    if proy_ids is not None:
+                        row_mask |= proy_ids.map(lambda value: bool(value and value[1] == number))
             mask &= row_mask
         if filters.clientes:
             normalized = [self._norm(c) for c in filters.clientes]
@@ -173,6 +171,14 @@ class MasterRepository:
             fechas = pd.to_datetime(df["fecha_recep"], errors="coerce")
             mask &= fechas <= pd.Timestamp(filters.fecha_hasta)
         return mask
+
+    @staticmethod
+    def _identifier(value: object) -> tuple[str, int] | None:
+        text = str(value or "").strip().upper()
+        match = re.fullmatch(r"([A-Z]+)?-?0*(\d+)(?:\.0+)?", text)
+        if not match:
+            return None
+        return (match.group(1) or "", int(match.group(2)))
 
     def search_many(self, queries: list[str], limit: int = 25) -> list[dict]:
         df = self._load()

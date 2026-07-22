@@ -10,6 +10,7 @@ from contextlib import closing
 from pathlib import Path
 from unittest.mock import AsyncMock, Mock, patch
 
+import pandas as pd
 from openpyxl import Workbook
 
 from app.agents.tools import TOOL_SCHEMAS, ToolDispatcher
@@ -19,6 +20,7 @@ from app.services.database_runtime import prepare_runtime_database, runtime_data
 from app.services.master_repository import MasterRepository
 from app.services.pipeline_registry import PIPELINE_VERSION, PipelineRegistry, source_signature
 from app.services.proposal_sync_service import ProposalSyncService
+from app.services.search_filters import SearchFilters
 from app.services.sharepoint_client import SharePointClient
 from app.services.structured_wiki import StructuredWikiService
 from app.services.wiki_auto_compiler import WikiAutoCompiler
@@ -413,6 +415,34 @@ class MasterRefreshTests(SettingsPathsMixin, unittest.IsolatedAsyncioTestCase):
             with closing(sqlite3.connect(settings.sqlite_path)) as conn:
                 row = conn.execute("select codigo, estado from oferta").fetchone()
             self.assertEqual(row, ("O-9999", "PG"))
+
+
+class MasterCodeFilterTests(unittest.TestCase):
+    def test_offer_code_filter_is_exact_not_substring(self):
+        frame = pd.DataFrame(
+            [
+                {"codigo": "O-0274", "cod_proy": "10.0"},
+                {"codigo": "O-2749", "cod_proy": "274.0"},
+                {"codigo": "O-1274", "cod_proy": "20.0"},
+            ]
+        )
+        repo = MasterRepository()
+
+        mask = repo._filter_mask(frame, SearchFilters(codigos=["O-274"]))
+
+        self.assertEqual(frame[mask]["codigo"].tolist(), ["O-0274"])
+
+    def test_project_code_filter_matches_numeric_project_column_exactly(self):
+        frame = pd.DataFrame(
+            [
+                {"codigo": "O-2000", "cod_proy": "390.0"},
+                {"codigo": "O-2001", "cod_proy": "1390.0"},
+            ]
+        )
+        repo = MasterRepository()
+        mask = repo._filter_mask(frame, SearchFilters(codigos=["SH-0390"]))
+
+        self.assertEqual(frame[mask]["codigo"].tolist(), ["O-2000"])
 
 
 class SchedulerReliabilityTests(unittest.IsolatedAsyncioTestCase):
