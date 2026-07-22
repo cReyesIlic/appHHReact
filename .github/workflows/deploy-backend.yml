@@ -129,11 +129,13 @@ jobs:
           az rest --method put --uri "$AUTH_URI" --body "@$AUTH_FILE" --output none
           rm -f "$AUTH_FILE"
 
-          AUTH_STATE=$(az rest --method get --uri "$AUTH_URI" \
-            --query "properties.[globalValidation.requireAuthentication,globalValidation.unauthenticatedClientAction,identityProviders.azureStaticWebApps.enabled]" \
-            -o tsv)
-          echo "App Service auth: $AUTH_STATE"
-          echo "$AUTH_STATE" | grep -Eq '^true[[:space:]]+Return401[[:space:]]+true$'
+          AUTH_STATE=$(az rest --method get --uri "$AUTH_URI" -o json)
+          echo "$AUTH_STATE" | jq -c '{required: .properties.globalValidation.requireAuthentication, action: .properties.globalValidation.unauthenticatedClientAction, staticWebApps: .properties.identityProviders.azureStaticWebApps.enabled}'
+          echo "$AUTH_STATE" | jq -e '
+            .properties.globalValidation.requireAuthentication == true and
+            .properties.globalValidation.unauthenticatedClientAction == "Return401" and
+            .properties.identityProviders.azureStaticWebApps.enabled == true
+          ' >/dev/null
 
       - name: Security smoke test
         run: |
