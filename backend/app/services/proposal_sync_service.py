@@ -392,14 +392,23 @@ class ProposalSyncService:
             primary_url = None
             for f in files:
                 content = await self.sharepoint.download_file(f)
-                local_path = self.sharepoint.save_pdf_locally(
+                local_path = await asyncio.to_thread(
+                    self.sharepoint.save_pdf_locally,
                     codigo,
                     f.get("name", "doc.bin"),
                     content,
-                    item_id=f.get("id"),
+                    f.get("id"),
                 )
                 kind = (f.get("name", "").lower().rsplit(".", 1)[-1] if "." in f.get("name", "") else "")
-                extracted_document = self._extract_document_any(content, kind, f.get("name", ""))
+                # PDF/DOCX/Excel pueden tardar varios segundos y son CPU-bound.
+                # Sacarlos del event loop mantiene navegable la API mientras el
+                # scheduler procesa carpetas antiguas con decenas de archivos.
+                extracted_document = await asyncio.to_thread(
+                    self._extract_document_any,
+                    content,
+                    kind,
+                    f.get("name", ""),
+                )
                 file_text = extracted_document["text"]
                 if not file_text.strip() or file_text.startswith("[error extrayendo "):
                     file_errors.append(file_text or f"{f.get('name')}: sin texto extraible")
@@ -430,7 +439,10 @@ class ProposalSyncService:
                     primary_path = str(local_path)
                     primary_url = f.get("webUrl")
                     if kind == "pdf":
-                        first_pages_text = self.sharepoint.extract_first_pages_text(content, pages=5)
+                        first_pages_text = "\n".join(
+                            str(page.get("text") or "")
+                            for page in (extracted_document.get("pages") or [])[:5]
+                        )
                     else:
                         first_pages_text = file_text[:8000]
             full_text = "\n".join(full_text_parts)
@@ -492,18 +504,23 @@ class ProposalSyncService:
                         "metadata": document_metadata,
                     }
                 )
-            pc_result = self.parent_child.index_documents(codigo, indexed_documents)
+            pc_result = await asyncio.to_thread(
+                self.parent_child.index_documents,
+                codigo,
+                indexed_documents,
+            )
             result["chunks_parent"] = pc_result.get("parents", 0)
             result["chunks_child"] = pc_result.get("children", 0)
             # Legacy chunks (rag_chunks) — opcional, mantiene compat
-            chunks = self.rag_store.make_chunks(
+            chunks = await asyncio.to_thread(
+                self.rag_store.make_chunks,
                 codigo=codigo,
                 text=full_text,
                 source=latest.get("webUrl") or str(local_path),
                 metadata=raw_metadata,
             )
-            self.rag_store.upsert_proposal(metadata, knowledge)
-            self.rag_store.replace_chunks(codigo, chunks)
+            await asyncio.to_thread(self.rag_store.upsert_proposal, metadata, knowledge)
+            await asyncio.to_thread(self.rag_store.replace_chunks, codigo, chunks)
         except Exception as exc:  # noqa: BLE001
             result.update({"status": "error", "error": f"indexing: {exc}"})
             self._record_manifest(result)
