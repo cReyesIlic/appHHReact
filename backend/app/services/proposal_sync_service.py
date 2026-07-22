@@ -255,7 +255,7 @@ class ProposalSyncService:
         build_embeddings: bool = True,
         source_files: list[dict] | None = None,
     ) -> dict:
-        codigo = codigo.upper().strip()
+        codigo = normalize_offer_code(codigo) or codigo.upper().strip()
         result = {
             "codigo": codigo,
             "status": "pending",
@@ -493,7 +493,7 @@ class ProposalSyncService:
         import asyncio
 
         if codigos:
-            target = [c.upper() for c in codigos]
+            target = [normalize_offer_code(c) or c.upper() for c in codigos]
         else:
             gap = self.discover_wiki_gaps()
             target = gap["missing_codes"]

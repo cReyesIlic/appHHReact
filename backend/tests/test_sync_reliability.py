@@ -19,6 +19,7 @@ from app.rag.parent_child import ParentChildIndexer
 from app.services.database_runtime import prepare_runtime_database, runtime_database_status
 from app.services.budget_extractor_client import BudgetExtractorClient
 from app.services.master_repository import MasterRepository
+from app.services.ops_dashboard import OpsDashboardService
 from app.services.pipeline_registry import PIPELINE_VERSION, PipelineRegistry, source_signature
 from app.services.proposal_sync_service import ProposalSyncService
 from app.services.search_filters import SearchFilters
@@ -155,8 +156,28 @@ class QueueReliabilityTests(unittest.TestCase):
         self.assertEqual([row["codigo"] for row in rows], ["O-0274"])
         self.assertEqual(rows[0]["titulo"], "Segunda")
 
+    def test_ops_coverage_joins_unpadded_master_codes_to_canonical_pipeline_codes(self):
+        service = object.__new__(OpsDashboardService)
+        self.assertEqual(service._code("O-274"), "O-0274")
+
 
 class SharePointFolderMatchingTests(unittest.IsolatedAsyncioTestCase):
+    async def test_manual_sync_normalizes_unpadded_offer_code(self):
+        service = object.__new__(ProposalSyncService)
+        service.pipeline = Mock()
+        service.pipeline.get.return_value = None
+        service.sharepoint = Mock()
+        service.sharepoint.list_emitido_files = AsyncMock(return_value=[])
+        service.sharepoint.list_pdfs = AsyncMock(return_value=[])
+        service.sharepoint.select_latest_pdf.return_value = None
+        service._record_manifest = Mock()
+
+        result = await service.sync_code("O-274")
+
+        self.assertEqual(result["codigo"], "O-0274")
+        service.sharepoint.list_emitido_files.assert_awaited_once_with("O-0274")
+        service.pipeline.record_failure.assert_called_once()
+
     async def test_offer_code_never_falls_back_to_fuzzy_neighbor(self):
         client = object.__new__(SharePointClient)
         client._children = AsyncMock(

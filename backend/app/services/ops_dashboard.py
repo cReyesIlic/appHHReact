@@ -9,6 +9,7 @@ from typing import Any
 from app.core.config import settings
 from app.services.hh_excel_extractor import HHExcelExtractor
 from app.services.master_repository import MasterRepository
+from app.services.sharepoint_client import normalize_offer_code
 from app.services.pipeline_registry import (
     PIPELINE_VERSION,
     RAG_PIPELINE_VERSION,
@@ -294,7 +295,8 @@ class OpsDashboardService:
         return datetime.min
 
     def _code(self, value: object) -> str:
-        return str(value or "").strip().upper()
+        raw = str(value or "").strip().upper()
+        return normalize_offer_code(raw) or raw
 
     def _int(self, value: object) -> int:
         try:
