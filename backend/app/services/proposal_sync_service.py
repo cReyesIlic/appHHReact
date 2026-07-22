@@ -385,6 +385,7 @@ class ProposalSyncService:
             processed_files = []
             file_errors = []
             excel_assets = []
+            rag_documents = []
             first_pages_text = ""
             primary_name = None
             primary_path = None
@@ -398,11 +399,20 @@ class ProposalSyncService:
                     item_id=f.get("id"),
                 )
                 kind = (f.get("name", "").lower().rsplit(".", 1)[-1] if "." in f.get("name", "") else "")
-                file_text = self._extract_text_any(content, kind, f.get("name", ""))
+                extracted_document = self._extract_document_any(content, kind, f.get("name", ""))
+                file_text = extracted_document["text"]
                 if not file_text.strip() or file_text.startswith("[error extrayendo "):
                     file_errors.append(file_text or f"{f.get('name')}: sin texto extraible")
                     continue
                 processed_files.append(f)
+                rag_documents.append(
+                    {
+                        "name": f.get("name") or local_path.name,
+                        "url": f.get("webUrl"),
+                        "local_path": str(local_path),
+                        "parse_result": extracted_document,
+                    }
+                )
                 if kind in {"xlsx", "xlsm", "xls"}:
                     excel_assets.append(
                         {
@@ -466,9 +476,23 @@ class ProposalSyncService:
         try:
             knowledge = await self.extractor.extract(metadata, first_pages_text, full_text)
             raw_metadata = {**metadata.model_dump(), **knowledge.model_dump()}
-            enriched = enrich_metadata(raw_metadata)
-            parse_result = {"text": full_text, "pages": []}
-            pc_result = self.parent_child.index_parse_result(codigo, parse_result, enriched)
+            indexed_documents = []
+            for document in rag_documents:
+                document_metadata = enrich_metadata(
+                    {
+                        **raw_metadata,
+                        "pdf_name": document["name"],
+                        "url": document["url"],
+                        "local_path": document["local_path"],
+                    }
+                )
+                indexed_documents.append(
+                    {
+                        "parse_result": document["parse_result"],
+                        "metadata": document_metadata,
+                    }
+                )
+            pc_result = self.parent_child.index_documents(codigo, indexed_documents)
             result["chunks_parent"] = pc_result.get("parents", 0)
             result["chunks_child"] = pc_result.get("children", 0)
             # Legacy chunks (rag_chunks) — opcional, mantiene compat
@@ -1015,7 +1039,8 @@ class ProposalSyncService:
             "saved_to": str(target),
         }
 
-        text = self._extract_text_any(content, kind, filename)
+        extracted_document = self._extract_document_any(content, kind, filename)
+        text = extracted_document["text"]
         if not text or text.startswith("[error"):
             result.update({"status": "extract_error", "error": text or "sin texto"})
             self._update_assets_manifest(codigo, kind, safe_name, target)
@@ -1027,8 +1052,7 @@ class ProposalSyncService:
             knowledge = await self.extractor.extract(metadata, text[:8000], text)
             raw_metadata = {**metadata.model_dump(), **knowledge.model_dump()}
             enriched = enrich_metadata(raw_metadata)
-            parse_result = {"text": text, "pages": []}
-            pc = self.parent_child.index_parse_result(codigo, parse_result, enriched)
+            pc = self.parent_child.index_parse_result(codigo, extracted_document, enriched)
             result["chunks_parent"] = pc.get("parents", 0)
             result["chunks_child"] = pc.get("children", 0)
             chunks = self.rag_store.make_chunks(codigo=codigo, text=text, source=str(target), metadata=raw_metadata)
@@ -1116,12 +1140,20 @@ class ProposalSyncService:
 
     def _extract_text_any(self, content: bytes, kind: str, filename: str) -> str:
         """Extrae texto de PDF, DOCX o XLSX. Devuelve texto plano concatenado."""
+        return self._extract_document_any(content, kind, filename)["text"]
+
+    def _extract_document_any(self, content: bytes, kind: str, filename: str) -> dict:
+        """Extrae texto y conserva paginas cuando el formato las expone."""
         from io import BytesIO
         try:
             if kind == "pdf":
                 from PyPDF2 import PdfReader
                 reader = PdfReader(BytesIO(content))
-                return "\n".join(p.extract_text() or "" for p in reader.pages)
+                pages = [
+                    {"pageNumber": index, "text": page.extract_text() or ""}
+                    for index, page in enumerate(reader.pages, start=1)
+                ]
+                return {"text": "\n".join(page["text"] for page in pages), "pages": pages}
             if kind == "docx":
                 from docx import Document
                 doc = Document(BytesIO(content))
@@ -1131,7 +1163,7 @@ class ProposalSyncService:
                         cells = [c.text.strip() for c in row.cells if c.text.strip()]
                         if cells:
                             blocks.append(" | ".join(cells))
-                return "\n".join(blocks)
+                return {"text": "\n".join(blocks), "pages": []}
             if kind in {"xlsx", "xlsm"}:
                 import openpyxl
                 wb = openpyxl.load_workbook(BytesIO(content), data_only=True, read_only=True)
@@ -1142,7 +1174,7 @@ class ProposalSyncService:
                         cells = [str(c).strip() for c in row if c is not None and str(c).strip()]
                         if cells:
                             blocks.append(" | ".join(cells))
-                return "\n".join(blocks)
+                return {"text": "\n".join(blocks), "pages": []}
             if kind == "xls":
                 import pandas as pd
                 sheets = pd.read_excel(BytesIO(content), sheet_name=None, header=None)
@@ -1153,10 +1185,10 @@ class ProposalSyncService:
                         cells = [cell.strip() for cell in row if cell.strip()]
                         if cells:
                             blocks.append(" | ".join(cells))
-                return "\n".join(blocks)
+                return {"text": "\n".join(blocks), "pages": []}
         except Exception as exc:  # noqa: BLE001
-            return f"[error extrayendo {filename}: {exc}]"
-        return ""
+            return {"text": f"[error extrayendo {filename}: {exc}]", "pages": []}
+        return {"text": "", "pages": []}
 
     def _metadata(self, codigo: str, pdf: dict, local_path: str) -> ProposalMetadata:
         master = self.master.search(codigo=codigo, limit=1)

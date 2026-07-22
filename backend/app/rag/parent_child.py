@@ -37,19 +37,39 @@ class ParentChildIndexer:
         self._ensure_tables()
 
     def index_parse_result(self, codigo: str, parse_result: dict, metadata: dict) -> dict:
+        return self.index_documents(
+            codigo,
+            [{"parse_result": parse_result, "metadata": metadata}],
+        )
+
+    def index_documents(self, codigo: str, documents: list[dict]) -> dict:
+        """Indexa varios archivos preservando la fuente y paginas de cada uno."""
+        parents: list[ParentSection] = []
+        for document in documents:
+            parse_result = document.get("parse_result") or {}
+            metadata = document.get("metadata") or {}
+            parents.extend(self._parents_from_parse_result(codigo, parse_result, metadata))
+        parents = self._unique_parents(parents)
+        children: list[ChildChunk] = []
+        for index, parent in enumerate(parents, start=1):
+            parent.metadata.update({"section_index": index, "section_count": len(parents)})
+            children.extend(self._children(parent))
+        self.replace(codigo, parents, children)
+        return {"codigo": codigo, "parents": len(parents), "children": len(children)}
+
+    def _parents_from_parse_result(
+        self,
+        codigo: str,
+        parse_result: dict,
+        metadata: dict,
+    ) -> list[ParentSection]:
         parents = self._markdown_sections(codigo, parse_result.get("text") or "", metadata)
         if not parents:
             parents = self._sections_from_pages(codigo, parse_result.get("pages") or [], metadata)
         if not parents:
             text = parse_result.get("text", "")
             parents = [self._parent(codigo, "Documento", text, None, None, metadata)]
-        parents = self._unique_parents(parents)
-        children = []
-        for index, parent in enumerate(parents, start=1):
-            parent.metadata.update({"section_index": index, "section_count": len(parents)})
-            children.extend(self._children(parent))
-        self.replace(codigo, parents, children)
-        return {"codigo": codigo, "parents": len(parents), "children": len(children)}
+        return parents
 
     def index_markdown(self, codigo: str, markdown: str, metadata: dict) -> dict:
         parents = self._unique_parents(self._markdown_sections(codigo, markdown, metadata))
@@ -294,6 +314,16 @@ class ParentChildIndexer:
         start = 0
         child_index = 0
         while start < len(parent.text):
+            remaining = len(parent.text) - start
+            if chunks and remaining <= overlap + 100:
+                previous_start = max(0, start - (max_chars - overlap))
+                merged = parent.text[previous_start:].strip()
+                previous = chunks[-1]
+                previous.text = merged
+                previous.child_id = sha1(
+                    f"{parent.parent_id}:{previous_start}:{merged[:80]}".encode("utf-8")
+                ).hexdigest()[:18]
+                break
             piece = parent.text[start : start + max_chars].strip()
             if piece:
                 child_index += 1
@@ -313,7 +343,15 @@ class ParentChildIndexer:
         return chunks
 
     def _parent(self, codigo: str, title: str, text: str, page_start: int | None, page_end: int | None, metadata: dict) -> ParentSection:
-        parent_id = sha1(f"{codigo}:{title}:{page_start}:{text[:120]}".encode("utf-8")).hexdigest()[:18]
+        source_file = (
+            metadata.get("pdf_name")
+            or metadata.get("archivo_nombre")
+            or metadata.get("source_file")
+            or ""
+        )
+        parent_id = sha1(
+            f"{codigo}:{source_file}:{title}:{page_start}:{text[:120]}".encode("utf-8")
+        ).hexdigest()[:18]
         parent_metadata = {
             **metadata,
             "section_entities": extract_entities(" ".join([title, text[:4000]])),

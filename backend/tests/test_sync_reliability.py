@@ -76,6 +76,74 @@ class ParentChildReliabilityTests(SettingsPathsMixin, unittest.TestCase):
             self.assertEqual(len(parent_ids), len(set(parent_ids)))
             self.assertEqual(old_embeddings, 0)
 
+    def test_multiple_documents_keep_their_own_pages_and_sources(self):
+        with tempfile.TemporaryDirectory() as temp_dir, self.patch_settings(temp_dir):
+            indexer = ParentChildIndexer()
+            result = indexer.index_documents(
+                "O-9998",
+                [
+                    {
+                        "parse_result": {
+                            "text": "texto tecnico del primer documento " * 8,
+                            "pages": [{"pageNumber": 3, "text": "texto tecnico del primer documento " * 8}],
+                        },
+                        "metadata": {"pdf_name": "primero.pdf", "url": "https://sharepoint/primero.pdf"},
+                    },
+                    {
+                        "parse_result": {
+                            "text": "evidencia independiente del segundo archivo " * 8,
+                            "pages": [{"pageNumber": 7, "text": "evidencia independiente del segundo archivo " * 8}],
+                        },
+                        "metadata": {"pdf_name": "segundo.pdf", "url": "https://sharepoint/segundo.pdf"},
+                    },
+                ],
+            )
+
+            self.assertEqual(result["parents"], 2)
+            with closing(sqlite3.connect(settings.sqlite_path)) as conn:
+                rows = conn.execute(
+                    "select page_start, metadata from rag_child_chunks where codigo = ? order by page_start",
+                    ("O-9998",),
+                ).fetchall()
+            self.assertEqual([row[0] for row in rows], [3, 7])
+            self.assertIn('"pdf_name": "primero.pdf"', rows[0][1])
+            self.assertIn('"url": "https://sharepoint/segundo.pdf"', rows[1][1])
+
+    def test_small_overlapping_tail_is_merged_instead_of_duplicated(self):
+        with tempfile.TemporaryDirectory() as temp_dir, self.patch_settings(temp_dir):
+            indexer = ParentChildIndexer()
+            result = indexer.index_parse_result(
+                "O-9997",
+                {"text": "x" * 1850, "pages": []},
+                {"pdf_name": "documento.pdf"},
+            )
+
+            self.assertEqual(result["children"], 2)
+            with closing(sqlite3.connect(settings.sqlite_path)) as conn:
+                lengths = [row[0] for row in conn.execute(
+                    "select length(text) from rag_child_chunks where codigo = ? order by json_extract(metadata, '$.child_index')",
+                    ("O-9997",),
+                )]
+            self.assertEqual(lengths, [1000, 1000])
+
+
+class ProposalExtractionTests(unittest.TestCase):
+    def test_pdf_extraction_preserves_page_numbers(self):
+        service = object.__new__(ProposalSyncService)
+        pages = [Mock(), Mock()]
+        pages[0].extract_text.return_value = "pagina uno"
+        pages[1].extract_text.return_value = "pagina dos"
+        reader = Mock(pages=pages)
+
+        with patch("PyPDF2.PdfReader", return_value=reader):
+            extracted = service._extract_document_any(b"pdf", "pdf", "oferta.pdf")
+
+        self.assertEqual(extracted["text"], "pagina uno\npagina dos")
+        self.assertEqual(extracted["pages"], [
+            {"pageNumber": 1, "text": "pagina uno"},
+            {"pageNumber": 2, "text": "pagina dos"},
+        ])
+
 
 class DatabaseRuntimeTests(SettingsPathsMixin, unittest.TestCase):
     def test_wal_database_is_migrated_to_network_safe_delete_journal(self):
