@@ -1,6 +1,6 @@
 # Azure Deployment Plan
 
-> **Status:** Validated (pipeline registry release)
+> **Status:** Deployed and verified
 
 Generated: 2026-07-21 (America/Santiago)
 
@@ -21,7 +21,7 @@ Generated: 2026-07-21 (America/Santiago)
 - Master refresh currently re-imports a cached/local Excel and only downloads the configured blob when the local file is absent.
 - The configured Master blob was last updated on 2026-03-10.
 - The exact current Master workbook was found in SharePoint (`Documentos/SH001-REG-GC-005 Planilla Master.xlsx`), last modified on 2026-07-20T22:21:29Z.
-- The first repair release (`116cbff`) is live and healthy; production synchronization of `O-2637` processed 12 PDF/DOCX/XLSX files into 18 parent chunks, 348 child chunks/embeddings, and a Wiki page.
+- A controlled check exposed that the old fuzzy SharePoint lookup had associated `O-2637` with the `O-2370` folder. Exact normalized matching now rejects that source and production RAG/Wiki/cache contamination for `O-2637` was removed.
 - A real main-chat trace successfully called Master, Wiki, RAG, and staffing tools; the static registry contains 22 exposed tools and 22 handlers.
 - The first release smoke test exposed an independent startup race: the budget extractor received a successful Azure Function response but SQLite could not open its mounted parent directory.
 - Root cause was confirmed from the SQLite header: the 812 MB database was in WAL mode on an Azure Files SMB mount. WAL uses shared-memory sidecars and is not supported safely on a network filesystem across container restarts.
@@ -95,7 +95,7 @@ No GitHub Copilot SDK markers were detected.
 12. Ask the Wiki AI to score source/RAG sufficiency and Wiki coverage/fidelity; retain an objective heuristic fallback and surface both in the operations table.
 13. Preserve Wiki entry identity/file paths during forced recompilation so reprocessing cannot create duplicate entries.
 14. Expose the project coverage table in the frontend with PDF/DOCX/Excel counts, parsed Excel, RAG, Wiki, quality, pipeline version, and reprocess state.
-15. Run five automatic Chile-time cycles daily (02:15, 07:15, 12:15, 17:15, 22:15), each refreshing Master first and then processing a fair bounded batch.
+15. Run one automatic Chile-time cycle daily at 02:15, as requested, refreshing Master first and then processing a fair bounded batch.
 16. Ensure Azure Files mount-point directories exist in the container and before the budget extractor opens SQLite.
 17. Migrate SQLite from WAL to network-safe DELETE journaling during application startup, before health traffic, and use the lightweight `/health` endpoint for deployment warm-up.
 
@@ -144,11 +144,13 @@ This is a code-only deployment to existing resources. `azure-quotas` was invoked
 ### Phase 4: Deployment
 
 - [x] First repair release deployed (`116cbff`)
-- [ ] Deploy expanded pipeline registry release
-- [ ] Verify five-run production schedule and persistent registry endpoint
-- [ ] Reprocess a controlled production proposal and verify AI quality/version fields
-- [ ] Re-run budget extractor smoke test
-- [ ] Update status to `Deployed`
+- [x] Deploy expanded pipeline registry release
+- [x] Verify one-run production schedule and persistent registry endpoint
+- [x] Reprocess controlled proposal `O-0274` and verify AI quality/version fields
+- [x] Re-run budget extractor smoke test and remove duplicate source aliases
+- [x] Verify exact SharePoint provenance and remove contaminated Wiki duplicates
+- [x] Verify main-chat selection of Wiki, Master/detail, economics/HH, and RAG tools
+- [x] Update status to `Deployed`
 
 ---
 
@@ -161,7 +163,7 @@ application code to existing resources and contains no infrastructure templates.
 | Check | Command Run | Result | Timestamp |
 |-------|-------------|--------|-----------|
 | Python syntax | `python -m compileall -q backend/app backend/tests` | Passed | 2026-07-21 |
-| Reliability tests | `python -m pytest backend/tests/test_sync_reliability.py -q` | 11 passed, including WAL-to-DELETE migration | 2026-07-21 |
+| Reliability tests | `python -m pytest backend/tests -q` | 26 passed, including source integrity, retry state, budget deduplication, canonical codes, and Wiki duplicate cleanup | 2026-07-22 |
 | Frontend build | `npm run build` | Passed; 2,011 modules transformed | 2026-07-21 |
 | Workflow syntax | `yaml.safe_load(.github/workflows/deploy-backend.yml)` | Passed; 11 steps | 2026-07-21 |
 | Whitespace | `git diff --check -- <deployment files>` | Passed; unrelated user-owned frontend workflow excluded | 2026-07-21 |
@@ -179,7 +181,18 @@ deployment blocker: the existing GitHub workflow builds with Docker and pushes
 directly to the same validated registry, and the identical Docker build passed
 locally.
 
-**Validated by:** `azure-validate` workflow, expanded release revalidated 2026-07-21T19:44:20-04:00
+### Production verification (2026-07-22)
+
+- Backend `915d602` is healthy and its GitHub Actions deployment, exact-version health gate, and budget smoke test completed successfully.
+- Frontend `65d4eea` completed its Static Web App deployment successfully. Wiki content is shown in the Wiki tab; synchronization controls are under Settings.
+- Azure scheduler is active in `America/Santiago` with `cron[hour='2', minute='15']`; `SYNC_SCHEDULE_LIMIT=20`.
+- Controlled `O-0274`: 2 PDF + 2 DOCX + 2 Excel, 10 parent chunks, 35 child chunks/embeddings, RAG AI quality 88/100, Wiki AI quality 92/100, and `needs_reprocess=false`.
+- Exactly one auto-compiled Wiki entry remains for `O-0274`; it contains `O-0274` and no `O-0277` content.
+- Budget extraction converged to 91 project rows and 12 expense rows from the two canonical Excel source names (no cache-alias duplicates).
+- Exact Master lookup returns the two genuine historical `O-274` rows. The chat distinguished Caserones/355 HH from Arcadis/154.8 HH and used Wiki, proposal detail, economics, and RAG tools.
+- Current automatic backlog is visible in the operations coverage table and rotates new, changed, and pipeline-stale proposals without marking partial work complete.
+
+**Validated by:** `azure-validate` workflow plus production API/chat verification, completed 2026-07-22.
 
 ---
 
@@ -190,7 +203,7 @@ locally.
 | `backend/app/rag/parent_child.py` | Collision-safe replacement and embedding cleanup |
 | `backend/app/services/proposal_sync_service.py` | Fair pending queue |
 | `backend/app/services/pipeline_registry.py` | Durable per-project source, quality, version, and reprocessing registry |
-| `backend/app/services/scheduler.py` | Correct timezone, five daily cycles, and current Master refresh |
+| `backend/app/services/scheduler.py` | Correct timezone, one daily cycle, and current Master refresh |
 | `backend/app/services/sharepoint_client.py` | Exact Master discovery/download |
 | `backend/app/services/wiki_auto_compiler.py` | AI RAG/Wiki quality scoring and identity-preserving recompilation |
 | `backend/app/services/structured_wiki.py` | Reuse the existing Wiki file during upsert |
@@ -211,6 +224,6 @@ locally.
 
 ## 10. Next Step
 
-Complete final validation, commit/push the scoped release, deploy it through the
-existing GitHub Actions pipeline, then verify the registry, schedule, controlled
-reprocess, Wiki quality, chat tool consistency, and budget extractor in production.
+Deployment and controlled production verification are complete. Continue observing
+the operations coverage table while the bounded daily queue migrates remaining
+new and stale proposals to the current RAG/Wiki pipeline.
