@@ -568,6 +568,14 @@
   color: var(--text-muted);
 }
 .source-item-title { font-weight: 500; color: var(--text-primary); }
+.source-item-button {
+  width: 100%;
+  text-align: left;
+  font: inherit;
+  cursor: pointer;
+}
+.source-item:hover { border-left-color: var(--shimin-copper); }
+.wiki-source-preview { max-height: 70vh; overflow: auto; }
 
 /* Drafts (propuestas en armado) */
 .drafts-layout {

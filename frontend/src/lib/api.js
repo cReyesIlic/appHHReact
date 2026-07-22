@@ -155,6 +155,10 @@ export function getWikiEntries() {
   return jsonFetch("/api/wiki/entries");
 }
 
+export function getWikiEntry(id) {
+  return jsonFetch(`/api/wiki/entries/${encodeURIComponent(id)}`);
+}
+
 export function getWikiQuickAccess() {
   return jsonFetch("/api/wiki/quick-access");
 }

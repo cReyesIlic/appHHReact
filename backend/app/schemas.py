@@ -31,6 +31,7 @@ class Source(BaseModel):
     kind: str
     title: str
     url: str | None = None
+    entry_id: str | None = None
     codigo: str | None = None
     score: float | None = None
 

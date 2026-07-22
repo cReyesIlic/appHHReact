@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 import { Sparkles, PanelLeftClose, PanelLeftOpen, PanelRightClose, PanelRightOpen } from "lucide-react";
-import { sendChat, getSession } from "../../lib/api.js";
+import { sendChat, getSession, getWikiEntry } from "../../lib/api.js";
 import { EMPTY_FILTERS, compactFilters, parseFiltersFromText } from "../../lib/filters.js";
 import { Card } from "../shared/Card.jsx";
 import { EmptyState } from "../shared/EmptyState.jsx";
@@ -11,6 +11,8 @@ import { SourcesView } from "./SourcesView.jsx";
 import { ThinkingIndicator } from "./ThinkingIndicator.jsx";
 import { SessionsSidebar } from "./SessionsSidebar.jsx";
 import { DataTable } from "../shared/DataTable.jsx";
+import { MarkdownView } from "../shared/MarkdownView.jsx";
+import { Modal } from "../shared/Modal.jsx";
 
 export function ChatView() {
   const [messages, setMessages] = useState([]);
@@ -25,6 +27,17 @@ export function ChatView() {
   // Toggle paneles (persistido en localStorage)
   const [showSessions, setShowSessions] = useState(() => localStorage.getItem("shimin_show_sessions") !== "0");
   const [showProcess, setShowProcess] = useState(() => localStorage.getItem("shimin_show_process") !== "0");
+  const [wikiPreview, setWikiPreview] = useState(null);
+
+  const openWikiSource = async (source) => {
+    setWikiPreview({ loading: true, title: source.title, entry: null, error: null });
+    try {
+      const entry = await getWikiEntry(source.entry_id);
+      setWikiPreview({ loading: false, title: entry.title || source.title, entry, error: null });
+    } catch (exc) {
+      setWikiPreview({ loading: false, title: source.title, entry: null, error: exc.detail || exc.message });
+    }
+  };
 
   // Cargar mensajes de sesión activa al cambiar
   useEffect(() => {
@@ -173,12 +186,29 @@ export function ChatView() {
                 {trace.length === 0 ? <small className="dim">Sin actividad aún.</small> : <TraceView trace={trace} />}
               </Card>
               <Card title="Fuentes" subtitle={`${sources.length} referencias`}>
-                {sources.length === 0 ? <small className="dim">Las fuentes aparecerán aquí.</small> : <SourcesView sources={sources} />}
+                {sources.length === 0 ? <small className="dim">Las fuentes aparecerán aquí.</small> : <SourcesView sources={sources} onOpenWiki={openWikiSource} />}
               </Card>
             </aside>
           )}
         </div>
       </div>
+      <Modal
+        open={wikiPreview !== null}
+        title={wikiPreview?.title ? `Wiki · ${wikiPreview.title}` : "Wiki"}
+        onClose={() => setWikiPreview(null)}
+      >
+        {wikiPreview?.loading && <EmptyState title="Cargando Wiki…" />}
+        {wikiPreview?.error && <div className="hh-alert">{wikiPreview.error}</div>}
+        {wikiPreview?.entry && (
+          <div className="wiki-source-preview">
+            <div className="wiki-entry-references">
+              {(wikiPreview.entry.propuestas_referenciadas || []).map((code) => <span key={code}>{code}</span>)}
+              {(wikiPreview.entry.tags || []).map((tag) => <span key={tag}>#{tag}</span>)}
+            </div>
+            <MarkdownView content={wikiPreview.entry.content || ""} className="wiki-entry-markdown" />
+          </div>
+        )}
+      </Modal>
     </div>
   );
 }

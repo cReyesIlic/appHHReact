@@ -390,6 +390,7 @@ class AgentLoop:
                     Source(
                         kind=tool_name,
                         title=str(entry.get("title") or entry.get("id") or "")[:200],
+                        entry_id=entry.get("id"),
                         codigo=None,
                         score=entry.get("score"),
                     )
