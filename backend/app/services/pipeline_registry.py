@@ -11,9 +11,9 @@ from pathlib import Path
 from app.core.config import settings
 
 
-PIPELINE_VERSION = "2026.07.21.3"
+PIPELINE_VERSION = "2026.07.22.1"
 RAG_PIPELINE_VERSION = "parent-child-v2"
-WIKI_PIPELINE_VERSION = "wiki-ai-v2"
+WIKI_PIPELINE_VERSION = "wiki-evidence-v3"
 
 
 def compact_source_files(files: list[dict] | None) -> list[dict]:

@@ -173,6 +173,7 @@ class ProposalSyncService:
                 codigo,
                 force_wiki=reason != "new_rag",
                 source_files=ganada.get("_source_files"),
+                defer_wiki_reindex=True,
             )
             outcome["sync_reason"] = reason
             counters.by_code.append({**outcome, "titulo": ganada.get("titulo"), "cliente": ganada.get("cliente")})
@@ -194,6 +195,10 @@ class ProposalSyncService:
                 counters.wiki_no_rag += 1
             elif outcome.get("wiki_status") == "error":
                 counters.wiki_error += 1
+        if counters.wiki_ok:
+            # Una sola reconstrucción hace visibles todas las Wikis nuevas para
+            # las tools del chat, sin reindexar el corpus en cada propuesta.
+            self.wiki.reindex_entries()
         summary = {
             "scope": "ganadas_master_pendientes",
             "total_ganadas_master": gap["total_ganadas_master"],
@@ -259,16 +264,41 @@ class ProposalSyncService:
         }
 
     def discover_wiki_gaps(self, only_with_rag: bool = True) -> dict:
-        """Devuelve códigos con RAG indexado pero SIN página Wiki en disco."""
+        """Devuelve páginas ausentes o anteriores al esquema Wiki vigente.
+
+        Leer el marcador del frontmatter permite que una migración masiva sea
+        reanudable: tras un reinicio sólo se vuelven a tomar las páginas que aún
+        no terminaron con el compilador basado en evidencia.
+        """
         rag_codes = self._codigos_with_rag()
         proposals_dir = settings.resolve_path("storage/llm_wiki/proposals")
         existing = {p.stem.upper() for p in proposals_dir.glob("O-*.md")} if proposals_dir.exists() else set()
         missing = sorted(rag_codes - existing)
+        current: list[str] = []
+        stale: list[str] = []
+        for codigo in sorted(rag_codes & existing):
+            path = proposals_dir / f"{codigo}.md"
+            try:
+                with path.open("r", encoding="utf-8") as handle:
+                    head = handle.read(2048)
+            except OSError:
+                stale.append(codigo)
+                continue
+            if "wiki_schema: evidence-v3" in head:
+                current.append(codigo)
+            else:
+                stale.append(codigo)
+        repair = sorted(set(missing + stale))
         return {
             "rag_count": len(rag_codes),
             "wiki_pages": len(existing),
             "missing_wiki": len(missing),
             "missing_codes": missing,
+            "wiki_current": len(current),
+            "wiki_stale": len(stale),
+            "stale_codes": stale,
+            "wiki_repair_pending": len(repair),
+            "repair_codes": repair,
         }
 
     # ---- sync per code ----
@@ -280,6 +310,7 @@ class ProposalSyncService:
         force_wiki: bool = False,
         build_embeddings: bool = True,
         source_files: list[dict] | None = None,
+        defer_wiki_reindex: bool = False,
     ) -> dict:
         codigo = normalize_offer_code(codigo) or codigo.upper().strip()
         result = {
@@ -450,7 +481,11 @@ class ProposalSyncService:
 
         # 6. Wiki autocompile
         try:
-            wiki_res = await self.wiki_compiler.compile_for_proposal(codigo, force=force_wiki)
+            wiki_res = await self.wiki_compiler.compile_for_proposal(
+                codigo,
+                force=force_wiki,
+                defer_reindex=defer_wiki_reindex,
+            )
             result["wiki_status"] = wiki_res.get("status")
             result["wiki_path"] = wiki_res.get("path")
             result["wiki_entry_id"] = wiki_res.get("entry_id")
@@ -520,6 +555,9 @@ class ProposalSyncService:
 
         if codigos:
             target = [normalize_offer_code(c) or c.upper() for c in codigos]
+        elif force:
+            # Reanudable: una página evidence-v3 ya terminada no se regenera.
+            target = self.discover_wiki_gaps()["repair_codes"]
         else:
             gap = self.discover_wiki_gaps()
             target = gap["missing_codes"]
@@ -535,11 +573,25 @@ class ProposalSyncService:
         async def worker(codigo: str) -> dict:
             async with sem:
                 try:
-                    outcome = await self.wiki_compiler.compile_for_proposal(codigo, force=force)
+                    outcome = await self.wiki_compiler.compile_for_proposal(
+                        codigo,
+                        force=force,
+                        defer_reindex=True,
+                    )
                 except Exception as exc:  # noqa: BLE001
                     outcome = {"codigo": codigo, "status": "error", "error": str(exc)}
                 if outcome.get("status") == "ok":
                     self.pipeline.record_wiki_success(codigo, outcome)
+                elif outcome.get("status") == "invalid_rag":
+                    cleanup = self._purge_invalid_index(
+                        codigo,
+                        self.pipeline.get(codigo) or {},
+                        reindex_wiki=False,
+                    )
+                    outcome["cleanup"] = cleanup
+                    self.pipeline.record_invalidated(codigo, outcome.get("error") or "RAG contaminado")
+                elif outcome.get("status") not in {"skipped", "no_rag"}:
+                    self.pipeline.record_failure(codigo, outcome)
                 async with progress_lock:
                     progress["done"] += 1
                     if progress["done"] % 25 == 0 or progress["done"] == total:
@@ -559,12 +611,26 @@ class ProposalSyncService:
                 return outcome
 
         await asyncio.gather(*(worker(c) for c in target))
+        invalidated = [row for row in counters.by_code if row.get("status") == "invalid_rag"]
+        wiki_reindexed = False
+        wiki_reindex_error = None
+        if counters.wiki_ok or invalidated:
+            # Una sola reconstrucción global hace visibles las páginas nuevas y
+            # evita reindexar el corpus por cada propuesta del lote.
+            try:
+                self.wiki.reindex_entries()
+                wiki_reindexed = True
+            except Exception as exc:  # noqa: BLE001
+                wiki_reindex_error = f"{type(exc).__name__}: {exc}"
         return {
             "target_count": total,
             "wiki_ok": counters.wiki_ok,
             "wiki_skipped": counters.wiki_skipped,
             "wiki_no_rag": counters.wiki_no_rag,
             "wiki_error": counters.wiki_error,
+            "invalid_rag": len(invalidated),
+            "wiki_reindexed": wiki_reindexed,
+            "wiki_reindex_error": wiki_reindex_error,
             "details": counters.by_code,
         }
 
@@ -629,7 +695,13 @@ class ProposalSyncService:
                 detected.add(code)
         return detected
 
-    def _purge_invalid_index(self, codigo: str, state: dict) -> dict:
+    def _purge_invalid_index(
+        self,
+        codigo: str,
+        state: dict,
+        *,
+        reindex_wiki: bool = True,
+    ) -> dict:
         """Retira RAG/Wiki contaminados, limitado al codigo comprobado."""
         codigo = codigo.upper()
         removed: dict[str, int | bool | str] = {}
@@ -685,14 +757,16 @@ class ProposalSyncService:
                 cache_dir.rmdir()
         removed["cache_files"] = cache_files_removed
         StructuredWikiService.invalidate_sync_cache()
-        try:
-            self.wiki.reindex_entries()
-            removed["wiki_reindexed"] = True
-        except Exception as exc:  # noqa: BLE001
-            # La fuente contaminada ya quedo fuera de las tablas consultables.
-            # Mantener el reproceso pendiente es preferible a restaurarla.
+        if reindex_wiki:
+            try:
+                self.wiki.reindex_entries()
+                removed["wiki_reindexed"] = True
+            except Exception as exc:  # noqa: BLE001
+                # La fuente contaminada ya quedó fuera de las tablas consultables.
+                removed["wiki_reindexed"] = False
+                removed["wiki_reindex_error"] = f"{type(exc).__name__}: {exc}"
+        else:
             removed["wiki_reindexed"] = False
-            removed["wiki_reindex_error"] = f"{type(exc).__name__}: {exc}"
         return removed
 
     def _ganadas_master_rows(self) -> list[dict]:

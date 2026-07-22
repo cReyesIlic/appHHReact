@@ -11,6 +11,8 @@ Config via env:
   SYNC_SCHEDULE_LIMIT     = máximo de propuestas por corrida (default 20)
   SYNC_SOURCE_RECHECK_LIMIT = fuentes ya indexadas a revisar por corrida (default 200)
   SYNC_SCHEDULE_TZ        = zona horaria IANA (default America/Santiago)
+  WIKI_REBUILD_ON_STARTUP = migra Wiki antigua al arrancar (default true)
+  WIKI_REBUILD_DAILY_LIMIT = lote de respaldo dentro del ciclo diario (default 25)
 
 El scheduler es **idempotente**: si el App Service reinicia, la próxima corrida
 agendada al ciclo siguiente seguirá funcionando. No requiere job store persistente
@@ -32,6 +34,8 @@ logger = logging.getLogger("shimin.scheduler")
 _scheduler: Any = None
 _last_run: dict | None = None
 _last_master_run: dict | None = None
+_last_wiki_rebuild: dict | None = None
+_wiki_rebuild_running = False
 
 
 def _bool_env(name: str, default: bool) -> bool:
@@ -73,6 +77,13 @@ async def _run_sync_ganadas() -> None:
         master_result = await _run_master_refresh(send_email=False)
         svc = ProposalSyncService()
         result = await svc.sync_ganadas(limit=limit)
+        wiki_migration = None
+        if not _wiki_rebuild_running:
+            wiki_migration = await svc.backfill_wiki(
+                force=True,
+                limit=_int_env("WIKI_REBUILD_DAILY_LIMIT", 25),
+                concurrency=_int_env("WIKI_REBUILD_CONCURRENCY", 4),
+            )
         _last_run = {
             "started_at": started_at.isoformat(timespec="seconds"),
             "finished_at": datetime.now().isoformat(timespec="seconds"),
@@ -83,6 +94,12 @@ async def _run_sync_ganadas() -> None:
             "objetivo": result.get("objetivo_corrida"),
             "email": result.get("email"),
             "master_refresh": master_result,
+            "wiki_migration": {
+                "target_count": wiki_migration.get("target_count"),
+                "wiki_ok": wiki_migration.get("wiki_ok"),
+                "wiki_error": wiki_migration.get("wiki_error"),
+                "invalid_rag": wiki_migration.get("invalid_rag"),
+            } if wiki_migration is not None else {"status": "full_rebuild_running"},
         }
         logger.info(
             "[scheduler] sync_ganadas done: ingested=%s errors=%s wiki_ok=%s",
@@ -130,6 +147,46 @@ async def _run_storage_monitor() -> None:
                 logger.warning("[scheduler] storage_monitor alert email sent (%.1f%%)", stats["utilization"] * 100)
     except Exception:  # noqa: BLE001
         logger.exception("[scheduler] storage_monitor failed")
+
+
+async def _run_wiki_rebuild() -> None:
+    """Migración puntual: recompila toda Wiki existente y retira RAG cruzado."""
+    from app.services.proposal_sync_service import ProposalSyncService
+
+    global _last_wiki_rebuild, _wiki_rebuild_running
+    if _wiki_rebuild_running:
+        return
+    _wiki_rebuild_running = True
+    started_at = datetime.now()
+    limit = _int_env("WIKI_REBUILD_LIMIT", 0) or None
+    concurrency = _int_env("WIKI_REBUILD_CONCURRENCY", 4)
+    logger.info("[scheduler] wiki_rebuild start limit=%s concurrency=%s", limit, concurrency)
+    try:
+        result = await ProposalSyncService().backfill_wiki(
+            force=True,
+            limit=limit,
+            concurrency=concurrency,
+        )
+        _last_wiki_rebuild = {
+            "started_at": started_at.isoformat(timespec="seconds"),
+            "finished_at": datetime.now().isoformat(timespec="seconds"),
+            "ok": True,
+            "target_count": result.get("target_count"),
+            "wiki_ok": result.get("wiki_ok"),
+            "wiki_error": result.get("wiki_error"),
+            "invalid_rag": result.get("invalid_rag"),
+        }
+        logger.info("[scheduler] wiki_rebuild done: %s", _last_wiki_rebuild)
+    except Exception as exc:  # noqa: BLE001
+        _last_wiki_rebuild = {
+            "started_at": started_at.isoformat(timespec="seconds"),
+            "finished_at": datetime.now().isoformat(timespec="seconds"),
+            "ok": False,
+            "error": f"{type(exc).__name__}: {exc}",
+        }
+        logger.exception("[scheduler] wiki_rebuild failed")
+    finally:
+        _wiki_rebuild_running = False
 
 
 async def _run_master_refresh(send_email: bool = True) -> dict:
@@ -224,6 +281,10 @@ def start_scheduler() -> dict:
 
     sched.start()
     _scheduler = sched
+    if _bool_env("WIKI_REBUILD_ON_STARTUP", True):
+        # Es reanudable: el compilador sólo toma páginas sin evidence-v3.
+        # Esto termina la migración aunque App Service reinicie durante el lote.
+        asyncio.create_task(_run_wiki_rebuild())
     logger.info(
         "[scheduler] iniciado tz=%s hours=%s minute=%s limit=%s",
         tz, hours, minute, _int_env("SYNC_SCHEDULE_LIMIT", 20),
@@ -249,7 +310,13 @@ def shutdown_scheduler() -> None:
 
 def scheduler_status() -> dict:
     if _scheduler is None or not getattr(_scheduler, "running", False):
-        return {"running": False, "last_run": _last_run, "last_master_run": _last_master_run}
+        return {
+            "running": False,
+            "last_run": _last_run,
+            "last_master_run": _last_master_run,
+            "last_wiki_rebuild": _last_wiki_rebuild,
+            "wiki_rebuild_running": _wiki_rebuild_running,
+        }
     jobs = []
     for j in _scheduler.get_jobs():
         nxt = getattr(j, "next_run_time", None)
@@ -265,6 +332,8 @@ def scheduler_status() -> dict:
         "jobs": jobs,
         "last_run": _last_run,
         "last_master_run": _last_master_run,
+        "last_wiki_rebuild": _last_wiki_rebuild,
+        "wiki_rebuild_running": _wiki_rebuild_running,
     }
 
 
@@ -280,4 +349,9 @@ async def trigger_now(job: str = "sync_ganadas") -> dict:
     if job == "storage_monitor":
         asyncio.create_task(_run_storage_monitor())
         return {"triggered": "storage_monitor", "status": "running_in_background"}
-    return {"error": f"job '{job}' desconocido (usar 'sync_ganadas', 'master_refresh' o 'storage_monitor')"}
+    if job == "wiki_rebuild":
+        if _wiki_rebuild_running:
+            return {"triggered": "wiki_rebuild", "status": "already_running"}
+        asyncio.create_task(_run_wiki_rebuild())
+        return {"triggered": "wiki_rebuild", "status": "running_in_background"}
+    return {"error": f"job '{job}' desconocido (usar 'sync_ganadas', 'master_refresh', 'storage_monitor' o 'wiki_rebuild')"}

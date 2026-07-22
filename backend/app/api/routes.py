@@ -320,6 +320,10 @@ def sync_status() -> dict:
         "rag_proposals": gap["rag_count"],
         "wiki_missing": gap["missing_wiki"],
         "missing_codes_preview": gap["missing_codes"][:20],
+        "wiki_current": gap["wiki_current"],
+        "wiki_stale": gap["wiki_stale"],
+        "wiki_repair_pending": gap["wiki_repair_pending"],
+        "repair_codes_preview": gap["repair_codes"][:20],
         "pipeline": svc.pipeline.status(),
     }
 

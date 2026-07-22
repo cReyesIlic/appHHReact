@@ -413,11 +413,43 @@ class PipelineRegistryTests(SettingsPathsMixin, unittest.IsolatedAsyncioTestCase
         }
         service.wiki_compiler.compile_for_proposal = AsyncMock(return_value=outcome)
         service.pipeline = Mock()
+        service.wiki = Mock()
 
         result = await service.backfill_wiki(codigos=["O-9999"], force=True, concurrency=1)
 
         self.assertEqual(result["wiki_ok"], 1)
         service.pipeline.record_wiki_success.assert_called_once_with("O-9999", outcome)
+        service.wiki_compiler.compile_for_proposal.assert_awaited_once_with(
+            "O-9999", force=True, defer_reindex=True
+        )
+        service.wiki.reindex_entries.assert_called_once_with()
+
+    async def test_wiki_rebuild_is_resumable_by_schema_marker(self):
+        with tempfile.TemporaryDirectory() as temp_dir, self.patch_settings(temp_dir):
+            base = Path(temp_dir)
+
+            def resolve_temp(value):
+                path = Path(value)
+                return path if path.is_absolute() else base / path
+
+            with patch.object(type(settings), "resolve_path", lambda _self, value: resolve_temp(value)):
+                proposals = base / "storage/llm_wiki/proposals"
+                proposals.mkdir(parents=True)
+                (proposals / "O-1000.md").write_text(
+                    "---\nwiki_schema: evidence-v3\n---\n# vigente", encoding="utf-8"
+                )
+                (proposals / "O-1001.md").write_text(
+                    "---\nwiki_schema: legacy\n---\n# antigua", encoding="utf-8"
+                )
+                service = object.__new__(ProposalSyncService)
+                service._codigos_with_rag = Mock(return_value={"O-1000", "O-1001", "O-1002"})
+
+                gaps = service.discover_wiki_gaps()
+
+            self.assertEqual(gaps["wiki_current"], 1)
+            self.assertEqual(gaps["wiki_stale"], 1)
+            self.assertEqual(gaps["missing_wiki"], 1)
+            self.assertEqual(gaps["repair_codes"], ["O-1001", "O-1002"])
 
 
 class WikiReprocessTests(SettingsPathsMixin, unittest.IsolatedAsyncioTestCase):
@@ -522,6 +554,65 @@ class WikiReprocessTests(SettingsPathsMixin, unittest.IsolatedAsyncioTestCase):
                 del compiler, wiki
                 gc.collect()
 
+    async def test_compiler_rejects_rag_whose_file_belongs_to_another_offer(self):
+        with tempfile.TemporaryDirectory() as temp_dir, self.patch_settings(temp_dir):
+            base = Path(temp_dir)
+            with patch.object(type(settings), "resolve_path", lambda _self, value: base / value):
+                ParentChildIndexer().index_parse_result(
+                    "O-9999",
+                    {
+                        "text": "## Alcance\nEste texto fue indexado bajo el código equivocado y no se debe reutilizar.",
+                        "pages": [],
+                    },
+                    {
+                        "codigo": "O-9999",
+                        "archivo_nombre": "Oferta Técnica O-8888.pdf",
+                        "source_path": "storage/proposals/O-8888/Oferta Técnica O-8888.pdf",
+                        "document_title": "O-8888 - Oferta contaminante",
+                    },
+                )
+                compiler = WikiAutoCompiler()
+                compiler.llm.client = None
+
+                result = await compiler.compile_for_proposal("O-9999", force=True)
+
+                self.assertEqual(result["status"], "invalid_rag")
+                self.assertGreater(result["invalid_parent_count"], 0)
+                self.assertFalse((base / "storage/llm_wiki/proposals/O-9999.md").exists())
+                del compiler
+                gc.collect()
+
+    def test_material_selection_prioritizes_scope_and_deliverables(self):
+        with tempfile.TemporaryDirectory() as temp_dir, self.patch_settings(temp_dir):
+            indexer = ParentChildIndexer()
+            metadata = {
+                "codigo": "O-9999",
+                "archivo_nombre": "Oferta Técnica O-9999.pdf",
+                "source_path": "storage/proposals/O-9999/Oferta Técnica O-9999.pdf",
+            }
+            indexer.index_parse_result(
+                "O-9999",
+                {
+                    "text": (
+                        "## Portada\n" + "Texto administrativo sin detalle. " * 20
+                        + "\n## Alcance del servicio\n" + "Diseñar la impulsión y verificar transientes. " * 20
+                        + "\n## Entregables\n" + "Memoria de cálculo, planos y especificaciones técnicas. " * 20
+                    ),
+                    "pages": [],
+                },
+                metadata,
+            )
+            compiler = WikiAutoCompiler()
+
+            material = compiler._collect_rag_material("O-9999", max_parents=2)
+
+            titles = [row["title"].lower() for row in material["parents"]]
+            self.assertTrue(any("alcance" in title for title in titles))
+            self.assertTrue(any("entregables" in title for title in titles))
+            self.assertEqual(material["invalid_parent_count"], 0)
+            del compiler
+            gc.collect()
+
 
 class ChatToolRegistryTests(unittest.TestCase):
     def test_every_exposed_tool_has_exactly_one_dispatch_handler(self):
@@ -613,6 +704,7 @@ class SchedulerReliabilityTests(unittest.IsolatedAsyncioTestCase):
                 "SYNC_SCHEDULE_HOURS": "2",
                 "SYNC_SCHEDULE_TZ": "America/Santiago",
                 "SYNC_SCHEDULE_MINUTE": "15",
+                "WIKI_REBUILD_ON_STARTUP": "false",
             },
             clear=False,
         ):
