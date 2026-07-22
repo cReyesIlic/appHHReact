@@ -1,4 +1,5 @@
 import re as _re
+import sqlite3
 
 from fastapi import APIRouter, File, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse
@@ -23,7 +24,7 @@ def _validate_codigo(codigo: str, *, prefix: str | None = None) -> str:
     return norm
 
 from app.agents.orchestrator import AgentOrchestrator
-from app.schemas import ChatMessage, ChatRequest, ChatResponse, ChatSessionCreateRequest, ChatSessionRenameRequest, ExportRequest, IngestBatchRequest, MasterSearchRequest, MemoryRequest, ProposalSupportRequest, WikiAutoCreateRequest, WikiBuildRequest, WikiEntryRequest, WikiSearchRequest, WikiValidateRequest
+from app.schemas import ChatMessage, ChatRequest, ChatResponse, ChatSessionCreateRequest, ChatSessionRenameRequest, ExportRequest, IngestBatchRequest, MasterSearchRequest, MemoryRequest, ProposalSupportRequest, ToolTrace, WikiAutoCreateRequest, WikiBuildRequest, WikiEntryRequest, WikiSearchRequest, WikiValidateRequest
 from app.services.chat_sessions import ChatSessionService
 from app.services.search_filters import SearchFilters, valid_categorias, valid_estados, valid_tipos_servicio
 from app.services.exports import ExportService
@@ -87,6 +88,30 @@ async def chat(request: ChatRequest, http_request: Request) -> ChatResponse:
 
         response = await orchestrator.run(request)
         response.session_id = session_id
+
+        # La consulta del draft también alimenta su Wiki de trabajo visible.
+        active_draft = (request.working_context or {}).get("active_draft") or {}
+        draft_slug = str(active_draft.get("slug") or "").strip()
+        draft_stage = str(active_draft.get("stage") or "").strip().casefold()
+        if draft_slug and draft_stage and response.answer:
+            try:
+                workspace_section = ProposalDraftService().save_workspace_section(
+                    user.id,
+                    draft_slug,
+                    draft_stage,
+                    response.answer,
+                    tables=response.tables,
+                    sources=[source.model_dump() for source in response.sources],
+                )
+                response.working_context.setdefault("active_draft", active_draft)
+                response.working_context["workspace_updated"] = {
+                    "key": workspace_section["key"],
+                    "updated_at": workspace_section["updated_at"],
+                }
+            except (KeyError, OSError, ValueError, sqlite3.Error) as exc:
+                response.trace.append(
+                    ToolTrace(tool="draft.workspace", status="warning", detail=str(exc))
+                )
 
         # Persistir respuesta y working_context actualizado
         if session_id:

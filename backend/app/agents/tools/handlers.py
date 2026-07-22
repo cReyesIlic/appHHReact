@@ -164,12 +164,47 @@ async def search_master(
     }
 
 
-async def search_rag(ctx: ToolContext, query: str | None = None, filters: dict | None = None, limit: int = 8) -> dict:
-    f = _filters(filters, query=query, limit=limit)
-    hits = await ctx.hybrid_rag.search(f.query or "", filters=f, limit=limit)
+async def search_rag(
+    ctx: ToolContext,
+    query: str | None = None,
+    queries: list[str] | None = None,
+    filters: dict | None = None,
+    limit: int = 8,
+) -> dict:
+    """Busca varias formulaciones semánticas y fusiona los resultados."""
+    variants: list[str] = []
+    for value in [*(queries or []), query]:
+        clean = str(value or "").strip()
+        if clean and clean.casefold() not in {item.casefold() for item in variants}:
+            variants.append(clean)
+    variants = variants[:6] or [""]
+
+    async def run_variant(value: str) -> tuple[str, list[dict]]:
+        effective = _filters(filters, query=value, limit=limit)
+        return value, await ctx.hybrid_rag.search(value, filters=effective, limit=limit)
+
+    groups = await asyncio.gather(*(run_variant(value) for value in variants))
+    merged: dict[tuple, dict] = {}
+    coverage: list[dict] = []
+    for variant, variant_hits in groups:
+        coverage.append({"query": variant, "hits": len(variant_hits)})
+        for hit in variant_hits:
+            compact = _compact_rag_hit(hit)
+            compact["matched_query"] = variant
+            key = (compact.get("codigo"), compact.get("title"), compact.get("summary"))
+            previous = merged.get(key)
+            if previous is None or float(compact.get("score") or 0) > float(previous.get("score") or 0):
+                merged[key] = compact
+    hits = sorted(
+        merged.values(),
+        key=lambda item: float(item.get("score") or 0),
+        reverse=True,
+    )[:limit]
     return {
         "count": len(hits),
-        "hits": [_compact_rag_hit(h) for h in hits[:limit]],
+        "hits": hits,
+        "queries_used": variants,
+        "coverage": coverage,
     }
 
 
@@ -234,9 +269,11 @@ async def compute_economics(ctx: ToolContext, codigos: list[str] | None = None, 
         master_rows = ctx.master.search(codigo=code, limit=1)
         rows.extend(master_rows)
     result = await ctx.economics.analyze(rows, limit=limit)
+    result_rows = result.get("rows", [])
     return {
-        "rows": result.get("rows", []),
+        "rows": result_rows,
         "summary": result.get("summary", {}),
+        "tables": [{"name": "Economía de referencias", "rows": result_rows}],
     }
 
 
@@ -249,6 +286,9 @@ async def compute_proposal_support(ctx: ToolContext, query: str, codigos: list[s
         "referencias_hh_entregables": result.get("referencias_hh_entregables", [])[:5],
         "texto_sugerido_pdf": result.get("texto_sugerido_pdf", [])[:3],
         "gaps_a_validar": result.get("gaps_a_validar", [])[:6],
+        "entity_expansions": result.get("entity_expansions", [])[:18],
+        "deepening_plan": result.get("deepening_plan", [])[:8],
+        "tables": result.get("tables", [])[:2],
     }
 
 
@@ -258,11 +298,13 @@ async def get_proposal_detail(ctx: ToolContext, codigo: str) -> dict:
     f = SearchFilters(codigos=[upper], limit=6)
     rag_hits = await ctx.hybrid_rag.search("", filters=f, limit=6)
     wiki_entries = ctx.wiki.search_entries(query=upper, limit=4)
+    compact_master = [_compact_master_row(r) for r in master_rows]
     return {
         "codigo": upper,
-        "master_rows": [_compact_master_row(r) for r in master_rows],
+        "master_rows": compact_master,
         "rag_hits": [_compact_rag_hit(h) for h in rag_hits],
         "wiki_entries": [_compact_wiki_entry(e) for e in wiki_entries],
+        "tables": [{"name": f"Ficha comercial {upper}", "rows": compact_master}],
     }
 
 
@@ -485,13 +527,27 @@ async def search_entregables_hh(
     if "error" in result:
         return result
     detalle = result.get("detalle") or []
+    compacted = [_compact_entregable(row) for row in detalle[:top]]
+    table_rows = [
+        {
+            "proyecto": row.get("proyecto_codigo"),
+            "oferta": row.get("codigo_prop"),
+            "entregable": row.get("entregable_nombre"),
+            "disciplina": row.get("disciplina"),
+            "hh_reales": row.get("horas_totales"),
+            "personas": row.get("personas_count"),
+            "cliente": row.get("cliente_resuelto"),
+        }
+        for row in compacted
+    ]
     return {
         "resumen": result.get("resumen") or {},
         "distribucion_disciplina": result.get("distribucion_disciplina") or {},
         "distribucion_cliente": result.get("distribucion_cliente") or {},
         "distribucion_servicio": result.get("distribucion_servicio") or {},
         "count": len(detalle),
-        "entregables": [_compact_entregable(row) for row in detalle[:top]],
+        "entregables": compacted,
+        "tables": [{"name": "HH reales de entregables comparables", "rows": table_rows}],
     }
 
 
@@ -525,21 +581,23 @@ async def get_horas_detalle(
     if "error" in result:
         return result
     detalle = result.get("detalle") or []
+    rows = [
+        {
+            "usuario_id": r.get("usuario_id"),
+            "nombre": r.get("nombre"),
+            "ano": r.get("ano"),
+            "semana": r.get("semana"),
+            "horas": r.get("horas"),
+            "entregable_id": r.get("entregable_id"),
+            "proyecto_codigo": r.get("proyecto_codigo"),
+            "cliente_resuelto": r.get("cliente_resuelto"),
+        }
+        for r in detalle[:limit]
+    ]
     return {
         "count": len(detalle),
-        "filas": [
-            {
-                "usuario_id": r.get("usuario_id"),
-                "nombre": r.get("nombre"),
-                "ano": r.get("ano"),
-                "semana": r.get("semana"),
-                "horas": r.get("horas"),
-                "entregable_id": r.get("entregable_id"),
-                "proyecto_codigo": r.get("proyecto_codigo"),
-                "cliente_resuelto": r.get("cliente_resuelto"),
-            }
-            for r in detalle[:limit]
-        ],
+        "filas": rows,
+        "tables": [{"name": "Detalle auditable de HH", "rows": rows}],
     }
 
 
@@ -557,6 +615,17 @@ async def get_proyecto_staffing(ctx: ToolContext, codigo: str, ano: int | None =
     proyecto = result.get("proyecto") or {}
     entregables = result.get("entregables") or []
     personas = result.get("personas") or []
+    compact_deliverables = [_compact_entregable(e) for e in entregables[:30]]
+    compact_people = [
+        {
+            "usuario_id": p.get("usuario_id"),
+            "nombre": p.get("nombre"),
+            "disciplina": p.get("disciplina"),
+            "cargo": p.get("cargo"),
+            "horas_totales": p.get("horas_totales") or p.get("hh"),
+        }
+        for p in personas[:30]
+    ]
     return {
         "proyecto": {
             "codigo": proyecto.get("codigo") or codigo,
@@ -566,17 +635,12 @@ async def get_proyecto_staffing(ctx: ToolContext, codigo: str, ano: int | None =
             "horas_totales": proyecto.get("horas_totales"),
         },
         "entregables_count": len(entregables),
-        "entregables": [_compact_entregable(e) for e in entregables[:30]],
+        "entregables": compact_deliverables,
         "personas_count": len(personas),
-        "personas": [
-            {
-                "usuario_id": p.get("usuario_id"),
-                "nombre": p.get("nombre"),
-                "disciplina": p.get("disciplina"),
-                "cargo": p.get("cargo"),
-                "horas_totales": p.get("horas_totales") or p.get("hh"),
-            }
-            for p in personas[:30]
+        "personas": compact_people,
+        "tables": [
+            {"name": f"Entregables reales {codigo.upper()}", "rows": compact_deliverables},
+            {"name": f"Equipo real {codigo.upper()}", "rows": compact_people},
         ],
     }
 
@@ -676,6 +740,23 @@ async def get_draft_context(ctx: ToolContext, slug: str, include_guide: bool = T
             }
             for f in draft.get("files") or []
         ],
+        "workspace_sections": [
+            {
+                "key": section.get("key"),
+                "title": section.get("title"),
+                "content": str(section.get("content") or "")[:10000],
+                "tables": [
+                    {
+                        **table,
+                        "rows": (table.get("rows") or [])[:20],
+                        "rows_total": len(table.get("rows") or []),
+                    }
+                    for table in (section.get("tables") or [])[:4]
+                    if isinstance(table, dict)
+                ],
+            }
+            for section in draft.get("workspace_sections") or []
+        ],
     }
     if include_guide and draft.get("guide_exists"):
         out["guide"] = ctx.drafts.get_guide(user.id, slug)
@@ -700,6 +781,73 @@ async def search_draft_chunks(ctx: ToolContext, slug: str, query: str, limit: in
         hit["title"] = filename or f"Antecedente {slug}"
         hit["url"] = f"/api/drafts/{quote(slug, safe='')}/files/{quote(filename, safe='')}"
     return {"count": len(hits), "hits": hits}
+
+
+async def analyze_draft_document_register(ctx: ToolContext, slug: str) -> dict:
+    """Cuenta y clasifica los documentos que deberán revisarse en el draft."""
+    user = get_current_user()
+    try:
+        result = ctx.drafts.analyze_document_register(user.id, slug)
+    except KeyError:
+        return {"error": f"draft '{slug}' no encontrado"}
+    discipline_rows = [
+        {"disciplina": key, "documentos": value}
+        for key, value in sorted(result["by_discipline"].items())
+    ]
+    type_rows = [
+        {"tipo_documento": key, "documentos": value}
+        for key, value in sorted(result["by_type"].items())
+    ]
+    return {
+        "total_documents": result["total_documents"],
+        "by_discipline": result["by_discipline"],
+        "by_type": result["by_type"],
+        "by_area": result["by_area"],
+        "sample_documents": result["documents"][:24],
+        "tables": [
+            {"name": "Documentos a revisar por disciplina", "rows": discipline_rows},
+            {"name": "Documentos a revisar por tipo", "rows": type_rows},
+        ],
+    }
+
+
+async def estimate_draft_review_hours(
+    ctx: ToolContext,
+    slug: str,
+    default_hours: float = 5.0,
+    hours_by_type: dict[str, float] | None = None,
+    discipline_factors: dict[str, float] | None = None,
+    general_activities: dict[str, float] | None = None,
+    basis: str = "",
+) -> dict:
+    """Estima REVISIÓN documental con parámetros elegidos por el agente, no elaboración."""
+    user = get_current_user()
+    try:
+        result = ctx.drafts.estimate_document_review_hours(
+            user.id,
+            slug,
+            default_hours=default_hours,
+            hours_by_type=hours_by_type,
+            discipline_factors=discipline_factors,
+            general_activities=general_activities,
+            basis=basis,
+        )
+    except (KeyError, TypeError, ValueError) as exc:
+        return {"error": str(exc)}
+    return {
+        "basis": result["basis"],
+        "total_documents": result["total_documents"],
+        "review_hours": result["review_hours"],
+        "general_hours": result["general_hours"],
+        "total_hours": result["total_hours"],
+        "discipline_totals": result["discipline_totals"],
+        "general_rows": result["general_rows"],
+        "tables": [
+            {"name": "Estimación de revisión por disciplina", "rows": result["discipline_totals"]},
+            {"name": "HH de actividades generales", "rows": result["general_rows"]},
+            {"name": "Estimación por documento a revisar", "rows": result["document_rows"]},
+        ],
+    }
 
 
 async def import_draft_from_sharepoint(ctx: ToolContext, slug: str, codigo: str) -> dict:

@@ -158,31 +158,80 @@ _DRAFT_CORE_TOOLS = {
     "search_master",
     "search_rag",
     "search_proposal_index",
+    "search_entities",
     "compute_proposal_support",
     "get_draft_context",
     "search_draft_chunks",
+    "analyze_draft_document_register",
     "import_draft_from_sharepoint",
 }
 _DRAFT_COST_TOOLS = {
     "compute_economics",
     "get_hh_licitadas",
     "search_entregables_hh",
+    "get_horas_detalle",
     "get_proyecto_staffing",
+    "estimate_draft_review_hours",
 }
+DRAFT_DEEP_TOOLS = {"get_proposal_detail", "read_pdf_deep"}
 DRAFT_TOOL_TIMEOUT_SECONDS = 10
-DRAFT_LLM_TIMEOUT_SECONDS = 15
+DRAFT_TOOL_TIMEOUTS = {
+    "read_pdf_deep": 30,
+    "get_hh_licitadas": 35,
+    "search_entregables_hh": 25,
+    "get_horas_detalle": 25,
+    "get_proyecto_staffing": 25,
+}
+DRAFT_LLM_TIMEOUT_SECONDS = 20
 DRAFT_MAX_ITERATIONS = 3
 
 
-def draft_tool_schemas(question: str) -> list[dict]:
+def draft_tool_schemas(question: str, stage: str | None = None) -> list[dict]:
     """Expone al draft solo herramientas pertinentes y evita ramas costosas accidentales."""
     allowed = set(_DRAFT_CORE_TOOLS)
     normalized = str(question or "").casefold()
-    if re.search(r"\b(hh|horas|costo|costos|costear|monto|tarifa|presupuesto)\b", normalized):
+    stage_key = str(stage or "").casefold()
+    if stage_key in {"references", "deliverables", "hours"}:
+        allowed.update(DRAFT_DEEP_TOOLS)
+    if stage_key in {"deliverables", "hours"}:
+        allowed.update({"get_hh_licitadas", "search_entregables_hh"})
+    if stage_key == "hours" or re.search(r"\b(hh|horas|costo|costos|costear|monto|tarifa|presupuesto)\b", normalized):
         allowed.update(_DRAFT_COST_TOOLS)
     if re.search(r"\b(?:o|sh)-\d{2,6}\b", normalized):
         allowed.add("get_proposal_detail")
     return [schema for schema in TOOL_SCHEMAS if schema.get("function", {}).get("name") in allowed]
+
+
+DRAFT_STAGE_INSTRUCTIONS = {
+    "scope": (
+        "Extrae requisitos del cliente desde todos los antecedentes: alcance, plazo, documentos, "
+        "disciplinas, entregables exigidos, restricciones y preguntas. No busques costos todavía."
+    ),
+    "references": (
+        "Investiga referencias con amplitud semántica, no literal. Usa Wiki, Master, índice, entidades "
+        "y RAG con 3-6 queries distintas. Prioriza ganadas, identifica tablas útiles y profundiza en "
+        "los 2-3 códigos más comparables. Entrega una tabla de referencias y sus límites."
+    ),
+    "deliverables": (
+        "Construye la metodología y matriz de entregables de la oferta nueva. Revisa tablas históricas "
+        "de propuestas comparables y distingue documentos a revisar, actividades de coordinación e "
+        "informe final. Entrega tablas con disciplina, producto, responsable y criterio de aceptación."
+    ),
+    "hours": (
+        "Estima HH de REVISIÓN, no de elaboración. Primero usa analyze_draft_document_register. Luego "
+        "busca evidencia histórica específica de revisión de ingeniería, tablas HH licitadas y HH reales. "
+        "Finalmente llama estimate_draft_review_hours con tasas justificadas. Separa revisión por documento, "
+        "coordinación, QA/QC, gestión de observaciones e informe final; muestra escenario base y supuestos."
+    ),
+    "proposal": (
+        "Integra las secciones ya guardadas de la Wiki de trabajo en una propuesta técnica coherente, "
+        "sin rehacer búsquedas resueltas. Señala decisiones pendientes y contradicciones entre secciones."
+    ),
+    "notes": (
+        "Responde la consulta concreta usando el draft y las secciones acumuladas. Si modifica una "
+        "conclusión anterior, explica el cambio y la evidencia nueva."
+    ),
+}
 
 
 @dataclass
@@ -231,7 +280,8 @@ class AgentLoop:
             user_payload["candidatos_de_contexto"] = candidate_codes[:8]
 
         draft_slug = str((active_draft or {}).get("slug") or "").strip()
-        available_tools = draft_tool_schemas(question) if draft_slug else TOOL_SCHEMAS
+        draft_stage = str((active_draft or {}).get("stage") or "notes").strip().casefold()
+        available_tools = draft_tool_schemas(question, draft_stage) if draft_slug else TOOL_SCHEMAS
         iteration_limit = min(self.max_iterations, DRAFT_MAX_ITERATIONS) if draft_slug else self.max_iterations
         llm_timeout = DRAFT_LLM_TIMEOUT_SECONDS if draft_slug else 45
         if draft_slug:
@@ -240,6 +290,18 @@ class AgentLoop:
                 "title": str((active_draft or {}).get("title") or "")[:300],
                 "cliente": str((active_draft or {}).get("cliente") or "")[:200],
                 "brief_text": str((active_draft or {}).get("brief_text") or "")[:20000],
+                "stage": draft_stage,
+            }
+            user_payload["etapa_trabajo"] = {
+                "key": draft_stage,
+                "instruction": DRAFT_STAGE_INSTRUCTIONS.get(
+                    draft_stage,
+                    DRAFT_STAGE_INSTRUCTIONS["notes"],
+                ),
+                "output": (
+                    "Entrega Markdown limpio, autosuficiente y apto para guardarse como sección de una "
+                    "Wiki de trabajo. Incluye tablas y fuentes; distingue evidencia, supuesto y estimación."
+                ),
             }
             draft_context: dict[str, dict] = {}
             draft_query = "\n".join(
@@ -252,6 +314,7 @@ class AgentLoop:
                 if part
             )
             preload_calls = [
+                ("load_skill", {"name": "armar_propuesta"}),
                 (
                     "get_draft_context",
                     {
@@ -416,6 +479,7 @@ class AgentLoop:
                 for name, payload in forced_outputs:
                     self._collect_payload(name, payload, sources, tables, charts, seen_codes)
                 self._dedupe_sources(sources)
+                self._dedupe_tables(tables)
                 return AgentRunResult(
                     answer=self._append_source_links(content.strip() or "(respuesta vacía)", sources),
                     trace=trace,
@@ -479,16 +543,17 @@ class AgentLoop:
                 t_start = time.time()
                 try:
                     if draft_slug:
+                        tool_timeout = DRAFT_TOOL_TIMEOUTS.get(name, DRAFT_TOOL_TIMEOUT_SECONDS)
                         result = await asyncio.wait_for(
                             dispatcher.dispatch(name, args),
-                            timeout=DRAFT_TOOL_TIMEOUT_SECONDS,
+                            timeout=tool_timeout,
                         )
                     else:
                         result = await dispatcher.dispatch(name, args)
                 except asyncio.TimeoutError:
                     result = {
                         "error": (
-                            f"{name} excedió {DRAFT_TOOL_TIMEOUT_SECONDS} segundos; "
+                            f"{name} excedió {tool_timeout} segundos; "
                             "se omitió para responder el draft a tiempo"
                         )
                     }
@@ -506,6 +571,9 @@ class AgentLoop:
                 status = "error" if isinstance(result, dict) and result.get("error") else "ok"
                 trace.append(ToolTrace(tool=f"agent.{name}", status=status, detail=f"{detail} ({latency_ms}ms)"))
                 self._absorb_codes(result, seen_codes)
+                if draft_slug and isinstance(result, dict):
+                    # Conserva tablas completas para la interfaz; el modelo recibe una vista acotada.
+                    self._collect_payload(name, result, sources, tables, charts, seen_codes)
                 messages.append(
                     {
                         "role": "tool",
@@ -520,9 +588,9 @@ class AgentLoop:
         # Fallback: pedir respuesta final sin tools
         try:
             close_instruction = (
-                "Con el draft y la evidencia ya recogida, entrega ahora una propuesta accionable: "
-                "entendimiento, alcance, metodología, entregables, plan/plazo, equipo preliminar, "
-                "supuestos/exclusiones y preguntas por cerrar. No llames más herramientas."
+                f"Cierra ahora la etapa '{draft_stage}' con la evidencia recogida. "
+                f"{DRAFT_STAGE_INSTRUCTIONS.get(draft_stage, DRAFT_STAGE_INSTRUCTIONS['notes'])} "
+                "Entrega Markdown autosuficiente, tablas, supuestos y fuentes. No llames más herramientas."
                 if draft_slug
                 else "Responde ahora con lo recogido. No llames más herramientas."
             )
@@ -546,6 +614,7 @@ class AgentLoop:
         for name, payload in forced_outputs:
             self._collect_payload(name, payload, sources, tables, charts, seen_codes)
         self._dedupe_sources(sources)
+        self._dedupe_tables(tables)
 
         return AgentRunResult(
             answer=self._append_source_links(answer, sources),
@@ -569,7 +638,20 @@ class AgentLoop:
         # Truncar listas largas a 6 elementos
         clipped: dict[str, Any] = {}
         for key, value in result.items():
-            if isinstance(value, list) and len(value) > 6:
+            if key == "tables" and isinstance(value, list):
+                clipped[key] = []
+                for table in value[:4]:
+                    if not isinstance(table, dict):
+                        continue
+                    rows = table.get("rows") or []
+                    clipped[key].append(
+                        {
+                            **table,
+                            "rows": rows[:20] if isinstance(rows, list) else [],
+                            "rows_total": len(rows) if isinstance(rows, list) else 0,
+                        }
+                    )
+            elif isinstance(value, list) and len(value) > 6:
                 clipped[key] = value[:6] + [{"_truncated": len(value) - 6}]
             else:
                 clipped[key] = value
@@ -779,6 +861,20 @@ class AgentLoop:
             seen.add(key)
             unique.append(source)
         sources[:] = unique
+
+    def _dedupe_tables(self, tables: list[dict]) -> None:
+        """Conserva la primera versión (completa) de cada tabla recogida."""
+        unique: list[dict] = []
+        seen: set[str] = set()
+        for index, table in enumerate(tables):
+            if not isinstance(table, dict):
+                continue
+            name = str(table.get("name") or f"table-{index}")
+            if name in seen:
+                continue
+            seen.add(name)
+            unique.append(table)
+        tables[:] = unique
 
     def _append_source_links(self, answer: str, sources: list[Source]) -> str:
         linked: list[Source] = []

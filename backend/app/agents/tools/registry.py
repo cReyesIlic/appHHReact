@@ -87,6 +87,11 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
                 "type": "object",
                 "properties": {
                     "query": {"type": "string"},
+                    "queries": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Variantes semánticas (actividad, producto, disciplina, sinónimos y nombres de tabla) que se consultan y fusionan.",
+                    },
                     "filters": SEARCH_FILTERS_SCHEMA,
                     "limit": {"type": "integer", "default": 8},
                 },
@@ -458,6 +463,53 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
     {
         "type": "function",
         "function": {
+            "name": "analyze_draft_document_register",
+            "description": (
+                "Extrae del PDF/DOCX del draft el registro de documentos A REVISAR. Cuenta códigos "
+                "únicos y los agrupa por área, disciplina y tipo. Debe usarse antes de estimar HH "
+                "de revisión; revisar no equivale a elaborar documentos nuevos."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {"slug": {"type": "string"}},
+                "required": ["slug"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "estimate_draft_review_hours",
+            "description": (
+                "Calcula HH para REVISAR cada documento del registro. El agente elige tasas por tipo "
+                "y factores por disciplina desde evidencia histórica, y separa coordinación e informe."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "slug": {"type": "string"},
+                    "default_hours": {"type": "number", "default": 5.0},
+                    "hours_by_type": {
+                        "type": "object",
+                        "additionalProperties": {"type": "number"},
+                    },
+                    "discipline_factors": {
+                        "type": "object",
+                        "additionalProperties": {"type": "number"},
+                    },
+                    "general_activities": {
+                        "type": "object",
+                        "additionalProperties": {"type": "number"},
+                    },
+                    "basis": {"type": "string"},
+                },
+                "required": ["slug", "default_hours", "basis"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "load_skill",
             "description": (
                 "Carga el playbook (SKILL.md) de una skill SHIMIN por nombre. Las skills definen flujos "
@@ -565,6 +617,8 @@ class ToolDispatcher:
             "list_my_drafts": handlers.list_my_drafts,
             "get_draft_context": handlers.get_draft_context,
             "search_draft_chunks": handlers.search_draft_chunks,
+            "analyze_draft_document_register": handlers.analyze_draft_document_register,
+            "estimate_draft_review_hours": handlers.estimate_draft_review_hours,
             "import_draft_from_sharepoint": handlers.import_draft_from_sharepoint,
             "load_skill": self._load_skill,
         }

@@ -1,7 +1,7 @@
 ---
 name: armar_propuesta
 description: Úsala cuando el usuario está preparando o armando una NUEVA propuesta y necesita referencias, alcance sugerido, HH estimadas y exclusiones. Triggers típicos: "estoy armando", "preparar propuesta", "base para", "alcance similar", "experiencia previa", "qué propuestas sirven", "draft de propuesta", "mi propuesta nueva".
-allowed-tools: search_wiki_entries, compute_proposal_support, search_master, search_rag, compute_economics, get_proposal_detail, save_library_entry, search_entregables_hh, get_proyecto_staffing, list_my_drafts, get_draft_context, search_draft_chunks, import_draft_from_sharepoint
+allowed-tools: search_wiki_entries, compute_proposal_support, search_master, search_rag, search_entities, compute_economics, get_proposal_detail, read_pdf_deep, get_hh_licitadas, search_entregables_hh, get_horas_detalle, get_proyecto_staffing, list_my_drafts, get_draft_context, search_draft_chunks, analyze_draft_document_register, estimate_draft_review_hours, import_draft_from_sharepoint
 ---
 
 # Armar una nueva propuesta SHIMIN
@@ -32,6 +32,22 @@ draft de forma genérica. Para una petición como “ayúdame a armarla”:
 
 La profundidad adicional se trabaja en las siguientes preguntas del mismo chat; no bloquees el
 primer armado intentando completar todo el dossier de ocho secciones en una sola respuesta.
+
+### Etapas de la Wiki de trabajo
+
+Si el payload incluye `etapa_trabajo`, trabaja solamente esa etapa y deja una sección completa:
+
+1. `scope`: requisitos extraídos de los archivos del cliente.
+2. `references`: búsqueda conceptual amplia; combina actividad, producto, disciplina, sinónimos y
+   nombres de tablas. Usa 3-6 variantes en `search_master.queries` y `search_rag.queries`.
+3. `deliverables`: metodología y matriz de entregables, profundizando en tablas históricas.
+4. `hours`: cuenta primero el registro con `analyze_draft_document_register`; busca benchmarks de
+   **revisión** y solo después parametriza `estimate_draft_review_hours`.
+5. `proposal`: integra lo ya guardado sin volver a investigar lo resuelto.
+
+En `hours`, jamás traslades las HH necesarias para producir un plano a su revisión. La unidad es el
+documento revisado y el esfuerzo incluye lectura técnica, contraste, comentario y cierre de la
+observación. Coordinación interdisciplinaria, QA/QC, control documental e informe final van separados.
 
 ## REGLA DE ORO — jerarquía de búsqueda
 

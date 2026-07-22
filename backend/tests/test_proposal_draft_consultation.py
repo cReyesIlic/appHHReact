@@ -12,6 +12,7 @@ from unittest.mock import AsyncMock, Mock, patch
 from docx import Document
 
 from app.agents.agent_loop import AgentLoop, draft_tool_schemas
+from app.agents.tools.handlers import search_rag
 from app.core.config import settings
 from app.services.proposal_drafts import ProposalDraftService
 
@@ -139,6 +140,60 @@ class ProposalDraftBriefTests(unittest.TestCase):
         self.assertFalse(service.search_chunks(draft["slug"], "ingeniería detalles"))
         self.assertFalse(service.get_draft("owner@shimin.cl", draft["slug"])["guide_exists"])
 
+    def test_document_register_and_review_estimate_use_review_rates(self):
+        service = ProposalDraftService()
+        draft = service.create_draft("owner@shimin.cl", "Revisión Truck Shop")
+        document = Document()
+        document.add_paragraph("3. Se comparten los siguientes documentos nuevos y actualizados.")
+        document.add_paragraph("WOR-GPR-21CS187-OT-030-1128-E-DW-001 - 0")
+        document.add_paragraph("WOR - GPR - 21CS187 - OT - 030 - 1128 - P - PID - 001 1 2")
+        document.add_paragraph("CEN-ST-000-E-SK-003_v0 Estándar de puesta a tierra")
+        buffer = BytesIO()
+        document.save(buffer)
+        service.add_file("owner@shimin.cl", draft["slug"], "Registro.docx", buffer.getvalue())
+
+        register = service.analyze_document_register("owner@shimin.cl", draft["slug"])
+        estimate = service.estimate_document_review_hours(
+            "owner@shimin.cl",
+            draft["slug"],
+            default_hours=5,
+            hours_by_type={"PID": 8, "SK": 6},
+            general_activities={"Informe final": 20},
+            basis="Benchmark histórico de revisión",
+        )
+
+        self.assertEqual(register["total_documents"], 3)
+        self.assertEqual(register["by_type"], {"DW": 1, "PID": 1, "SK": 1})
+        self.assertEqual(estimate["review_hours"], 19)
+        self.assertEqual(estimate["total_hours"], 39)
+        self.assertEqual(len(estimate["document_rows"]), 3)
+
+    def test_workspace_sections_are_persistent_and_overwrite_by_stage(self):
+        service = ProposalDraftService()
+        draft = service.create_draft("owner@shimin.cl", "Oferta progresiva")
+
+        service.save_workspace_section(
+            "owner@shimin.cl",
+            draft["slug"],
+            "hours",
+            "Primera estimación",
+            tables=[{"name": "HH", "rows": [{"total": 100}]}],
+            sources=[{"title": "O-1553", "codigo": "O-1553"}],
+        )
+        service.save_workspace_section(
+            "owner@shimin.cl",
+            draft["slug"],
+            "hours",
+            "Estimación revisada",
+            tables=[{"name": "HH", "rows": [{"total": 120}]}],
+        )
+
+        sections = service.get_draft("owner@shimin.cl", draft["slug"])["workspace_sections"]
+        self.assertEqual(len(sections), 1)
+        self.assertEqual(sections[0]["key"], "hours")
+        self.assertEqual(sections[0]["content"], "Estimación revisada")
+        self.assertEqual(sections[0]["tables"][0]["rows"][0]["total"], 120)
+
     def test_document_intelligence_ocr_preserves_page_evidence(self):
         service = ProposalDraftService()
         submit = Mock(status_code=202, headers={"operation-location": "https://ocr/jobs/1"})
@@ -185,6 +240,34 @@ class ProposalDraftBriefTests(unittest.TestCase):
 
 
 class ProposalDraftAgentContextTests(unittest.TestCase):
+    def test_rag_merges_multiple_semantic_queries(self):
+        hybrid = Mock()
+
+        async def search(query, filters, limit):
+            common = {
+                "codigo": "O-1553",
+                "title": "Tabla de revisión",
+                "summary": "HH para revisar documentos",
+                "score": 2.0,
+                "metadata": {},
+            }
+            if query == "constructibility review":
+                return [common, {**common, "codigo": "O-1999", "title": "Constructibilidad"}]
+            return [common]
+
+        hybrid.search = AsyncMock(side_effect=search)
+        result = asyncio.run(
+            search_rag(
+                SimpleNamespace(hybrid_rag=hybrid),
+                queries=["revisión ingeniería", "constructibility review"],
+                limit=8,
+            )
+        )
+
+        self.assertEqual(result["queries_used"], ["revisión ingeniería", "constructibility review"])
+        self.assertEqual(result["count"], 2)
+        self.assertEqual(hybrid.search.await_count, 2)
+
     def test_draft_tools_are_agentic_but_expensive_costing_is_explicit(self):
         general = {
             schema["function"]["name"]
@@ -200,6 +283,14 @@ class ProposalDraftAgentContextTests(unittest.TestCase):
         self.assertIn("compute_economics", costing)
         self.assertIn("get_hh_licitadas", costing)
         self.assertIn("get_proposal_detail", costing)
+
+        hours_stage = {
+            schema["function"]["name"]
+            for schema in draft_tool_schemas("Estima la revisión", stage="hours")
+        }
+        self.assertIn("analyze_draft_document_register", hours_stage)
+        self.assertIn("estimate_draft_review_hours", hours_stage)
+        self.assertIn("read_pdf_deep", hours_stage)
 
     def test_active_draft_is_preloaded_before_the_model_answers(self):
         loop = AgentLoop.__new__(AgentLoop)
@@ -217,6 +308,8 @@ class ProposalDraftAgentContextTests(unittest.TestCase):
         dispatcher = Mock()
 
         async def dispatch(name, args):
+            if name == "load_skill":
+                return {"name": "armar_propuesta", "content": "Flujo por etapas"}
             if name == "get_draft_context":
                 return {
                     "slug": "restitucion-abc123",
@@ -262,7 +355,7 @@ class ProposalDraftAgentContextTests(unittest.TestCase):
 
         self.assertEqual(
             [call.args[0] for call in dispatcher.dispatch.await_args_list],
-            ["get_draft_context", "search_draft_chunks"],
+            ["load_skill", "get_draft_context", "search_draft_chunks"],
         )
         model_messages = loop.llm.chat_with_tools.await_args.kwargs["messages"]
         payload = json.loads(model_messages[-1]["content"])
@@ -293,6 +386,8 @@ class ProposalDraftAgentContextTests(unittest.TestCase):
         dispatcher = Mock()
 
         async def dispatch(name, args):
+            if name == "load_skill":
+                return {"name": "armar_propuesta", "content": "Flujo"}
             if name in {"get_draft_context", "search_draft_chunks"}:
                 return {"slug": "revision-id", "count": 0}
             if name == "compute_proposal_support":

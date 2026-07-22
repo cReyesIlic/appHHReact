@@ -42,6 +42,16 @@ class DraftFileInfo:
     chars_extracted: int
 
 
+WORKSPACE_SECTION_TITLES = {
+    "scope": "1. Alcance y requisitos del cliente",
+    "references": "2. Referencias y evidencia histórica",
+    "deliverables": "3. Entregables y metodología",
+    "hours": "4. Estimación de HH y equipo",
+    "proposal": "5. Propuesta integrada",
+    "notes": "Notas de trabajo",
+}
+
+
 class ProposalDraftService:
     def __init__(self) -> None:
         self._last_extraction_method = "none"
@@ -186,6 +196,7 @@ class ProposalDraftService:
             "files": files,
             "guide_exists": guia.exists(),
             "guide_path": str(guia) if guia.exists() else None,
+            "workspace_sections": self.list_workspace(slug),
         }
 
     def update_brief(self, owner_id: str, slug: str, brief_text: str) -> dict:
@@ -215,6 +226,7 @@ class ProposalDraftService:
             ).rowcount
             conn.execute("delete from proposal_draft_files where slug = ?", (slug,))
             conn.execute("delete from proposal_draft_chunks where slug = ?", (slug,))
+            conn.execute("delete from proposal_draft_workspace where slug = ?", (slug,))
         if not n:
             return {"deleted": False}
         # Borrar archivos en disco
@@ -223,6 +235,86 @@ class ProposalDraftService:
         if d.exists():
             shutil.rmtree(d, ignore_errors=True)
         return {"deleted": True, "slug": slug}
+
+    # ---- Wiki de trabajo progresiva ----
+
+    def list_workspace(self, slug: str) -> list[dict]:
+        with closing(sqlite3.connect(settings.sqlite_path, timeout=5)) as conn:
+            rows = conn.execute(
+                """
+                select section_key, title, content, tables_json, sources_json, updated_at
+                from proposal_draft_workspace where slug = ?
+                """,
+                (slug,),
+            ).fetchall()
+        by_key = {
+            row[0]: {
+                "key": row[0],
+                "title": row[1],
+                "content": row[2],
+                "tables": self._json_list(row[3]),
+                "sources": self._json_list(row[4]),
+                "updated_at": row[5],
+            }
+            for row in rows
+        }
+        return [
+            by_key[key]
+            for key in WORKSPACE_SECTION_TITLES
+            if key in by_key
+        ]
+
+    def save_workspace_section(
+        self,
+        owner_id: str,
+        slug: str,
+        section_key: str,
+        content: str,
+        tables: list[dict] | None = None,
+        sources: list[dict] | None = None,
+    ) -> dict:
+        """Guarda el resultado IA de una etapa como parte visible del draft."""
+        self.get_draft(owner_id, slug)
+        key = str(section_key or "notes").strip().casefold()
+        if key not in WORKSPACE_SECTION_TITLES:
+            key = "notes"
+        clean_content = str(content or "").strip()[:60000]
+        now = datetime.now().isoformat(timespec="seconds")
+        with closing(sqlite3.connect(settings.sqlite_path, timeout=30)) as conn, conn:
+            conn.execute(
+                """
+                insert into proposal_draft_workspace
+                (slug, section_key, title, content, tables_json, sources_json, updated_at)
+                values (?, ?, ?, ?, ?, ?, ?)
+                on conflict(slug, section_key) do update set
+                    title = excluded.title,
+                    content = excluded.content,
+                    tables_json = excluded.tables_json,
+                    sources_json = excluded.sources_json,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    slug,
+                    key,
+                    WORKSPACE_SECTION_TITLES[key],
+                    clean_content,
+                    json.dumps(tables or [], ensure_ascii=False),
+                    json.dumps(sources or [], ensure_ascii=False),
+                    now,
+                ),
+            )
+            conn.execute(
+                "update proposal_drafts set updated_at = ? where slug = ? and owner_id = ?",
+                (now, slug, owner_id),
+            )
+        return next(section for section in self.list_workspace(slug) if section["key"] == key)
+
+    def _json_list(self, value: str | None) -> list:
+        try:
+            parsed = json.loads(value or "[]")
+            return parsed if isinstance(parsed, list) else []
+        except (json.JSONDecodeError, TypeError):
+            return []
 
     # ---- Files ----
 
@@ -540,6 +632,144 @@ class ProposalDraftService:
                 break
         return "".join(parts)
 
+    def analyze_document_register(self, owner_id: str, slug: str) -> dict:
+        """Estructura los códigos del registro documental contenido en los antecedentes."""
+        self.get_draft(owner_id, slug)
+        raw = self.all_text(slug, max_chars=250000)
+        normalized = re.sub(r"\s*-\s*", "-", raw.upper())
+        marker = re.search(r"3\.\s*SE COMPARTEN LOS SIGUIENTES DOCUMENTOS", normalized)
+        register_text = normalized[marker.start():] if marker else normalized
+
+        found: dict[str, dict] = {}
+        wor_pattern = re.compile(
+            r"WOR-GPR-21CS187-OT-030-([A-Z0-9]+)-([A-Z])-([A-Z]+)-(\d+)"
+        )
+        for match in wor_pattern.finditer(register_text):
+            code = match.group(0)
+            found[code] = {
+                "codigo_documento": code,
+                "area": match.group(1),
+                "disciplina": match.group(2),
+                "tipo_documento": match.group(3),
+            }
+
+        generic_patterns = [
+            re.compile(r"CEN-ST-\d+-([A-Z])-SK-\d+"),
+            re.compile(r"HBSA-([A-Z])-SK-\d+(?:\.\d+)?"),
+        ]
+        for pattern in generic_patterns:
+            for match in pattern.finditer(register_text):
+                code = match.group(0)
+                found[code] = {
+                    "codigo_documento": code,
+                    "area": "EETT / Estándares",
+                    "disciplina": match.group(1),
+                    "tipo_documento": "SK",
+                }
+
+        # Fallback para otros clientes/codificaciones: identifica el tipo
+        # documental y la disciplina por su posición, sin depender de WOR/MCEN.
+        known_types = {
+            "DW", "PID", "PFD", "CS", "DS", "ES", "TS", "ET", "GD", "IS",
+            "LT", "CB", "SK", "SPEC", "CAL", "MEM", "MTO", "BOM", "LIST",
+        }
+        generic_code = re.compile(r"\b[A-Z][A-Z0-9]*(?:-[A-Z0-9][A-Z0-9._]*){3,}\b")
+        for match in generic_code.finditer(register_text):
+            code = match.group(0).rstrip("._")
+            overlaps_known = any(
+                code == known or code.startswith(f"{known}-") or code.startswith(f"{known}_")
+                for known in found
+            )
+            if overlaps_known or not any(character.isdigit() for character in code):
+                continue
+            parts = code.split("-")
+            type_index = next(
+                (index for index in range(len(parts) - 1, -1, -1) if parts[index] in known_types),
+                None,
+            )
+            if type_index is None:
+                continue
+            discipline = parts[type_index - 1] if type_index >= 1 else "ND"
+            if not re.fullmatch(r"[A-Z]{1,3}", discipline):
+                discipline = "ND"
+            area = parts[type_index - 2] if type_index >= 2 else "General"
+            found[code] = {
+                "codigo_documento": code,
+                "area": area,
+                "disciplina": discipline,
+                "tipo_documento": parts[type_index],
+            }
+
+        documents = sorted(
+            found.values(),
+            key=lambda row: (row["area"], row["disciplina"], row["tipo_documento"], row["codigo_documento"]),
+        )
+        by_discipline: dict[str, int] = {}
+        by_type: dict[str, int] = {}
+        by_area: dict[str, int] = {}
+        for row in documents:
+            for bucket, value in (
+                (by_discipline, row["disciplina"]),
+                (by_type, row["tipo_documento"]),
+                (by_area, row["area"]),
+            ):
+                bucket[value] = bucket.get(value, 0) + 1
+        return {
+            "total_documents": len(documents),
+            "documents": documents,
+            "by_discipline": by_discipline,
+            "by_type": by_type,
+            "by_area": by_area,
+        }
+
+    def estimate_document_review_hours(
+        self,
+        owner_id: str,
+        slug: str,
+        default_hours: float,
+        hours_by_type: dict[str, float] | None = None,
+        discipline_factors: dict[str, float] | None = None,
+        general_activities: dict[str, float] | None = None,
+        basis: str = "",
+    ) -> dict:
+        """Aplica al registro las tasas que el agente eligió desde evidencia histórica."""
+        register = self.analyze_document_register(owner_id, slug)
+        type_rates = {str(k).upper(): float(v) for k, v in (hours_by_type or {}).items()}
+        factors = {str(k).upper(): float(v) for k, v in (discipline_factors or {}).items()}
+        rows: list[dict] = []
+        discipline_totals: dict[str, dict] = {}
+        for document in register["documents"]:
+            discipline = document["disciplina"]
+            document_type = document["tipo_documento"]
+            rate = type_rates.get(document_type, float(default_hours))
+            factor = factors.get(discipline, 1.0)
+            hours = round(max(0.0, rate * factor), 2)
+            rows.append({**document, "hh_revision": hours})
+            total = discipline_totals.setdefault(
+                discipline,
+                {"disciplina": discipline, "documentos": 0, "hh_revision": 0.0},
+            )
+            total["documentos"] += 1
+            total["hh_revision"] = round(total["hh_revision"] + hours, 2)
+
+        general_rows = [
+            {"actividad": str(name), "hh": round(float(hours), 2)}
+            for name, hours in (general_activities or {}).items()
+            if float(hours) >= 0
+        ]
+        review_hours = round(sum(row["hh_revision"] for row in rows), 2)
+        general_hours = round(sum(row["hh"] for row in general_rows), 2)
+        return {
+            "basis": str(basis or "")[:2000],
+            "total_documents": len(rows),
+            "review_hours": review_hours,
+            "general_hours": general_hours,
+            "total_hours": round(review_hours + general_hours, 2),
+            "discipline_totals": list(discipline_totals.values()),
+            "document_rows": rows,
+            "general_rows": general_rows,
+        }
+
     def save_guide(self, owner_id: str, slug: str, markdown: str) -> Path:
         path = self._guia_path(owner_id, slug)
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -778,6 +1008,20 @@ class ProposalDraftService:
                     text text not null,
                     char_start integer,
                     chunk_index integer
+                )
+                """
+            )
+            conn.execute(
+                """
+                create table if not exists proposal_draft_workspace (
+                    slug text not null,
+                    section_key text not null,
+                    title text not null,
+                    content text not null,
+                    tables_json text default '[]',
+                    sources_json text default '[]',
+                    updated_at text not null,
+                    primary key (slug, section_key)
                 )
                 """
             )

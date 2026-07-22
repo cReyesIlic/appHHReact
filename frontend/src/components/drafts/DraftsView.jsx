@@ -24,6 +24,7 @@ import { Button } from "../shared/Button.jsx";
 import { Card } from "../shared/Card.jsx";
 import { Input, Field } from "../shared/Field.jsx";
 import { EmptyState } from "../shared/EmptyState.jsx";
+import { DataTable } from "../shared/DataTable.jsx";
 
 export function DraftsView() {
   const [drafts, setDrafts] = useState([]);
@@ -113,6 +114,7 @@ export function DraftsView() {
             role: message.role,
             content: message.content,
             sources: message.sources || [],
+            tables: message.tables || [],
           })),
         );
       })
@@ -277,7 +279,7 @@ export function DraftsView() {
     }
   };
 
-  const handleConsult = async (suggestedQuestion = null) => {
+  const handleConsult = async (suggestedQuestion = null, stage = "notes") => {
     const text = String(suggestedQuestion || consultInput || "").trim();
     if (!activeSlug || !active || !text) return;
     setConsultBusy(true);
@@ -300,6 +302,7 @@ export function DraftsView() {
         title: active.title,
         cliente: active.cliente || "",
         brief_text: briefText,
+        stage,
       };
       let sessionId = consultSessionId;
       if (!sessionId) {
@@ -324,6 +327,7 @@ export function DraftsView() {
           role: "assistant",
           content: response.answer || "(sin respuesta)",
           sources: response.sources || [],
+          tables: response.tables || [],
         },
       ]);
       setConsultContext(response.working_context || { active_draft: activeDraftContext });
@@ -331,6 +335,7 @@ export function DraftsView() {
         setConsultSessionId(response.session_id);
         localStorage.setItem(draftSessionKey(activeSlug), response.session_id);
       }
+      getDraft(activeSlug).then(setActive).catch(() => {});
     } catch (exc) {
       setConsultMessages((current) => [
         ...current,
@@ -637,6 +642,48 @@ export function DraftsView() {
               </Card>
 
               <Card
+                title="Wiki de trabajo de la propuesta"
+                subtitle={`${(active.workspace_sections || []).length} de ${DRAFT_STAGES.length} etapas desarrolladas`}
+              >
+                {(active.workspace_sections || []).length === 0 ? (
+                  <EmptyState
+                    icon={Sparkles}
+                    title="La propuesta se irá construyendo aquí"
+                    description="Ejecuta las etapas de la consulta IA. Cada resultado, sus tablas y fuentes quedarán visibles y se actualizarán al repetir una etapa."
+                  />
+                ) : (
+                  <div className="draft-workspace-sections">
+                    {(active.workspace_sections || []).map((section) => (
+                      <article className="draft-workspace-section" key={section.key}>
+                        <header>
+                          <h3>{section.title}</h3>
+                          <small className="dim">Actualizado: {section.updated_at}</small>
+                        </header>
+                        <div className="message-body">
+                          <ReactMarkdown remarkPlugins={[remarkGfm]}>{section.content || ""}</ReactMarkdown>
+                        </div>
+                        {(section.tables || []).map((table, tableIndex) => (
+                          <div className="draft-inline-table" key={`${section.key}-${table.name || tableIndex}`}>
+                            <b>{table.name || `Tabla ${tableIndex + 1}`}</b>
+                            <DataTable columns={inferColumns(table.rows)} rows={table.rows || []} />
+                          </div>
+                        ))}
+                        {(section.sources || []).some((source) => source.url) && (
+                          <div className="draft-consult-sources">
+                            {(section.sources || []).filter((source) => source.url).slice(0, 12).map((source, sourceIndex) => (
+                              <a key={`${source.url}-${sourceIndex}`} href={source.url} target="_blank" rel="noreferrer">
+                                {source.title || source.codigo || "Abrir fuente"}
+                              </a>
+                            ))}
+                          </div>
+                        )}
+                      </article>
+                    ))}
+                  </div>
+                )}
+              </Card>
+
+              <Card
                 title="Consulta IA de esta propuesta"
                 subtitle="Lee el brief, la guía y los PDF/DOCX; además contrasta propuestas históricas"
                 actions={
@@ -650,17 +697,22 @@ export function DraftsView() {
                   </Button>
                 }
               >
-                <div className="draft-quick-prompts">
-                  {DRAFT_PROMPTS.map((prompt) => (
+                <div className="draft-workflow">
+                  {DRAFT_STAGES.map((stage, index) => {
+                    const completed = (active.workspace_sections || []).some((section) => section.key === stage.key);
+                    return (
                     <button
                       type="button"
-                      key={prompt}
-                      onClick={() => handleConsult(prompt)}
+                      key={stage.key}
+                      className={completed ? "completed" : ""}
+                      onClick={() => handleConsult(stage.prompt, stage.key)}
                       disabled={consultBusy || ((active.files || []).length === 0 && !briefText.trim())}
                     >
-                      {prompt}
+                      <span>{completed ? "✓" : index + 1}</span>
+                      <span><b>{stage.title}</b><small>{stage.description}</small></span>
                     </button>
-                  ))}
+                    );
+                  })}
                 </div>
 
                 <div className="draft-consult-thread">
@@ -682,6 +734,12 @@ export function DraftsView() {
                         <ReactMarkdown remarkPlugins={[remarkGfm]}>
                           {message.content || "(sin contenido)"}
                         </ReactMarkdown>
+                        {(message.tables || []).map((table, tableIndex) => (
+                          <div className="draft-inline-table" key={`${table.name || "table"}-${tableIndex}`}>
+                            <b>{table.name || `Tabla ${tableIndex + 1}`}</b>
+                            <DataTable columns={inferColumns(table.rows)} rows={table.rows || []} />
+                          </div>
+                        ))}
                         {(message.sources || []).some((source) => source.url) && (
                           <div className="draft-consult-sources">
                             {(message.sources || []).filter((source) => source.url).slice(0, 8).map((source, sourceIndex) => (
@@ -747,12 +805,51 @@ export function DraftsView() {
   );
 }
 
-const DRAFT_PROMPTS = [
-  "¿Cómo debería armar esta propuesta?",
-  "Sugiere alcance y entregables",
-  "Detecta riesgos, vacíos y preguntas al cliente",
-  "Busca propuestas ganadas similares",
+const DRAFT_STAGES = [
+  {
+    key: "scope",
+    title: "Entender alcance",
+    description: "Lee todos los antecedentes y requisitos del cliente",
+    prompt: "Construye la etapa de alcance: revisa todos los antecedentes y extrae requisitos, documentos, disciplinas, plazo, restricciones, riesgos y preguntas al cliente.",
+  },
+  {
+    key: "references",
+    title: "Investigar referencias",
+    description: "Busca conceptos equivalentes y profundiza en tablas históricas",
+    prompt: "Construye la etapa de referencias: busca ampliamente propuestas ganadas comparables usando sinónimos y conceptos, no solo frases literales. Identifica y lee las tablas históricas relevantes.",
+  },
+  {
+    key: "deliverables",
+    title: "Armar entregables",
+    description: "Propone metodología, matriz y criterios de aceptación",
+    prompt: "Construye la etapa de entregables: arma metodología y una matriz completa de actividades y productos para revisar esta ingeniería, usando las mejores tablas históricas encontradas.",
+  },
+  {
+    key: "hours",
+    title: "Estimar HH de revisión",
+    description: "Cuenta cada documento y estima revisarlo, no producirlo",
+    prompt: "Construye la etapa de HH: cuenta los documentos del registro cargado y estima las horas necesarias para revisar cada uno. No uses horas de elaboración. Sustenta tasas con propuestas y proyectos históricos, y separa coordinación, QA, observaciones e informe.",
+  },
+  {
+    key: "proposal",
+    title: "Integrar propuesta",
+    description: "Consolida la Wiki de trabajo en una propuesta coherente",
+    prompt: "Integra todas las etapas guardadas en una propuesta técnica coherente, con alcance, metodología, entregables, plan, equipo, HH, supuestos, exclusiones y decisiones pendientes.",
+  },
 ];
+
+function inferColumns(rows) {
+  if (!rows || rows.length === 0) return [];
+  return Object.keys(rows[0]).slice(0, 9).map((key) => ({
+    key,
+    label: key.replaceAll("_", " "),
+    numeric: typeof rows[0][key] === "number",
+    render: (row) => {
+      const value = row[key];
+      return value && typeof value === "object" ? JSON.stringify(value) : value;
+    },
+  }));
+}
 
 function draftSessionKey(slug) {
   return `shimin_draft_session_${slug}`;
