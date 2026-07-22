@@ -144,7 +144,10 @@ def sessions_rename(session_id: str, request: ChatSessionRenameRequest, http_req
 @router.delete("/sessions/{session_id}")
 def sessions_delete(session_id: str, http_request: Request) -> dict:
     user = user_from_request(http_request)
-    return ChatSessionService().delete_session(user.id, session_id)
+    try:
+        return ChatSessionService().delete_session(user.id, session_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="Sesión no encontrada") from exc
 
 
 @router.get("/me")

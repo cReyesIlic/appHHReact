@@ -1,13 +1,15 @@
 import logging
 import os
 
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 
 from app.api.routes import router
 from app.core.config import settings
 from app.services.database_runtime import prepare_runtime_database
 from app.services.scheduler import shutdown_scheduler, start_scheduler
+from app.services.user_context import user_from_request
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 
@@ -20,6 +22,17 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+@app.middleware("http")
+async def require_api_identity(request, call_next):
+    """Impide saltarse el proxy autenticado de Static Web Apps."""
+    if request.url.path.startswith("/api/"):
+        try:
+            user_from_request(request)
+        except HTTPException as exc:
+            return JSONResponse(status_code=exc.status_code, content={"detail": exc.detail})
+    return await call_next(request)
 
 app.include_router(router, prefix="/api")
 

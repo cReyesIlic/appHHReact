@@ -97,7 +97,8 @@ export function ChatView() {
     try {
       const response = await sendChat({
         message: text,
-        history: newMessages.slice(-12),
+        // El mensaje actual viaja en `message`; history contiene sólo turnos previos.
+        history: messages.slice(-12),
         selected_codes: workingContext.suggested_codes || [],
         deep_pdf_read: false,
         working_context: workingContext,

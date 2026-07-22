@@ -4,7 +4,6 @@
     "exclude": ["/api/*", "/.auth/*", "/assets/*", "/*.{png,jpg,jpeg,gif,svg,ico,webp,woff,woff2,ttf}"]
   },
   "auth": {
-    "rolesSource": "/api/me",
     "identityProviders": {
       "azureActiveDirectory": {
         "userDetailsClaim": "preferred_username",

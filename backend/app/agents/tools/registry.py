@@ -246,6 +246,34 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
     {
         "type": "function",
         "function": {
+            "name": "get_hh_licitadas",
+            "description": (
+                "Consulta HH ESTIMADAS/LICITADAS de una oferta O-XXXX desde el detalle estructurado "
+                "del Master o desde el Excel procesado por el lector propio. Es OBLIGATORIA para "
+                "preguntas como 'HH por entregable', 'desglose de horas estimadas', 'presupuesto por "
+                "actividad/disciplina/rol'. No confundir con search_entregables_hh, que consulta HH "
+                "REALES de Staffing. También devuelve enlaces SharePoint a PDF/Excel emitidos y, si "
+                "el detalle aún no fue ingerido, procesa automáticamente el Excel antes de responder."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "codigo": {"type": "string", "description": "Código de oferta O-XXXX"},
+                    "view": {
+                        "type": "string",
+                        "enum": ["proyecto", "disciplina", "role", "entregable"],
+                        "default": "entregable",
+                    },
+                    "text": {"type": "string", "description": "Filtro textual opcional"},
+                    "limit": {"type": "integer", "default": 200},
+                },
+                "required": ["codigo"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "search_entregables_hh",
             "description": (
                 "Busca ENTREGABLES con HH REALES cargadas en el sistema de Staffing SHIMIN. "
@@ -526,6 +554,7 @@ class ToolDispatcher:
             "compute_proposal_support": handlers.compute_proposal_support,
             "get_proposal_detail": handlers.get_proposal_detail,
             "read_pdf_deep": handlers.read_pdf_deep,
+            "get_hh_licitadas": handlers.get_hh_licitadas,
             "save_library_entry": handlers.save_library_entry,
             "generate_document": handlers.generate_document,
             "search_entregables_hh": handlers.search_entregables_hh,

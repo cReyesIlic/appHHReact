@@ -1,5 +1,7 @@
 from pathlib import Path
 from datetime import datetime
+from dataclasses import dataclass, field
+from html import escape as html_escape
 import re
 import subprocess
 
@@ -9,6 +11,7 @@ from docx.shared import Pt, Inches, RGBColor, Cm
 from docx.enum.text import WD_ALIGN_PARAGRAPH
 from docx.oxml.ns import qn
 from docx.oxml import OxmlElement
+from docx.opc.constants import RELATIONSHIP_TYPE as RT
 from reportlab.lib.pagesizes import letter, A4
 from reportlab.lib import colors
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
@@ -47,9 +50,9 @@ class ExportService:
             return self._xlsx(request)
         if kind == "docx":
             return self._docx(request)
-        if kind in {"typst", "typst-pdf", "report"}:
+        if kind in {"typst", "typst-pdf"}:
             return self._typst_pdf(request)
-        if kind == "pdf":
+        if kind in {"pdf", "report"}:
             return self._pdf(request)
         raise ValueError("Formato soportado: xlsx, docx, pdf")
 
@@ -202,8 +205,8 @@ class ExportService:
         # Línea separadora cobre
         _docx_horizontal_rule(doc, color="C8863B", size=8)
 
-        # Cuerpo (parsea markdown light: ## headings, listas, párrafos)
-        _docx_render_markdown_light(doc, request.answer or "")
+        # Cuerpo Markdown: títulos, énfasis, enlaces, listas, tablas y código.
+        _docx_render_markdown(doc, request.answer or "")
 
         # Tablas
         for table in request.tables[:10]:
@@ -235,7 +238,7 @@ class ExportService:
             for r_idx, row in enumerate(rows[:60]):
                 cells = doc_table.add_row().cells
                 for c_idx, column in enumerate(columns):
-                    cells[c_idx].text = str(row.get(column, ""))[:500]
+                    cells[c_idx].text = _display_value(row.get(column, ""))[:500]
                     for paragraph in cells[c_idx].paragraphs:
                         for run in paragraph.runs:
                             run.font.size = Pt(9)
@@ -262,6 +265,9 @@ class ExportService:
                 if s.get("codigo"):
                     rest_text = f"{s['codigo']}  ·  {rest_text}"
                 line.add_run(str(rest_text)[:280]).font.size = Pt(9.5)
+                if s.get("url"):
+                    line.add_run("  ")
+                    _docx_add_hyperlink(line, "Abrir fuente", str(s["url"]))
 
         # Footer
         try:
@@ -316,6 +322,24 @@ class ExportService:
             fontName="Helvetica-Bold", fontSize=11, leading=15,
             textColor=SHIMIN_COPPER, spaceBefore=8, spaceAfter=4,
         )
+        bullet_style = ParagraphStyle(
+            "BulletS", parent=body_style, leftIndent=14, firstLineIndent=-8,
+            bulletIndent=5, spaceAfter=3,
+        )
+        quote_style = ParagraphStyle(
+            "QuoteS", parent=body_style, leftIndent=12, rightIndent=8,
+            borderColor=SHIMIN_COPPER, borderWidth=0.8, borderPadding=6,
+            backColor=SHIMIN_MIST, textColor=SHIMIN_MUTED,
+        )
+        code_style = ParagraphStyle(
+            "CodeS", parent=body_style, fontName="Courier", fontSize=8.5,
+            leading=11, leftIndent=8, rightIndent=8, borderPadding=6,
+            backColor=colors.HexColor("#f4f6f7"),
+        )
+        table_header_style = ParagraphStyle(
+            "TableHeaderS", parent=body_style, fontName="Helvetica-Bold",
+            fontSize=8.5, leading=10, textColor=colors.white, spaceAfter=0,
+        )
 
         story = []
         # Portada con logo
@@ -332,17 +356,26 @@ class ExportService:
         ))
         story.append(HRFlowable(width="100%", thickness=1.2, color=SHIMIN_COPPER, spaceBefore=4, spaceAfter=12))
 
-        # Cuerpo con markdown light
-        for block in _pdf_split_markdown_light(request.answer or ""):
-            kind, text = block
-            if kind == "h2":
-                story.append(Paragraph(_escape_xml(text), h2_style))
-            elif kind == "h3":
-                story.append(Paragraph(_escape_xml(text), h3_style))
-            elif kind == "bullet":
-                story.append(Paragraph("• " + _escape_xml(text), body_style))
+        # Cuerpo Markdown completo, sin imprimir sus marcadores literales.
+        for block in _parse_markdown(request.answer or ""):
+            if block.kind == "heading":
+                style = title_style if block.level == 1 else h2_style if block.level == 2 else h3_style
+                story.append(Paragraph(_pdf_inline(block.text), style))
+            elif block.kind == "bullet":
+                story.append(Paragraph(_pdf_inline(block.text), bullet_style, bulletText="•"))
+            elif block.kind == "number":
+                story.append(Paragraph(_pdf_inline(block.text), bullet_style, bulletText=f"{block.number}."))
+            elif block.kind == "quote":
+                story.append(Paragraph(_pdf_inline(block.text), quote_style))
+            elif block.kind == "code":
+                story.append(Paragraph(html_escape(block.text).replace("\n", "<br/>"), code_style))
+            elif block.kind == "hr":
+                story.append(HRFlowable(width="100%", thickness=0.6, color=SHIMIN_LINE, spaceBefore=5, spaceAfter=7))
+            elif block.kind == "table":
+                story.append(_pdf_markdown_table(block, body_style))
+                story.append(Spacer(1, 8))
             else:
-                story.append(Paragraph(_escape_xml(text).replace("\n", "<br/>"), body_style))
+                story.append(Paragraph(_pdf_inline(block.text).replace("\n", "<br/>"), body_style))
 
         # Tablas
         for table in request.tables[:6]:
@@ -351,10 +384,10 @@ class ExportService:
                 continue
             story.append(Paragraph(_escape_xml(str(table.get("name", "Tabla"))), h2_style))
             columns = list(rows[0].keys())[:6]
-            data = [[Paragraph(f"<b>{_escape_xml(str(c))}</b>", body_style) for c in columns]]
+            data = [[Paragraph(_pdf_inline(str(c)), table_header_style) for c in columns]]
             for row in rows[:40]:
                 data.append([
-                    Paragraph(_escape_xml(str(row.get(col, ""))[:300]), body_style)
+                    Paragraph(_pdf_inline(_display_value(row.get(col, ""))[:300]), body_style)
                     for col in columns
                 ])
             t = Table(data, repeatRows=1, hAlign="LEFT")
@@ -386,6 +419,9 @@ class ExportService:
                 if codigo:
                     line += f"<b>{codigo}</b> · "
                 line += title
+                url = str(s.get("url") or "").strip()
+                if _clickable_url(url):
+                    line += f' · <link href="{html_escape(url, quote=True)}" color="#1f5f7a"><u>Abrir fuente</u></link>'
                 story.append(Paragraph(line, body_style))
 
         doc.build(story, onFirstPage=_pdf_header_footer, onLaterPages=_pdf_header_footer)
@@ -573,45 +609,213 @@ def _escape_xml(text: str) -> str:
     )
 
 
-def _pdf_split_markdown_light(text: str) -> list[tuple[str, str]]:
-    """Parser muy básico para markdown: ## h2, ### h3, - bullet, párrafos."""
-    blocks: list[tuple[str, str]] = []
-    para_lines: list[str] = []
+@dataclass
+class _MarkdownBlock:
+    kind: str
+    text: str = ""
+    level: int = 0
+    number: int = 0
+    headers: list[str] = field(default_factory=list)
+    rows: list[list[str]] = field(default_factory=list)
 
-    def flush_para():
-        if para_lines:
-            content = " ".join(para_lines).strip()
-            if content:
-                blocks.append(("p", content))
-            para_lines.clear()
 
-    for raw in (text or "").splitlines():
-        line = raw.rstrip()
-        if not line.strip():
-            flush_para()
+_INLINE_RE = re.compile(
+    r"(?P<link>\[(?P<link_text>[^\]\n]+)\]\((?P<link_url>https?://[^\s)]+|/api/[^\s)]+)(?:\s+\"[^\"]*\")?\))"
+    r"|(?P<code>`(?P<code_text>[^`\n]+)`)"
+    r"|(?P<bold>\*\*(?P<bold_text>.+?)\*\*)"
+    r"|(?P<bold_u>__(?P<bold_u_text>.+?)__)"
+    r"|(?P<strike>~~(?P<strike_text>.+?)~~)"
+    r"|(?P<italic>(?<!\*)\*(?P<italic_text>[^*\n]+)\*(?!\*))"
+    r"|(?P<italic_u>(?<!\w)_(?P<italic_u_text>[^_\n]+)_(?!\w))"
+)
+
+
+def _parse_markdown(text: str) -> list[_MarkdownBlock]:
+    """Convierte Markdown de chat en bloques semánticos compartidos por PDF y Word."""
+    lines = str(text or "").replace("\r\n", "\n").replace("\r", "\n").split("\n")
+    blocks: list[_MarkdownBlock] = []
+    index = 0
+    while index < len(lines):
+        line = lines[index].rstrip()
+        stripped = line.strip()
+        if not stripped:
+            index += 1
             continue
-        if line.startswith("### "):
-            flush_para()
-            blocks.append(("h3", line[4:].strip()))
-        elif line.startswith("## "):
-            flush_para()
-            blocks.append(("h2", line[3:].strip()))
-        elif line.startswith("# "):
-            flush_para()
-            blocks.append(("h2", line[2:].strip()))
-        elif line.lstrip().startswith(("- ", "* ", "• ")):
-            flush_para()
-            blocks.append(("bullet", line.lstrip()[2:].strip()))
-        elif re.match(r"^\d+[\.\)]\s", line.lstrip()):
-            flush_para()
-            blocks.append(("bullet", re.sub(r"^\d+[\.\)]\s", "", line.lstrip())))
-        else:
-            # Convertir **texto** a <b>texto</b> y *texto* a <i>texto</i>
-            line = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", line)
-            line = re.sub(r"(?<!\*)\*(?!\*)(.+?)\*(?!\*)", r"<i>\1</i>", line)
-            para_lines.append(line)
-    flush_para()
+
+        fence = re.match(r"^\s*(```+|~~~+)", line)
+        if fence:
+            marker = fence.group(1)
+            index += 1
+            code_lines = []
+            while index < len(lines) and not re.match(rf"^\s*{re.escape(marker[0])}{{{len(marker)},}}\s*$", lines[index]):
+                code_lines.append(lines[index].rstrip())
+                index += 1
+            if index < len(lines):
+                index += 1
+            blocks.append(_MarkdownBlock("code", text="\n".join(code_lines)))
+            continue
+
+        if _is_markdown_table(lines, index):
+            headers = _split_markdown_row(lines[index])
+            index += 2
+            rows = []
+            while index < len(lines) and "|" in lines[index] and lines[index].strip():
+                cells = _split_markdown_row(lines[index])
+                cells = (cells + [""] * len(headers))[:len(headers)]
+                rows.append(cells)
+                index += 1
+            blocks.append(_MarkdownBlock("table", headers=headers, rows=rows))
+            continue
+
+        heading = re.match(r"^\s{0,3}(#{1,6})\s+(.+?)\s*#*\s*$", line)
+        if heading:
+            blocks.append(_MarkdownBlock("heading", text=heading.group(2), level=len(heading.group(1))))
+            index += 1
+            continue
+        if re.match(r"^\s{0,3}([-*_])(?:\s*\1){2,}\s*$", line):
+            blocks.append(_MarkdownBlock("hr"))
+            index += 1
+            continue
+        bullet = re.match(r"^\s*[-+*•]\s+(.+)$", line)
+        if bullet:
+            blocks.append(_MarkdownBlock("bullet", text=bullet.group(1).strip()))
+            index += 1
+            continue
+        numbered = re.match(r"^\s*(\d+)[.)]\s+(.+)$", line)
+        if numbered:
+            blocks.append(_MarkdownBlock("number", text=numbered.group(2).strip(), number=int(numbered.group(1))))
+            index += 1
+            continue
+        if re.match(r"^\s*>\s?", line):
+            quote_lines = []
+            while index < len(lines) and re.match(r"^\s*>\s?", lines[index]):
+                quote_lines.append(re.sub(r"^\s*>\s?", "", lines[index]).strip())
+                index += 1
+            blocks.append(_MarkdownBlock("quote", text=" ".join(quote_lines)))
+            continue
+
+        paragraph = [stripped]
+        index += 1
+        while index < len(lines) and lines[index].strip() and not _starts_markdown_block(lines, index):
+            paragraph.append(lines[index].strip())
+            index += 1
+        blocks.append(_MarkdownBlock("paragraph", text=" ".join(paragraph)))
     return blocks
+
+
+def _starts_markdown_block(lines: list[str], index: int) -> bool:
+    line = lines[index]
+    return bool(
+        re.match(r"^\s*(```+|~~~+)", line)
+        or re.match(r"^\s{0,3}#{1,6}\s+", line)
+        or re.match(r"^\s{0,3}([-*_])(?:\s*\1){2,}\s*$", line)
+        or re.match(r"^\s*[-+*•]\s+", line)
+        or re.match(r"^\s*\d+[.)]\s+", line)
+        or re.match(r"^\s*>\s?", line)
+        or _is_markdown_table(lines, index)
+    )
+
+
+def _is_markdown_table(lines: list[str], index: int) -> bool:
+    if index + 1 >= len(lines) or "|" not in lines[index] or "|" not in lines[index + 1]:
+        return False
+    headers = _split_markdown_row(lines[index])
+    separators = _split_markdown_row(lines[index + 1])
+    return bool(headers and len(headers) == len(separators) and all(
+        re.fullmatch(r":?-{3,}:?", cell.replace(" ", "")) for cell in separators
+    ))
+
+
+def _split_markdown_row(line: str) -> list[str]:
+    value = line.strip().strip("|")
+    return [cell.replace(r"\|", "|").strip() for cell in re.split(r"(?<!\\)\|", value)]
+
+
+def _inline_tokens(text: str) -> list[tuple[str, str, str | None]]:
+    tokens: list[tuple[str, str, str | None]] = []
+    position = 0
+    for match in _INLINE_RE.finditer(str(text or "")):
+        if match.start() > position:
+            tokens.append(("text", text[position:match.start()], None))
+        if match.group("link"):
+            tokens.append(("link", match.group("link_text"), match.group("link_url")))
+        elif match.group("code"):
+            tokens.append(("code", match.group("code_text"), None))
+        elif match.group("bold") or match.group("bold_u"):
+            tokens.append(("bold", match.group("bold_text") or match.group("bold_u_text"), None))
+        elif match.group("strike"):
+            tokens.append(("strike", match.group("strike_text"), None))
+        else:
+            tokens.append(("italic", match.group("italic_text") or match.group("italic_u_text"), None))
+        position = match.end()
+    if position < len(text):
+        tokens.append(("text", text[position:], None))
+    return tokens
+
+
+def _pdf_inline(text: str) -> str:
+    parts = []
+    for kind, value, url in _inline_tokens(text):
+        safe = html_escape(value)
+        if kind == "bold":
+            parts.append(f"<b>{safe}</b>")
+        elif kind == "italic":
+            parts.append(f"<i>{safe}</i>")
+        elif kind == "strike":
+            parts.append(f"<strike>{safe}</strike>")
+        elif kind == "code":
+            parts.append(f'<font name="Courier">{safe}</font>')
+        elif kind == "link" and _clickable_url(url):
+            parts.append(f'<link href="{html_escape(str(url), quote=True)}" color="#1f5f7a"><u>{safe}</u></link>')
+        else:
+            parts.append(safe)
+    return "".join(parts)
+
+
+def _clickable_url(value: str | None) -> bool:
+    url = str(value or "").strip()
+    return bool(re.match(r"^https?://", url, flags=re.IGNORECASE) or url.startswith("/api/"))
+
+
+def _display_value(value) -> str:
+    if isinstance(value, dict):
+        return ", ".join(f"{key}: {_display_value(item)}" for key, item in value.items())
+    if isinstance(value, (list, tuple, set)):
+        return ", ".join(_display_value(item) for item in value)
+    return str(value if value is not None else "")
+
+
+def _pdf_markdown_table(block: _MarkdownBlock, body_style: ParagraphStyle) -> Table:
+    header_style = ParagraphStyle(
+        "MarkdownTableHeader", parent=body_style, fontName="Helvetica-Bold",
+        fontSize=8.5, leading=10, textColor=colors.white, spaceAfter=0,
+    )
+    cell_style = ParagraphStyle(
+        "MarkdownTableCell", parent=body_style, fontSize=8.5, leading=10, spaceAfter=0,
+    )
+    data = [[Paragraph(_pdf_inline(header), header_style) for header in block.headers]]
+    for row in block.rows[:80]:
+        data.append([Paragraph(_pdf_inline(cell), cell_style) for cell in row])
+    available_width = 17.4 * cm
+    weights = [
+        max(6, min(32, max([len(block.headers[index]), *[len(row[index]) for row in block.rows if index < len(row)]], default=6)))
+        for index in range(len(block.headers))
+    ]
+    weight_total = sum(weights) or 1
+    widths = [available_width * weight / weight_total for weight in weights]
+    table = Table(data, colWidths=widths, repeatRows=1, hAlign="LEFT")
+    table.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (-1, 0), SHIMIN_COPPER),
+        ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+        ("VALIGN", (0, 0), (-1, -1), "TOP"),
+        ("GRID", (0, 0), (-1, -1), 0.3, SHIMIN_LINE),
+        ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, SHIMIN_MIST]),
+        ("LEFTPADDING", (0, 0), (-1, -1), 5),
+        ("RIGHTPADDING", (0, 0), (-1, -1), 5),
+        ("TOPPADDING", (0, 0), (-1, -1), 4),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
+    ]))
+    return table
 
 
 def _pdf_header_footer(canvas_obj, doc) -> None:
@@ -657,54 +861,131 @@ def _docx_shade_cell(cell, color: str) -> None:
     tc_pr.append(shd)
 
 
-def _docx_render_markdown_light(doc, text: str) -> None:
-    """Renderiza markdown light en Word: ## h2, ### h3, **bold**, listas, párrafos."""
-    bold_re = re.compile(r"\*\*(.+?)\*\*")
-    for raw in (text or "").splitlines():
-        line = raw.rstrip()
-        if not line.strip():
-            doc.add_paragraph()
-            continue
-        if line.startswith("### "):
-            h = doc.add_paragraph()
-            run = h.add_run(line[4:].strip())
-            run.bold = True
-            run.font.size = Pt(11.5)
-            run.font.color.rgb = RGBColor(0xC8, 0x86, 0x3B)
-            h.paragraph_format.space_before = Pt(8)
-            h.paragraph_format.space_after = Pt(2)
-        elif line.startswith("## "):
-            h = doc.add_paragraph()
-            run = h.add_run(line[3:].strip())
-            run.bold = True
-            run.font.size = Pt(14)
-            run.font.color.rgb = RGBColor(0x22, 0x3F, 0x4D)
-            h.paragraph_format.space_before = Pt(12)
-            h.paragraph_format.space_after = Pt(4)
-        elif line.startswith("# "):
-            h = doc.add_paragraph()
-            run = h.add_run(line[2:].strip())
-            run.bold = True
-            run.font.size = Pt(16)
-            run.font.color.rgb = RGBColor(0x18, 0x2B, 0x36)
-        elif line.lstrip().startswith(("- ", "* ", "• ")):
-            p = doc.add_paragraph(style="List Bullet")
-            _docx_apply_inline(p, line.lstrip()[2:], bold_re)
-        elif re.match(r"^\d+[\.\)]\s", line.lstrip()):
-            p = doc.add_paragraph(style="List Number")
-            _docx_apply_inline(p, re.sub(r"^\d+[\.\)]\s", "", line.lstrip()), bold_re)
+def _docx_render_markdown(doc, text: str) -> None:
+    """Renderiza los mismos bloques Markdown que el PDF dentro de un DOCX real."""
+    for block in _parse_markdown(text):
+        if block.kind == "heading":
+            paragraph = doc.add_paragraph()
+            _docx_apply_inline(paragraph, block.text)
+            for run in paragraph.runs:
+                run.bold = True
+                run.font.size = Pt(16 if block.level == 1 else 14 if block.level == 2 else 11.5)
+                run.font.color.rgb = (
+                    RGBColor(0x18, 0x2B, 0x36)
+                    if block.level == 1 else RGBColor(0x22, 0x3F, 0x4D)
+                    if block.level == 2 else RGBColor(0xC8, 0x86, 0x3B)
+                )
+            paragraph.paragraph_format.space_before = Pt(12 if block.level <= 2 else 8)
+            paragraph.paragraph_format.space_after = Pt(4)
+        elif block.kind in {"bullet", "number"}:
+            paragraph = doc.add_paragraph(style="List Bullet" if block.kind == "bullet" else "List Number")
+            _docx_apply_inline(paragraph, block.text)
+        elif block.kind == "quote":
+            paragraph = doc.add_paragraph()
+            paragraph.paragraph_format.left_indent = Cm(0.5)
+            paragraph.paragraph_format.right_indent = Cm(0.3)
+            _docx_apply_inline(paragraph, block.text)
+            for run in paragraph.runs:
+                run.italic = True
+                run.font.color.rgb = RGBColor(0x5F, 0x74, 0x7D)
+            _docx_left_border(paragraph, "C8863B")
+        elif block.kind == "code":
+            paragraph = doc.add_paragraph()
+            paragraph.paragraph_format.left_indent = Cm(0.35)
+            run = paragraph.add_run(block.text)
+            run.font.name = "Courier New"
+            run.font.size = Pt(8.5)
+            _docx_shade_paragraph(paragraph, "F4F6F7")
+        elif block.kind == "hr":
+            _docx_horizontal_rule(doc, color="D7E0E2", size=4)
+        elif block.kind == "table":
+            _docx_markdown_table(doc, block)
         else:
-            p = doc.add_paragraph()
-            _docx_apply_inline(p, line, bold_re)
+            paragraph = doc.add_paragraph()
+            paragraph.paragraph_format.space_after = Pt(5)
+            _docx_apply_inline(paragraph, block.text)
 
 
-def _docx_apply_inline(paragraph, text: str, bold_re) -> None:
-    pos = 0
-    for match in bold_re.finditer(text):
-        if match.start() > pos:
-            paragraph.add_run(text[pos:match.start()])
-        bold_run = paragraph.add_run(match.group(1))
-        bold_run.bold = True
-        pos = match.end()
-    if pos < len(text):
-        paragraph.add_run(text[pos:])
+def _docx_apply_inline(paragraph, text: str) -> None:
+    for kind, value, url in _inline_tokens(text):
+        if kind == "link" and _clickable_url(url):
+            _docx_add_hyperlink(paragraph, value, str(url))
+            continue
+        run = paragraph.add_run(value)
+        if kind == "bold":
+            run.bold = True
+        elif kind == "italic":
+            run.italic = True
+        elif kind == "strike":
+            run.font.strike = True
+        elif kind == "code":
+            run.font.name = "Courier New"
+            run.font.size = Pt(9)
+            run.font.color.rgb = RGBColor(0x22, 0x3F, 0x4D)
+
+
+def _docx_add_hyperlink(paragraph, text: str, url: str) -> None:
+    relation_id = paragraph.part.relate_to(url, RT.HYPERLINK, is_external=True)
+    hyperlink = OxmlElement("w:hyperlink")
+    hyperlink.set(qn("r:id"), relation_id)
+    run = OxmlElement("w:r")
+    run_properties = OxmlElement("w:rPr")
+    color = OxmlElement("w:color")
+    color.set(qn("w:val"), "1F5F7A")
+    underline = OxmlElement("w:u")
+    underline.set(qn("w:val"), "single")
+    run_properties.extend([color, underline])
+    run.append(run_properties)
+    value = OxmlElement("w:t")
+    value.text = text
+    run.append(value)
+    hyperlink.append(run)
+    paragraph._p.append(hyperlink)
+
+
+def _docx_markdown_table(doc, block: _MarkdownBlock) -> None:
+    table = doc.add_table(rows=1, cols=len(block.headers))
+    table.style = "Light Grid Accent 1"
+    table.autofit = True
+    for index, header in enumerate(block.headers):
+        cell = table.rows[0].cells[index]
+        cell.text = ""
+        _docx_apply_inline(cell.paragraphs[0], header)
+        for run in cell.paragraphs[0].runs:
+            run.bold = True
+            run.font.color.rgb = RGBColor(0xFF, 0xFF, 0xFF)
+            run.font.size = Pt(9)
+        _docx_shade_cell(cell, "C8863B")
+    for row_index, values in enumerate(block.rows[:100]):
+        cells = table.add_row().cells
+        for column_index, value in enumerate(values[:len(block.headers)]):
+            cells[column_index].text = ""
+            _docx_apply_inline(cells[column_index].paragraphs[0], value)
+            for run in cells[column_index].paragraphs[0].runs:
+                run.font.size = Pt(8.5)
+            if row_index % 2 == 0:
+                _docx_shade_cell(cells[column_index], "EEF3F4")
+
+
+def _docx_shade_paragraph(paragraph, color: str) -> None:
+    properties = paragraph._p.get_or_add_pPr()
+    shade = OxmlElement("w:shd")
+    shade.set(qn("w:fill"), color)
+    properties.append(shade)
+
+
+def _docx_left_border(paragraph, color: str) -> None:
+    properties = paragraph._p.get_or_add_pPr()
+    borders = OxmlElement("w:pBdr")
+    left = OxmlElement("w:left")
+    left.set(qn("w:val"), "single")
+    left.set(qn("w:sz"), "12")
+    left.set(qn("w:space"), "6")
+    left.set(qn("w:color"), color)
+    borders.append(left)
+    properties.append(borders)
+
+
+# Alias interno para llamadas antiguas dentro de extensiones locales.
+def _docx_render_markdown_light(doc, text: str) -> None:
+    _docx_render_markdown(doc, text)

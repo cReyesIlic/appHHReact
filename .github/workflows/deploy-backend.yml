@@ -18,8 +18,6 @@ env:
   ACR_NAME: apphshimin
   IMAGE_NAME: shimin-backend
   WORKDIR: backend
-  SMOKE_TEST_CODIGO: O-0274
-  SMOKE_TEST_MIN_FILAS: "1"
 
 jobs:
   build-and-deploy:
@@ -75,6 +73,16 @@ jobs:
             --docker-custom-image-name $ACR_NAME.azurecr.io/$IMAGE_NAME:${{ steps.tag.outputs.tag }} \
             --docker-registry-server-url https://$ACR_NAME.azurecr.io
 
+      - name: Configure application identity policy
+        run: |
+          az webapp config appsettings set -g $RG -n $APP_SERVICE \
+            --settings \
+              AUTH_REQUIRED=true \
+              AUTH_ALLOW_LOCAL_DEV=false \
+              AUTH_ALLOWED_EMAIL_DOMAINS=shimin.cl \
+              AUTH_ADMIN_EMAILS=cristian.reyes@shimin.cl \
+            --output none
+
       - name: Restart web app
         run: az webapp restart -g $RG -n $APP_SERVICE
 
@@ -97,42 +105,34 @@ jobs:
           echo "Health check failed: version $EXPECTED_VERSION never became active" >&2
           exit 1
 
-      - name: Smoke test extract-budget end-to-end
+      - name: Enforce linked Static Web Apps authentication
+        run: |
+          set -eo pipefail
+          # `auth update` lee y conserva el proveedor azureStaticWebApps enlazado;
+          # sólo endurece la validación global y mantiene /health público.
+          az webapp auth update -g $RG -n $APP_SERVICE \
+            --enabled true \
+            --action Return401 \
+            --excluded-paths '["/health"]' \
+            --set globalValidation.requireAuthentication=true \
+            --output none
+
+          AUTH_STATE=$(az webapp auth show -g $RG -n $APP_SERVICE \
+            --query "properties.[globalValidation.requireAuthentication,globalValidation.unauthenticatedClientAction,identityProviders.azureStaticWebApps.enabled]" \
+            -o tsv)
+          echo "App Service auth: $AUTH_STATE"
+          echo "$AUTH_STATE" | grep -Eq '^true[[:space:]]+Return401[[:space:]]+true$'
+
+      - name: Security smoke test
         run: |
           set -eo pipefail
           HOST=$(az webapp show -g $RG -n $APP_SERVICE --query defaultHostName -o tsv)
           BACKEND="https://$HOST"
-          CODIGO="${SMOKE_TEST_CODIGO}"
-          echo "POST $BACKEND/api/entregables/extract-budget/$CODIGO (idempotente)"
-          response_file=$(mktemp)
-          http_code=$(curl -sS -X POST --max-time 540 \
-            -o "$response_file" -w "%{http_code}" \
-            "$BACKEND/api/entregables/extract-budget/$CODIGO" \
-            -H 'Content-Type: application/json')
-          response=$(cat "$response_file")
-          rm -f "$response_file"
-          echo "$response" | python -m json.tool 2>/dev/null | head -80 || echo "$response" | head -800
-          if [[ ! "$http_code" =~ ^2 ]]; then
-            echo "::error::Extract returned HTTP $http_code"
-            exit 1
-          fi
-          if echo "$response" | grep -qiE '"detail":\s*"[^"]'; then
-            echo "::error::Extract returned an error detail"
-            exit 1
-          fi
-
-          echo ""
-          echo "GET $BACKEND/api/entregables/extracted/$CODIGO"
-          extracted=$(curl -sS --max-time 60 "$BACKEND/api/entregables/extracted/$CODIGO")
-          n_filas=$(echo "$extracted" | python -c "import json,sys; print(len(json.load(sys.stdin).get('filas') or []))")
-          n_gastos=$(echo "$extracted" | python -c "import json,sys; print(len(json.load(sys.stdin).get('gastos') or []))")
-          n_audit=$(echo "$extracted" | python -c "import json,sys; print(len(json.load(sys.stdin).get('audit') or []))")
-          echo "Persisted: $n_filas filas, $n_gastos gastos, $n_audit audit"
-          if [ "$n_filas" -lt "$SMOKE_TEST_MIN_FILAS" ]; then
-            echo "::error::Expected at least $SMOKE_TEST_MIN_FILAS filas but got $n_filas"
-            exit 1
-          fi
-          echo "::notice::Smoke test passed for $CODIGO ($n_filas filas + $n_gastos gastos)"
+          health_code=$(curl -sS -o /dev/null -w "%{http_code}" "$BACKEND/health")
+          api_code=$(curl -sS -o /dev/null -w "%{http_code}" "$BACKEND/api/me")
+          echo "health=$health_code anonymous_api=$api_code"
+          [ "$health_code" = "200" ]
+          [ "$api_code" = "401" ] || [ "$api_code" = "403" ]
 
       - name: Azure logout
         if: always()

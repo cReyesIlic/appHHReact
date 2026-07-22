@@ -14,8 +14,10 @@ from typing import Any
 
 from app.rag.hybrid_store import HybridRagStore
 from app.rag.parent_child import ParentChildIndexer
+from app.services.budget_extractor_client import BudgetExtractorClient
 from app.services.deliverables_economics import DeliverablesEconomicsAnalyst
 from app.services.entity_index import EntityIndex
+from app.services.entregables_repository import EntregablesRepository
 from app.services.master_repository import MasterRepository
 from app.services.master_stats_analyst import MasterStatsAnalyst
 from app.services.proposal_index import ProposalIndexService
@@ -41,6 +43,8 @@ class ToolContext:
     wiki: StructuredWikiService
     sharepoint: SharePointClient
     staffing: StaffingClient
+    entregables: EntregablesRepository
+    budget_extractor: BudgetExtractorClient
     drafts: ProposalDraftService
 
     @classmethod
@@ -57,6 +61,8 @@ class ToolContext:
             wiki=StructuredWikiService(),
             sharepoint=SharePointClient(),
             staffing=StaffingClient(),
+            entregables=EntregablesRepository(),
+            budget_extractor=BudgetExtractorClient(),
             drafts=ProposalDraftService(),
         )
 
@@ -276,6 +282,111 @@ async def read_pdf_deep(ctx: ToolContext, codigo: str, focus: str | None = None)
         for c in contexts[:2]
     ]
     return {"codigo": codigo.upper(), "contexts": summary}
+
+
+async def get_hh_licitadas(
+    ctx: ToolContext,
+    codigo: str,
+    view: str = "entregable",
+    text: str | None = None,
+    limit: int = 200,
+) -> dict:
+    """Consulta HH estimadas/licitadas del Excel-Master y devuelve sus archivos fuente."""
+    from app.services.sharepoint_client import normalize_offer_code
+
+    normalized = normalize_offer_code(codigo)
+    if not normalized:
+        return {"error": f"Código de oferta inválido: {codigo}", "rows": []}
+    if view not in {"proyecto", "disciplina", "role", "entregable"}:
+        return {"error": f"Vista licitada desconocida: {view}", "rows": []}
+
+    result = await asyncio.to_thread(
+        ctx.entregables.aggregate_licitadas,
+        view=view,
+        codigo=normalized,
+        text=text,
+        limit=max(1, min(int(limit or 200), 500)),
+    )
+    result["codigo"] = normalized
+
+    # Entrega enlaces reales a los PDF/Excel emitidos. Los datos tabulares siguen
+    # siendo válidos aunque Graph no esté disponible temporalmente.
+    assets: list[dict] = []
+    files: list[dict] = []
+    try:
+        files = await ctx.sharepoint.list_emitido_files(
+            normalized,
+            kinds=(".pdf", ".docx", ".xlsx", ".xlsm", ".xls"),
+        )
+        assets = [
+            {
+                "codigo": normalized,
+                "title": item.get("name") or normalized,
+                "url": item.get("webUrl"),
+                "kind": item.get("kind"),
+                "last_modified": item.get("lastModifiedDateTime"),
+            }
+            for item in files[:12]
+            if item.get("webUrl")
+        ]
+    except Exception as exc:  # noqa: BLE001
+        result["source_assets_error"] = f"No se pudieron listar enlaces SharePoint: {exc}"
+    result["source_assets"] = assets
+
+    # Si el pipeline todavía no procesó este código, intenta el Excel emitido
+    # inmediatamente. Así una pregunta no confunde "aún no ingerido" con
+    # "el desglose no existe".
+    if not result.get("rows"):
+        excel_files = [
+            item for item in files
+            if str(item.get("kind") or "").casefold() in {"xlsx", "xlsm", "xls"}
+        ]
+        refresh_rows = []
+        if excel_files and ctx.budget_extractor.available:
+            selected = sorted(
+                excel_files,
+                key=lambda item: str(item.get("lastModifiedDateTime") or ""),
+                reverse=True,
+            )[:2]
+            for item in selected:
+                name = str(item.get("name") or f"{normalized}.xlsx")
+                try:
+                    content = await ctx.sharepoint.download_file(item)
+                    extracted = await asyncio.wait_for(
+                        ctx.budget_extractor.extract_normalized(normalized, content, name),
+                        timeout=240,
+                    )
+                    if extracted.get("error"):
+                        refresh_rows.append({"file": name, "error": extracted["error"]})
+                        continue
+                    persisted = ctx.budget_extractor.persist(normalized, name, extracted)
+                    refresh_rows.append({"file": name, "persisted": persisted})
+                except Exception as exc:  # noqa: BLE001
+                    refresh_rows.append({"file": name, "error": str(exc)})
+            refreshed = await asyncio.to_thread(
+                ctx.entregables.aggregate_licitadas,
+                view=view,
+                codigo=normalized,
+                text=text,
+                limit=max(1, min(int(limit or 200), 500)),
+            )
+            if refreshed.get("rows"):
+                result = refreshed
+                result["codigo"] = normalized
+                result["source_assets"] = assets
+        result["excel_refresh"] = refresh_rows
+
+    table_rows = []
+    for row in result.get("rows") or []:
+        compact = dict(row)
+        roles = compact.get("roles")
+        if isinstance(roles, dict):
+            compact["roles"] = ", ".join(
+                f"{role.upper()}: {hours:g}" for role, hours in roles.items()
+            )
+        table_rows.append(compact)
+    result["tables"] = [{"name": f"HH licitadas {normalized} · {view}", "rows": table_rows}]
+    return result
 
 
 async def generate_document(

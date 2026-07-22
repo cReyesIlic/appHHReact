@@ -8,8 +8,9 @@ from __future__ import annotations
 
 import json
 import sqlite3
+from contextlib import closing
 from datetime import datetime
-from hashlib import sha1
+from uuid import uuid4
 
 from app.core.config import settings
 
@@ -21,7 +22,7 @@ class ChatSessionService:
     # ---- Sessions ----
 
     def list_sessions(self, user_id: str, limit: int = 50) -> list[dict]:
-        with sqlite3.connect(settings.sqlite_path, timeout=5) as conn:
+        with closing(sqlite3.connect(settings.sqlite_path, timeout=5)) as conn:
             rows = conn.execute(
                 """
                 select id, title, created_at, updated_at, last_message_at, message_count
@@ -45,7 +46,7 @@ class ChatSessionService:
         ]
 
     def get_session(self, user_id: str, session_id: str) -> dict:
-        with sqlite3.connect(settings.sqlite_path, timeout=5) as conn:
+        with closing(sqlite3.connect(settings.sqlite_path, timeout=5)) as conn:
             row = conn.execute(
                 """
                 select id, title, created_at, updated_at, last_message_at, message_count, working_context
@@ -68,8 +69,8 @@ class ChatSessionService:
 
     def create_session(self, user_id: str, title: str = "Nueva conversación") -> dict:
         now = datetime.now().isoformat(timespec="seconds")
-        session_id = sha1(f"{user_id}:{now}:{title}".encode("utf-8")).hexdigest()[:16]
-        with sqlite3.connect(settings.sqlite_path, timeout=5) as conn:
+        session_id = uuid4().hex
+        with closing(sqlite3.connect(settings.sqlite_path, timeout=5)) as conn, conn:
             conn.execute(
                 """
                 insert into chat_sessions
@@ -82,7 +83,7 @@ class ChatSessionService:
 
     def rename_session(self, user_id: str, session_id: str, title: str) -> dict:
         now = datetime.now().isoformat(timespec="seconds")
-        with sqlite3.connect(settings.sqlite_path, timeout=5) as conn:
+        with closing(sqlite3.connect(settings.sqlite_path, timeout=5)) as conn, conn:
             n = conn.execute(
                 "update chat_sessions set title = ?, updated_at = ? where user_id = ? and id = ?",
                 (title.strip()[:200], now, user_id, session_id),
@@ -92,8 +93,17 @@ class ChatSessionService:
         return self.get_session(user_id, session_id)
 
     def delete_session(self, user_id: str, session_id: str) -> dict:
-        with sqlite3.connect(settings.sqlite_path, timeout=5) as conn:
-            conn.execute("delete from chat_messages where session_id = ?", (session_id,))
+        with closing(sqlite3.connect(settings.sqlite_path, timeout=5)) as conn, conn:
+            owned = conn.execute(
+                "select 1 from chat_sessions where user_id = ? and id = ?",
+                (user_id, session_id),
+            ).fetchone()
+            if not owned:
+                raise KeyError(session_id)
+            conn.execute(
+                "delete from chat_messages where user_id = ? and session_id = ?",
+                (user_id, session_id),
+            )
             n = conn.execute(
                 "delete from chat_sessions where user_id = ? and id = ?",
                 (user_id, session_id),
@@ -101,8 +111,8 @@ class ChatSessionService:
         return {"deleted": session_id, "rows": n}
 
     def update_working_context(self, user_id: str, session_id: str, working_context: dict) -> None:
-        with sqlite3.connect(settings.sqlite_path, timeout=5) as conn:
-            conn.execute(
+        with closing(sqlite3.connect(settings.sqlite_path, timeout=5)) as conn, conn:
+            n = conn.execute(
                 "update chat_sessions set working_context = ?, updated_at = ? where user_id = ? and id = ?",
                 (
                     json.dumps(working_context, ensure_ascii=False),
@@ -110,23 +120,25 @@ class ChatSessionService:
                     user_id,
                     session_id,
                 ),
-            )
+            ).rowcount
+        if not n:
+            raise KeyError(session_id)
 
     # ---- Messages ----
 
     def list_messages(self, user_id: str, session_id: str, limit: int = 200) -> list[dict]:
         # Verifica propiedad
         self.get_session(user_id, session_id)
-        with sqlite3.connect(settings.sqlite_path, timeout=5) as conn:
+        with closing(sqlite3.connect(settings.sqlite_path, timeout=5)) as conn:
             rows = conn.execute(
                 """
                 select id, role, content, trace, sources, tables, created_at
                 from chat_messages
-                where session_id = ?
+                where user_id = ? and session_id = ?
                 order by created_at asc, id asc
                 limit ?
                 """,
-                (session_id, limit),
+                (user_id, session_id, limit),
             ).fetchall()
         return [
             {
@@ -154,15 +166,16 @@ class ChatSessionService:
         # Verificar que la sesión existe y pertenece al user
         self.get_session(user_id, session_id)
         now = datetime.now().isoformat(timespec="seconds")
-        with sqlite3.connect(settings.sqlite_path, timeout=5) as conn:
+        with closing(sqlite3.connect(settings.sqlite_path, timeout=5)) as conn, conn:
             cursor = conn.execute(
                 """
                 insert into chat_messages
-                (session_id, role, content, trace, sources, tables, created_at)
-                values (?, ?, ?, ?, ?, ?, ?)
+                (session_id, user_id, role, content, trace, sources, tables, created_at)
+                values (?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     session_id,
+                    user_id,
                     role,
                     content,
                     json.dumps(trace or [], ensure_ascii=False),
@@ -174,20 +187,23 @@ class ChatSessionService:
             msg_id = cursor.lastrowid
             # Auto-titular sesión con primer user message si aún es default
             if role == "user":
-                row = conn.execute("select title from chat_sessions where id = ?", (session_id,)).fetchone()
+                row = conn.execute(
+                    "select title from chat_sessions where id = ? and user_id = ?",
+                    (session_id, user_id),
+                ).fetchone()
                 if row and row[0] in {"Nueva conversación", "Nueva conversacion"}:
                     new_title = content.strip().split("\n")[0][:80]
                     conn.execute(
-                        "update chat_sessions set title = ? where id = ?",
-                        (new_title or "Nueva conversación", session_id),
+                        "update chat_sessions set title = ? where id = ? and user_id = ?",
+                        (new_title or "Nueva conversación", session_id, user_id),
                     )
             conn.execute(
                 """
                 update chat_sessions
                 set last_message_at = ?, updated_at = ?, message_count = message_count + 1
-                where id = ?
+                where id = ? and user_id = ?
                 """,
-                (now, now, session_id),
+                (now, now, session_id, user_id),
             )
         return {"id": msg_id, "session_id": session_id, "role": role, "created_at": now}
 
@@ -195,7 +211,7 @@ class ChatSessionService:
 
     def _ensure_tables(self) -> None:
         settings.sqlite_path.parent.mkdir(parents=True, exist_ok=True)
-        with sqlite3.connect(settings.sqlite_path) as conn:
+        with closing(sqlite3.connect(settings.sqlite_path)) as conn, conn:
             conn.execute(
                 """
                 create table if not exists chat_sessions (
@@ -215,6 +231,7 @@ class ChatSessionService:
                 create table if not exists chat_messages (
                     id integer primary key autoincrement,
                     session_id text not null,
+                    user_id text not null,
                     role text not null,
                     content text not null,
                     trace text default '[]',
@@ -224,5 +241,21 @@ class ChatSessionService:
                 )
                 """
             )
+            columns = {
+                str(row[1]) for row in conn.execute("pragma table_info(chat_messages)").fetchall()
+            }
+            if "user_id" not in columns:
+                conn.execute("alter table chat_messages add column user_id text not null default ''")
+            conn.execute(
+                """
+                update chat_messages
+                set user_id = coalesce(
+                    (select s.user_id from chat_sessions s where s.id = chat_messages.session_id),
+                    ''
+                )
+                where user_id = ''
+                """
+            )
             conn.execute("create index if not exists idx_chat_sessions_user on chat_sessions(user_id, last_message_at)")
             conn.execute("create index if not exists idx_chat_messages_session on chat_messages(session_id, created_at)")
+            conn.execute("create index if not exists idx_chat_messages_user_session on chat_messages(user_id, session_id, created_at)")

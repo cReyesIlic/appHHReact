@@ -57,6 +57,13 @@ class Settings(BaseSettings):
     site_url_proyectos: str | None = Field(default=None, alias="SITE_URL_PROYECTOS")
     sharepoint_site: str | None = Field(default=None, alias="SHAREPOINT_SITE")
 
+    # Identidad propagada por Azure Static Web Apps / App Service Easy Auth.
+    # Produccion falla cerrada; el fallback local requiere habilitacion explicita.
+    auth_required: bool = Field(default=True, alias="AUTH_REQUIRED")
+    auth_allow_local_dev: bool = Field(default=False, alias="AUTH_ALLOW_LOCAL_DEV")
+    auth_allowed_email_domains: str = Field(default="shimin.cl", alias="AUTH_ALLOWED_EMAIL_DOMAINS")
+    auth_admin_emails: str = Field(default="", alias="AUTH_ADMIN_EMAILS")
+
     azure_connection_string: str | None = Field(default=None, alias="AZURE_CONNECTION_STRING")
     container_name: str | None = Field(default=None, alias="CONTAINER_NAME")
     blob_name: str | None = Field(default=None, alias="BLOB_NAME")
