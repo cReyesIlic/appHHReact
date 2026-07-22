@@ -196,12 +196,36 @@ class ParentChildIndexer:
         return hits[:limit]
 
     def status(self) -> dict:
-        with sqlite3.connect(settings.sqlite_path) as conn:
+        conn = sqlite3.connect(settings.sqlite_path)
+        try:
             parent_count = conn.execute("select count(*) from rag_parent_sections").fetchone()[0]
             child_count = conn.execute("select count(*) from rag_child_chunks").fetchone()[0]
             proposal_count = conn.execute("select count(distinct codigo) from rag_parent_sections").fetchone()[0]
+            searchable_proposal_count = conn.execute(
+                "select count(distinct codigo) from rag_child_chunks"
+            ).fetchone()[0]
+            parent_only_codes = [
+                str(row[0])
+                for row in conn.execute(
+                    """
+                    select distinct p.codigo
+                    from rag_parent_sections p
+                    where not exists (
+                        select 1 from rag_child_chunks c where c.codigo = p.codigo
+                    )
+                    order by p.codigo
+                    limit 25
+                    """
+                ).fetchall()
+                if row[0]
+            ]
+        finally:
+            conn.close()
         return {
             "proposal_count": proposal_count,
+            "searchable_proposal_count": searchable_proposal_count,
+            "parent_only_count": max(0, proposal_count - searchable_proposal_count),
+            "parent_only_codes_preview": parent_only_codes,
             "parent_count": parent_count,
             "child_count": child_count,
         }

@@ -134,6 +134,26 @@ class ParentChildReliabilityTests(SettingsPathsMixin, unittest.TestCase):
             self.assertFalse(indexer._looks_like_heading("200 ADistribucion de VDC a control"))
             self.assertTrue(indexer._looks_like_heading("3. Alcance del servicio"))
 
+    def test_status_reports_parent_only_codes_as_not_searchable(self):
+        with tempfile.TemporaryDirectory() as temp_dir, self.patch_settings(temp_dir):
+            indexer = ParentChildIndexer()
+            with closing(sqlite3.connect(settings.sqlite_path)) as conn:
+                conn.execute(
+                    """
+                    insert into rag_parent_sections
+                        (parent_id, codigo, title, text, page_start, page_end, metadata)
+                    values ('orphan-parent', 'O-9996', 'Documento', 'texto legado', null, null, '{}')
+                    """
+                )
+                conn.commit()
+
+            status = indexer.status()
+
+            self.assertEqual(status["proposal_count"], 1)
+            self.assertEqual(status["searchable_proposal_count"], 0)
+            self.assertEqual(status["parent_only_count"], 1)
+            self.assertEqual(status["parent_only_codes_preview"], ["O-9996"])
+
 
 class ProposalExtractionTests(unittest.TestCase):
     def test_pdf_extraction_preserves_page_numbers(self):
