@@ -385,6 +385,18 @@ class ProposalDraftAgentContextTests(unittest.TestCase):
                 ]
             },
         )
+        candidates = loop._merge_research_candidates(
+            candidates,
+            [
+                {
+                    "codigo": "O-1537",
+                    "title": "En la Tabla 1 se muestra el listado de entregables.",
+                    "sources": ["search_rag"],
+                    "review_match": True,
+                    "status": "pending",
+                }
+            ],
+        )
         result = {
             "codigo": "O-1537",
             "rows": [
@@ -405,10 +417,22 @@ class ProposalDraftAgentContextTests(unittest.TestCase):
         marked = loop._mark_candidate_from_hh(candidates, "O-1537", result, benchmarks)
 
         self.assertEqual([item["codigo"] for item in candidates], ["O-1537"])
+        self.assertIn("Revisión Ingeniería", candidates[0]["title"])
+        self.assertEqual(candidates[0]["sources"], ["search_master", "search_rag"])
         self.assertEqual(benchmarks[0]["documentos"], 3)
         self.assertEqual(benchmarks[0]["hh"], 35)
         self.assertEqual(benchmarks[0]["hh_por_documento"], 11.67)
         self.assertEqual(marked[0]["status"], "accepted")
+
+    def test_quantitative_benchmarks_dedupe_accent_variants_by_metrics(self):
+        loop = AgentLoop.__new__(AgentLoop)
+        benchmarks = loop._dedupe_benchmarks(
+            [
+                {"codigo": "O-1553", "actividad": "Revision Hidraulica", "documentos": 14, "hh": 70},
+                {"codigo": "O-1553", "actividad": "Revisión Hidráulica", "documentos": 14, "hh": 70},
+            ]
+        )
+        self.assertEqual(len(benchmarks), 1)
 
     def test_review_budget_without_document_denominator_requires_pdf(self):
         loop = AgentLoop.__new__(AgentLoop)

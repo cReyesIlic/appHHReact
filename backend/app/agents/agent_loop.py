@@ -1257,7 +1257,9 @@ class AgentLoop:
             None,
         )
         candidate_title = str((candidate or {}).get("title") or "")
-        if not candidate or not self._looks_like_review_project(candidate_title):
+        if not candidate or not (
+            candidate.get("review_match") or self._looks_like_review_project(candidate_title)
+        ):
             return []
 
         # Algunos presupuestos (p. ej. O-1537) traen una fila por documento/plano
@@ -1332,6 +1334,7 @@ class AgentLoop:
                     "title": candidate_title or normalized_code,
                     "estado": str(estado or "").strip().upper() or None,
                     "sources": [tool_name],
+                    "review_match": True,
                     "status": "pending",
                     "reason": "Candidato semántico; falta verificar tabla HH y denominador documental",
                 }
@@ -1373,13 +1376,20 @@ class AgentLoop:
             previous = merged.get(code, {})
             sources = list(dict.fromkeys([*(previous.get("sources") or []), *(item.get("sources") or [])]))
             status = previous.get("status") if previous.get("status") in {"accepted", "rejected", "needs_pdf"} else item.get("status")
+            previous_title = str(previous.get("title") or "")
+            incoming_title = str(item.get("title") or "")
+            if self._looks_like_review_project(previous_title) and not self._looks_like_review_project(incoming_title):
+                best_title = previous_title
+            else:
+                best_title = incoming_title or previous_title or code
             merged[code] = {
                 **previous,
                 **item,
                 "codigo": code,
-                "title": item.get("title") or previous.get("title") or code,
+                "title": best_title,
                 "estado": item.get("estado") or previous.get("estado"),
                 "sources": sources,
+                "review_match": bool(previous.get("review_match") or item.get("review_match")),
                 "status": status or "pending",
                 "reason": previous.get("reason") if status == previous.get("status") else item.get("reason"),
             }
@@ -1483,7 +1493,17 @@ class AgentLoop:
         for item in benchmarks:
             if not isinstance(item, dict):
                 continue
-            key = (str(item.get("codigo") or "").upper(), str(item.get("actividad") or "").casefold())
+            code = str(item.get("codigo") or "").upper()
+            documents = item.get("documentos")
+            hours = item.get("hh")
+            key = (
+                code,
+                round(float(documents), 3),
+                round(float(hours), 3),
+            ) if code and documents is not None and hours is not None else (
+                code,
+                str(item.get("actividad") or "").casefold(),
+            )
             if key != ("", ""):
                 unique[key] = item
         return list(unique.values())[-30:]
