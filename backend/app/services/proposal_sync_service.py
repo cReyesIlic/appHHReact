@@ -628,9 +628,17 @@ class ProposalSyncService:
         entry_id = str(state.get("wiki_entry_id") or "").strip()
         if entry_id:
             try:
-                self.wiki.delete_entry(entry_id)
-                removed["wiki_entry"] = entry_id
+                entry = self.wiki.get_entry(entry_id)
             except KeyError:
+                entry = None
+            if entry:
+                entry_path = Path(str(entry.get("file_path") or ""))
+                if entry_path.is_file():
+                    entry_path.unlink()
+                with closing(sqlite3.connect(settings.sqlite_path, timeout=30)) as conn, conn:
+                    conn.execute("delete from wiki_entries where id = ?", (entry_id,))
+                removed["wiki_entry"] = entry_id
+            else:
                 removed["wiki_entry"] = False
         proposal_page = settings.resolve_path(f"storage/llm_wiki/proposals/{codigo}.md")
         if proposal_page.exists():
@@ -649,6 +657,14 @@ class ProposalSyncService:
                 cache_dir.rmdir()
         removed["cache_files"] = cache_files_removed
         StructuredWikiService.invalidate_sync_cache()
+        try:
+            self.wiki.reindex_entries()
+            removed["wiki_reindexed"] = True
+        except Exception as exc:  # noqa: BLE001
+            # La fuente contaminada ya quedo fuera de las tablas consultables.
+            # Mantener el reproceso pendiente es preferible a restaurarla.
+            removed["wiki_reindexed"] = False
+            removed["wiki_reindex_error"] = f"{type(exc).__name__}: {exc}"
         return removed
 
     def _ganadas_master_rows(self) -> list[dict]:

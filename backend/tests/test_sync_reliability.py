@@ -313,6 +313,18 @@ class PipelineRegistryTests(SettingsPathsMixin, unittest.IsolatedAsyncioTestCase
 
 
 class WikiReprocessTests(SettingsPathsMixin, unittest.IsolatedAsyncioTestCase):
+    async def test_reindex_tolerates_duplicate_section_ids(self):
+        markdown = """# Wiki\n\n## Grupo\n\n### Repetida\nMismo contenido.\n\n### Repetida\nMismo contenido.\n"""
+        with tempfile.TemporaryDirectory() as temp_dir, self.patch_settings(temp_dir):
+            service = StructuredWikiService()
+
+            result = service.build(markdown)
+
+            self.assertEqual(result["sections"], 4)
+            with closing(sqlite3.connect(settings.sqlite_path)) as conn:
+                stored = conn.execute("select count(*) from wiki_sections").fetchone()[0]
+            self.assertGreater(stored, 0)
+
     async def test_forced_reprocess_keeps_one_entry_and_same_file(self):
         with tempfile.TemporaryDirectory() as temp_dir, self.patch_settings(temp_dir):
             base = Path(temp_dir)
