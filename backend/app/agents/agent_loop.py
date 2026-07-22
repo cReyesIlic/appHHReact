@@ -153,7 +153,6 @@ def build_system_prompt(skill_registry: SkillRegistry) -> str:
 
 
 _DRAFT_CORE_TOOLS = {
-    "load_skill",
     "search_wiki_entries",
     "search_master",
     "search_rag",
@@ -183,6 +182,7 @@ DRAFT_TOOL_TIMEOUTS = {
     "get_proyecto_staffing": 25,
 }
 DRAFT_LLM_TIMEOUT_SECONDS = 20
+DRAFT_FINAL_TIMEOUT_SECONDS = 60
 DRAFT_MAX_ITERATIONS = 3
 
 
@@ -197,6 +197,9 @@ def draft_tool_schemas(question: str, stage: str | None = None) -> list[dict]:
         allowed.update({"get_hh_licitadas", "search_entregables_hh"})
     if stage_key == "hours" or re.search(r"\b(hh|horas|costo|costos|costear|monto|tarifa|presupuesto)\b", normalized):
         allowed.update(_DRAFT_COST_TOOLS)
+    if stage_key == "hours":
+        # El registro se precarga automáticamente antes del primer turno del modelo.
+        allowed.discard("analyze_draft_document_register")
     if re.search(r"\b(?:o|sh)-\d{2,6}\b", normalized):
         allowed.add("get_proposal_detail")
     return [schema for schema in TOOL_SCHEMAS if schema.get("function", {}).get("name") in allowed]
@@ -328,6 +331,10 @@ class AgentLoop:
                     {"slug": draft_slug, "query": draft_query, "limit": 10},
                 ),
             ]
+            if draft_stage == "hours":
+                preload_calls.append(
+                    ("analyze_draft_document_register", {"slug": draft_slug})
+                )
             for name, args in preload_calls:
                 started = time.time()
                 try:
@@ -397,6 +404,23 @@ class AgentLoop:
             content = getattr(message, "content", None) or ""
 
             if not tool_calls:
+                if (
+                    draft_slug
+                    and draft_stage == "hours"
+                    and "estimate_draft_review_hours" not in called_tools
+                ):
+                    # Una respuesta narrativa no puede cerrar esta etapa sin la tabla auditable.
+                    # La IA elegirá los parámetros en el paso forzado posterior usando la evidencia
+                    # ya acumulada; el cálculo sigue siendo agentico, no una tasa fija del backend.
+                    messages.append({"role": "assistant", "content": content})
+                    trace.append(
+                        ToolTrace(
+                            tool="agent.hours_guard",
+                            status="warning",
+                            detail="la IA intentó cerrar sin ejecutar estimate_draft_review_hours",
+                        )
+                    )
+                    break
                 focus_code = self._evidence_code(question, seen_codes)
                 needs_licitada_lookup = self._needs_licitada_lookup(question, called_tools)
                 required_detail_call = self._required_full_detail_call(question, focus_code, called_tools)
@@ -585,12 +609,137 @@ class AgentLoop:
             trace.append(ToolTrace(tool="agent.iter", status="ok", detail=f"iter {iteration} en {int((time.time()-t0)*1000)}ms"))
 
         trace.append(ToolTrace(tool="agent.loop", status="warning", detail="max_iterations alcanzado"))
+
+        # La etapa HH tiene un contrato de salida: debe existir una estimación por documento.
+        # Al agotarse el ciclo general, damos a la IA una llamada exclusiva para seleccionar las
+        # tasas a partir de toda la evidencia recogida y ejecutar el estimador. No imponemos tasas
+        # determinísticas: el modelo decide default, ajustes por tipo/disciplina y actividades.
+        if draft_slug and draft_stage == "hours" and "estimate_draft_review_hours" not in called_tools:
+            estimator_schema = next(
+                (
+                    schema
+                    for schema in available_tools
+                    if schema.get("function", {}).get("name") == "estimate_draft_review_hours"
+                ),
+                None,
+            )
+            try:
+                if estimator_schema is None:
+                    raise RuntimeError("estimate_draft_review_hours no está disponible")
+                messages.append(
+                    {
+                        "role": "user",
+                        "content": (
+                            "Antes de cerrar debes calcular la tabla auditable. Usa la evidencia histórica "
+                            "ya obtenida para decidir tasas de REVISIÓN, nunca de elaboración. Llama ahora "
+                            "exactamente a estimate_draft_review_hours. Incluye en general_activities KOM, "
+                            "control documental, coordinación, QA/QC, gestión de observaciones e informe "
+                            "cuando correspondan. Si existe un benchmark histórico con cantidad de documentos "
+                            "y HH, calcula su tasa implícita y úsala como ancla; cualquier desviación material "
+                            "debe quedar justificada por tipo o complejidad. Explica la base y no inventes "
+                            "precisión sin evidencia."
+                        ),
+                    }
+                )
+                planned = await asyncio.wait_for(
+                    self.llm.chat_with_tools(
+                        deployment=deployment,
+                        messages=messages,
+                        tools=[estimator_schema],
+                        tool_choice={
+                            "type": "function",
+                            "function": {"name": "estimate_draft_review_hours"},
+                        },
+                        max_completion_tokens=1600,
+                    ),
+                    timeout=DRAFT_FINAL_TIMEOUT_SECONDS,
+                )
+                planned_calls = getattr(planned, "tool_calls", None) or []
+                if not planned_calls:
+                    raise RuntimeError("la IA no emitió la llamada obligatoria al estimador")
+                tc = planned_calls[0]
+                raw_args = tc.function.arguments or "{}"
+                args = json.loads(raw_args)
+                if not isinstance(args, dict):
+                    raise ValueError("argumentos del estimador no son un objeto JSON")
+                args["slug"] = draft_slug
+                messages.append(
+                    {
+                        "role": "assistant",
+                        "content": getattr(planned, "content", None) or "",
+                        "tool_calls": [
+                            {
+                                "id": tc.id,
+                                "type": "function",
+                                "function": {
+                                    "name": "estimate_draft_review_hours",
+                                    "arguments": json.dumps(args, ensure_ascii=False),
+                                },
+                            }
+                        ],
+                    }
+                )
+                started = time.time()
+                estimate_result = await asyncio.wait_for(
+                    dispatcher.dispatch("estimate_draft_review_hours", args),
+                    timeout=DRAFT_TOOL_TIMEOUT_SECONDS,
+                )
+                latency_ms = int((time.time() - started) * 1000)
+                called_tools.add("estimate_draft_review_hours")
+                estimate_status = (
+                    "error"
+                    if isinstance(estimate_result, dict) and estimate_result.get("error")
+                    else "ok"
+                )
+                trace.append(
+                    ToolTrace(
+                        tool="agent.estimate_draft_review_hours",
+                        status=estimate_status,
+                        detail=(
+                            "cierre obligatorio de etapa HH · "
+                            f"documentos={estimate_result.get('total_documents') if isinstance(estimate_result, dict) else '?'} · "
+                            f"total_hh={estimate_result.get('total_hours') if isinstance(estimate_result, dict) else '?'} "
+                            f"({latency_ms}ms)"
+                        ),
+                    )
+                )
+                if not isinstance(estimate_result, dict) or estimate_result.get("error"):
+                    raise RuntimeError(str((estimate_result or {}).get("error") or "estimador sin resultado"))
+                self._collect_payload(
+                    "estimate_draft_review_hours",
+                    estimate_result,
+                    sources,
+                    tables,
+                    charts,
+                    seen_codes,
+                )
+                messages.append(
+                    {
+                        "role": "tool",
+                        "tool_call_id": tc.id,
+                        "name": "estimate_draft_review_hours",
+                        "content": json.dumps(self._truncate_result(estimate_result), ensure_ascii=False),
+                    }
+                )
+            except Exception as exc:  # noqa: BLE001
+                trace.append(
+                    ToolTrace(
+                        tool="agent.hours_guard",
+                        status="error",
+                        detail=f"{type(exc).__name__}: {exc}",
+                    )
+                )
+
         # Fallback: pedir respuesta final sin tools
         try:
             close_instruction = (
                 f"Cierra ahora la etapa '{draft_stage}' con la evidencia recogida. "
                 f"{DRAFT_STAGE_INSTRUCTIONS.get(draft_stage, DRAFT_STAGE_INSTRUCTIONS['notes'])} "
-                "Entrega Markdown autosuficiente, tablas, supuestos y fuentes. No llames más herramientas."
+                "Entrega Markdown autosuficiente y completo en un máximo de 1.200 palabras. Resume las "
+                "tablas estructuradas: no copies las filas por documento ni repitas las URLs de fuentes, "
+                "porque la interfaz las agrega automáticamente. Incluye supuestos, totales y decisiones "
+                "pendientes. Verifica que la última sección y toda tabla Markdown queden cerradas. "
+                "No llames más herramientas."
                 if draft_slug
                 else "Responde ahora con lo recogido. No llames más herramientas."
             )
@@ -601,13 +750,20 @@ class AgentLoop:
                     messages=messages,
                     tools=available_tools,
                     tool_choice="none",
-                    max_completion_tokens=1800 if draft_slug else 2048,
+                    max_completion_tokens=4096 if draft_slug else 2048,
                 ),
-                timeout=DRAFT_LLM_TIMEOUT_SECONDS if draft_slug else 30,
+                timeout=DRAFT_FINAL_TIMEOUT_SECONDS if draft_slug else 30,
             )
             answer = (final.content if final else "") or "(respuesta vacía)"
+            trace.append(ToolTrace(tool="agent.finalize", status="ok", detail="respuesta final cerrada"))
         except Exception as exc:  # noqa: BLE001
-            trace.append(ToolTrace(tool="agent.finalize", status="error", detail=str(exc)))
+            trace.append(
+                ToolTrace(
+                    tool="agent.finalize",
+                    status="error",
+                    detail=f"{type(exc).__name__}: {exc}",
+                )
+            )
             answer = "No fue posible cerrar la respuesta dentro del cupo. Datos recolectados disponibles en sources."
 
         self._collect_outputs(messages, sources, tables, charts, seen_codes)
@@ -863,17 +1019,22 @@ class AgentLoop:
         sources[:] = unique
 
     def _dedupe_tables(self, tables: list[dict]) -> None:
-        """Conserva la primera versión (completa) de cada tabla recogida."""
+        """Conserva la versión con más filas de cada tabla recogida."""
         unique: list[dict] = []
-        seen: set[str] = set()
+        positions: dict[str, int] = {}
         for index, table in enumerate(tables):
             if not isinstance(table, dict):
                 continue
             name = str(table.get("name") or f"table-{index}")
-            if name in seen:
+            position = positions.get(name)
+            if position is None:
+                positions[name] = len(unique)
+                unique.append(table)
                 continue
-            seen.add(name)
-            unique.append(table)
+            current_rows = unique[position].get("rows") or []
+            candidate_rows = table.get("rows") or []
+            if len(candidate_rows) > len(current_rows):
+                unique[position] = table
         tables[:] = unique
 
     def _append_source_links(self, answer: str, sources: list[Source]) -> str:

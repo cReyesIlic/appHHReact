@@ -642,7 +642,7 @@ class ProposalDraftService:
 
         found: dict[str, dict] = {}
         wor_pattern = re.compile(
-            r"WOR-GPR-21CS187-OT-030-([A-Z0-9]+)-([A-Z])-([A-Z]+)-(\d+)"
+            r"WOR-GPR-21CS187-OT-030-([A-Z0-9]+)-([A-Z])-([A-Z]+)-(\d{3})(?!\d)"
         )
         for match in wor_pattern.finditer(register_text):
             code = match.group(0)
@@ -676,6 +676,10 @@ class ProposalDraftService:
         generic_code = re.compile(r"\b[A-Z][A-Z0-9]*(?:-[A-Z0-9][A-Z0-9._]*){3,}\b")
         for match in generic_code.finditer(register_text):
             code = match.group(0).rstrip("._")
+            # Los códigos WOR válidos ya fueron capturados por el parser estricto.
+            # OCR suele concatenar dos filas y producir falsos WOR más largos.
+            if code.startswith("WOR-"):
+                continue
             overlaps_known = any(
                 code == known or code.startswith(f"{known}-") or code.startswith(f"{known}_")
                 for known in found

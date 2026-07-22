@@ -148,6 +148,9 @@ class ProposalDraftBriefTests(unittest.TestCase):
         document.add_paragraph("WOR-GPR-21CS187-OT-030-1128-E-DW-001 - 0")
         document.add_paragraph("WOR - GPR - 21CS187 - OT - 030 - 1128 - P - PID - 001 1 2")
         document.add_paragraph("CEN-ST-000-E-SK-003_v0 Estándar de puesta a tierra")
+        document.add_paragraph(
+            "WOR-GPR-21CS187-OT-030-1126G-C-DW-0126G-C-DW-006 texto OCR concatenado"
+        )
         buffer = BytesIO()
         document.save(buffer)
         service.add_file("owner@shimin.cl", draft["slug"], "Registro.docx", buffer.getvalue())
@@ -240,6 +243,19 @@ class ProposalDraftBriefTests(unittest.TestCase):
 
 
 class ProposalDraftAgentContextTests(unittest.TestCase):
+    def test_table_deduplication_keeps_the_most_complete_version(self):
+        loop = AgentLoop.__new__(AgentLoop)
+        tables = [
+            {"name": "Estimación por documento", "rows": []},
+            {"name": "Otra tabla", "rows": [{"id": 1}]},
+            {"name": "Estimación por documento", "rows": [{"id": 1}, {"id": 2}]},
+        ]
+
+        loop._dedupe_tables(tables)
+
+        self.assertEqual([table["name"] for table in tables], ["Estimación por documento", "Otra tabla"])
+        self.assertEqual(len(tables[0]["rows"]), 2)
+
     def test_rag_merges_multiple_semantic_queries(self):
         hybrid = Mock()
 
@@ -278,7 +294,8 @@ class ProposalDraftAgentContextTests(unittest.TestCase):
             for schema in draft_tool_schemas("Estima las HH, costo y tarifa de O-1779")
         }
 
-        self.assertTrue({"load_skill", "search_rag", "search_master", "search_draft_chunks"} <= general)
+        self.assertTrue({"search_rag", "search_master", "search_draft_chunks"} <= general)
+        self.assertNotIn("load_skill", general)
         self.assertNotIn("compute_economics", general)
         self.assertIn("compute_economics", costing)
         self.assertIn("get_hh_licitadas", costing)
@@ -288,7 +305,7 @@ class ProposalDraftAgentContextTests(unittest.TestCase):
             schema["function"]["name"]
             for schema in draft_tool_schemas("Estima la revisión", stage="hours")
         }
-        self.assertIn("analyze_draft_document_register", hours_stage)
+        self.assertNotIn("analyze_draft_document_register", hours_stage)
         self.assertIn("estimate_draft_review_hours", hours_stage)
         self.assertIn("read_pdf_deep", hours_stage)
 
@@ -409,6 +426,96 @@ class ProposalDraftAgentContextTests(unittest.TestCase):
         self.assertEqual(result.answer, "Propuesta accionable cerrada.")
         self.assertTrue(
             any(t.tool == "agent.compute_proposal_support" and t.status == "error" for t in result.trace)
+        )
+
+    def test_hours_stage_forces_ai_estimator_before_final_answer(self):
+        loop = AgentLoop.__new__(AgentLoop)
+        loop.max_iterations = 1
+        loop.skill_registry = Mock()
+        loop.skill_registry.catalog.return_value = ""
+        evidence_call = SimpleNamespace(
+            id="call-evidence",
+            function=SimpleNamespace(
+                name="search_rag",
+                arguments=json.dumps({"query": "revisión ingeniería", "limit": 4}),
+            ),
+        )
+        estimate_call = SimpleNamespace(
+            id="call-estimate",
+            function=SimpleNamespace(
+                name="estimate_draft_review_hours",
+                arguments=json.dumps(
+                    {
+                        "slug": "revision-id",
+                        "default_hours": 5,
+                        "hours_by_type": {"PID": 8},
+                        "general_activities": {"Informe final": 20},
+                        "basis": "O-1553: revisión histórica por documento",
+                    }
+                ),
+            ),
+        )
+        loop.llm = Mock(client=object(), azure=False)
+        loop.llm.chat_with_tools = AsyncMock(
+            side_effect=[
+                SimpleNamespace(tool_calls=[evidence_call], content=""),
+                SimpleNamespace(tool_calls=[estimate_call], content=""),
+                SimpleNamespace(tool_calls=[], content="## Estimación\nTotal: **39 HH**"),
+            ]
+        )
+        dispatcher = Mock()
+
+        async def dispatch(name, args):
+            if name == "load_skill":
+                return {"name": "armar_propuesta", "content": "Flujo"}
+            if name in {"get_draft_context", "search_draft_chunks"}:
+                return {"slug": "revision-id", "count": 0}
+            if name == "analyze_draft_document_register":
+                return {"total_documents": 3, "tables": []}
+            if name == "search_rag":
+                return {"count": 1, "hits": [{"codigo": "O-1553", "summary": "5 HH/documento"}]}
+            if name == "estimate_draft_review_hours":
+                return {
+                    "total_documents": 3,
+                    "review_hours": 19,
+                    "general_hours": 20,
+                    "total_hours": 39,
+                    "tables": [
+                        {"name": "Estimación por documento a revisar", "rows": [{"documento": "A", "hh": 5}]}
+                    ],
+                }
+            raise AssertionError(name)
+
+        dispatcher.dispatch = AsyncMock(side_effect=dispatch)
+        with patch("app.agents.agent_loop.ToolContext.build", return_value=object()), patch(
+            "app.agents.agent_loop.ToolDispatcher", return_value=dispatcher
+        ):
+            result = asyncio.run(
+                loop.run(
+                    "Estima las HH de revisión",
+                    active_draft={
+                        "slug": "revision-id",
+                        "title": "Revisión",
+                        "brief_text": "Revisar documentos, no elaborarlos",
+                        "stage": "hours",
+                    },
+                )
+            )
+
+        called_names = [call.args[0] for call in dispatcher.dispatch.await_args_list]
+        self.assertEqual(called_names.count("analyze_draft_document_register"), 1)
+        self.assertIn("estimate_draft_review_hours", called_names)
+        self.assertEqual(
+            loop.llm.chat_with_tools.await_args_list[1].kwargs["tool_choice"],
+            {"type": "function", "function": {"name": "estimate_draft_review_hours"}},
+        )
+        self.assertIn("39 HH", result.answer)
+        self.assertTrue(any(table.get("name") == "Estimación por documento a revisar" for table in result.tables))
+        self.assertTrue(
+            any(
+                item.tool == "agent.estimate_draft_review_hours" and item.status == "ok"
+                for item in result.trace
+            )
         )
 
 
