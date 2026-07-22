@@ -52,7 +52,7 @@ class HHExcelExtractor:
         return {"codigo": codigo, "status": "ok", "rows": len(rows), "error": ""}
 
     def replace_file(self, codigo: str, file_path: str, rows: list[HHRow]) -> None:
-        with closing(sqlite3.connect(settings.sqlite_path)) as conn, conn:
+        with closing(sqlite3.connect(settings.sqlite_path, timeout=30)) as conn, conn:
             conn.execute("delete from hh_estimate_rows where codigo = ? and file_path = ?", (codigo, file_path))
             for row in rows:
                 conn.execute(
@@ -100,7 +100,7 @@ class HHExcelExtractor:
             sql += " where " + " and ".join(where)
         sql += " order by codigo, workbook_name, sheet_name, row_number limit ?"
         params.append(str(limit))
-        with closing(sqlite3.connect(settings.sqlite_path)) as conn:
+        with closing(sqlite3.connect(settings.sqlite_path, timeout=30)) as conn:
             conn.row_factory = sqlite3.Row
             return [dict(row) for row in conn.execute(sql, params).fetchall()]
 
@@ -110,7 +110,7 @@ class HHExcelExtractor:
         if codigo:
             where = "where codigo = ?"
             params.append(codigo.upper())
-        with closing(sqlite3.connect(settings.sqlite_path)) as conn:
+        with closing(sqlite3.connect(settings.sqlite_path, timeout=30)) as conn:
             row = conn.execute(
                 f"""
                 select count(*) rows,
@@ -340,7 +340,7 @@ class HHExcelExtractor:
 
     def _ensure_tables(self) -> None:
         settings.sqlite_path.parent.mkdir(parents=True, exist_ok=True)
-        with closing(sqlite3.connect(settings.sqlite_path)) as conn, conn:
+        with closing(sqlite3.connect(settings.sqlite_path, timeout=30)) as conn, conn:
             conn.execute(
                 """
                 create table if not exists hh_estimate_rows (

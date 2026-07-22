@@ -17,6 +17,7 @@ from app.agents.tools import TOOL_SCHEMAS, ToolDispatcher
 from app.core.config import settings
 from app.rag.parent_child import ParentChildIndexer
 from app.services.database_runtime import prepare_runtime_database, runtime_database_status
+from app.services.budget_extractor_client import BudgetExtractorClient
 from app.services.master_repository import MasterRepository
 from app.services.pipeline_registry import PIPELINE_VERSION, PipelineRegistry, source_signature
 from app.services.proposal_sync_service import ProposalSyncService
@@ -256,6 +257,24 @@ class ExcelPipelineTests(SettingsPathsMixin, unittest.IsolatedAsyncioTestCase):
                 self.assertNotEqual(first, second)
                 self.assertEqual(first.read_bytes(), b"first")
                 self.assertEqual(second.read_bytes(), b"second")
+
+    async def test_budget_persistence_converges_cache_alias_to_sharepoint_name(self):
+        extracted = {
+            "proyecto_filas": [{"descripcion": "Ingeniería", "hh": 10}],
+            "tarifas_filas": [],
+            "gastos_filas": [{"concepto": "Viaje", "total": 100}],
+        }
+        with tempfile.TemporaryDirectory() as temp_dir, self.patch_settings(temp_dir):
+            client = BudgetExtractorClient()
+            client.persist("O-9999", "Oferta__QRURAKSAHROY.xlsx", extracted)
+            client.persist("O-9999", "Oferta.xlsx", extracted)
+
+            stored = client.get_for_codigo("O-9999")
+
+            self.assertEqual(len(stored["filas"]), 1)
+            self.assertEqual(len(stored["gastos"]), 1)
+            self.assertEqual(stored["filas"][0]["source_file"], "Oferta.xlsx")
+            self.assertEqual(len(stored["audit"]), 2)
 
 
 class PipelineRegistryTests(SettingsPathsMixin, unittest.IsolatedAsyncioTestCase):

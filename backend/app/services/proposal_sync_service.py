@@ -572,7 +572,7 @@ class ProposalSyncService:
 
         extracted = await asyncio.gather(
             *(
-                budget.extract_normalized(codigo, asset["content"], asset["source_file"])
+                budget.extract_normalized(codigo, asset["content"], asset["name"])
                 for asset in assets
             )
         )
@@ -581,7 +581,7 @@ class ProposalSyncService:
                 error = f"{row['name']}: presupuesto: {payload['error']}"
                 row["error"] = f"{row['error']}; {error}" if row.get("error") else error
                 continue
-            row["budget_persisted"] = budget.persist(codigo, row["source_file"], payload)
+            row["budget_persisted"] = budget.persist(codigo, row["name"], payload)
             row["budget_totals"] = payload.get("totals")
         return results
 

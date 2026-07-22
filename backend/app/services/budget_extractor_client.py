@@ -13,9 +13,11 @@ Stateless: cada extracción reemplaza los datos previos del mismo `codigo + sour
 from __future__ import annotations
 
 import logging
+import re
 import sqlite3
 from contextlib import closing
-from datetime import datetime
+from datetime import UTC, datetime
+from pathlib import Path
 from typing import Any
 
 import httpx
@@ -95,15 +97,36 @@ class BudgetExtractorClient:
 
     def persist(self, codigo: str, source_file: str, extracted: dict) -> dict:
         """Inserta proyecto_filas / tarifas_filas / gastos_filas. Idempotente por (codigo, source_file)."""
-        now = datetime.utcnow().isoformat(timespec="seconds") + "Z"
+        now = datetime.now(UTC).isoformat(timespec="seconds").replace("+00:00", "Z")
+        source_file = self._canonical_source_file(source_file)
         proyecto_filas = extracted.get("proyecto_filas") or []
         tarifas_filas = extracted.get("tarifas_filas") or []
         gastos_filas = extracted.get("gastos_filas") or []
         with closing(sqlite3.connect(settings.sqlite_path, timeout=10)) as conn, conn:
-            # Reemplaza el set previo de este (codigo, source_file)
-            conn.execute("delete from proyectos_extracted where codigo=? and source_file=?", (codigo, source_file))
-            conn.execute("delete from proyecto_tarifas where codigo=? and source_file=?", (codigo, source_file))
-            conn.execute("delete from proyecto_gastos_reembolsables where codigo=? and source_file=?", (codigo, source_file))
+            # Reemplaza también aliases históricos creados por el sufijo técnico
+            # del cache local (archivo__ITEMID.xlsx).
+            existing_names = {
+                str(row[0])
+                for row in conn.execute(
+                    """
+                    select source_file from proyectos_extracted where codigo=?
+                    union select source_file from proyecto_tarifas where codigo=?
+                    union select source_file from proyecto_gastos_reembolsables where codigo=?
+                    """,
+                    (codigo, codigo, codigo),
+                ).fetchall()
+                if row[0]
+            }
+            aliases = {
+                name for name in existing_names
+                if self._canonical_source_file(name).casefold() == source_file.casefold()
+            }
+            aliases.add(source_file)
+            placeholders = ",".join("?" for _ in aliases)
+            params = (codigo, *sorted(aliases))
+            conn.execute(f"delete from proyectos_extracted where codigo=? and source_file in ({placeholders})", params)
+            conn.execute(f"delete from proyecto_tarifas where codigo=? and source_file in ({placeholders})", params)
+            conn.execute(f"delete from proyecto_gastos_reembolsables where codigo=? and source_file in ({placeholders})", params)
             for r in proyecto_filas:
                 conn.execute(
                     """insert into proyectos_extracted
@@ -140,6 +163,14 @@ class BudgetExtractorClient:
             "tarifas_filas": len(tarifas_filas),
             "gastos_filas": len(gastos_filas),
         }
+
+    @staticmethod
+    def _canonical_source_file(source_file: str) -> str:
+        """Converge nombre SharePoint y nombre del cache sin confundir archivos distintos."""
+        name = Path(str(source_file or "").replace("\\", "/")).name
+        path = Path(name)
+        stem = re.sub(r"__[A-Z0-9]{8,}$", "", path.stem, flags=re.IGNORECASE)
+        return f"{stem}{path.suffix}"
 
     def _ensure_tables(self) -> None:
         # Azure Files monta este directorio en produccion. SQLite no crea por
