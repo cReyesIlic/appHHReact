@@ -13,7 +13,6 @@ import { EmptyState } from "../shared/EmptyState.jsx";
 import { Input } from "../shared/Field.jsx";
 import { EntryList } from "./EntryList.jsx";
 import { EntryEditor } from "./EntryEditor.jsx";
-import { SyncPanel } from "./SyncPanel.jsx";
 
 export function LibraryView() {
   const [entries, setEntries] = useState([]);
@@ -98,7 +97,6 @@ export function LibraryView() {
 
   return (
     <div className="view-body" style={{ height: "100%" }}>
-      <SyncPanel onChanged={load} />
       <div className="library-grid" style={{ flex: 1, minHeight: 0 }}>
         <div className="flex-col" style={{ overflow: "hidden" }}>
           <div className="flex-row" style={{ gap: 6 }}>

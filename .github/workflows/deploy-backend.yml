@@ -60,6 +60,7 @@ jobs:
           az acr login --name $ACR_NAME
           IMAGE_URI=$ACR_NAME.azurecr.io/$IMAGE_NAME
           docker build \
+            --build-arg APP_VERSION=${{ steps.tag.outputs.tag }} \
             -t $IMAGE_URI:${{ steps.tag.outputs.tag }} \
             -t $IMAGE_URI:latest \
             -f $WORKDIR/Dockerfile \
@@ -82,14 +83,18 @@ jobs:
           set -e
           HOST=$(az webapp show -g $RG -n $APP_SERVICE --query defaultHostName -o tsv)
           URL="https://$HOST/health"
-          echo "Waiting for $URL ..."
-          for i in $(seq 1 30); do
-            code=$(curl -s -o /dev/null -w "%{http_code}" "$URL" || echo "000")
-            echo "  attempt $i: HTTP $code"
-            [ "$code" = "200" ] && exit 0
+          EXPECTED_VERSION="${{ steps.tag.outputs.tag }}"
+          echo "Waiting for $URL to report version $EXPECTED_VERSION ..."
+          for i in $(seq 1 45); do
+            response_file=$(mktemp)
+            code=$(curl -sS -o "$response_file" -w "%{http_code}" "$URL" || true)
+            version=$(python -c "import json,sys; print(json.load(open(sys.argv[1])).get('version', ''))" "$response_file" 2>/dev/null || true)
+            rm -f "$response_file"
+            echo "  attempt $i: HTTP ${code:-000}, version ${version:-unknown}"
+            [ "$code" = "200" ] && [ "$version" = "$EXPECTED_VERSION" ] && exit 0
             sleep 10
           done
-          echo "Health check failed after 30 attempts" >&2
+          echo "Health check failed: version $EXPECTED_VERSION never became active" >&2
           exit 1
 
       - name: Smoke test extract-budget end-to-end
