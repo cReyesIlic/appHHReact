@@ -11,7 +11,7 @@ from unittest.mock import AsyncMock, Mock, patch
 
 from docx import Document
 
-from app.agents.agent_loop import AgentLoop
+from app.agents.agent_loop import AgentLoop, draft_tool_schemas
 from app.core.config import settings
 from app.services.proposal_drafts import ProposalDraftService
 
@@ -93,6 +93,52 @@ class ProposalDraftBriefTests(unittest.TestCase):
         self.assertTrue(hits)
         self.assertIn("doce semanas", hits[0]["snippet"])
 
+    def test_reupload_replaces_metadata_and_chunks_instead_of_duplicating(self):
+        service = ProposalDraftService()
+        draft = service.create_draft("owner@shimin.cl", "Truck Shop")
+
+        def document_bytes(text: str) -> bytes:
+            document = Document()
+            document.add_paragraph(text)
+            buffer = BytesIO()
+            document.save(buffer)
+            return buffer.getvalue()
+
+        service.add_file(
+            "owner@shimin.cl",
+            draft["slug"],
+            "Bases.docx",
+            document_bytes("Versión antigua sobre oficinas."),
+        )
+        service.add_file(
+            "owner@shimin.cl",
+            draft["slug"],
+            "Bases.docx",
+            document_bytes("Versión vigente para revisión del Truck Shop."),
+        )
+
+        self.assertEqual(len(service.list_files(draft["slug"])), 1)
+        self.assertFalse(service.search_chunks(draft["slug"], "antigua oficinas"))
+        self.assertTrue(service.search_chunks(draft["slug"], "vigente truck"))
+
+    def test_delete_file_removes_asset_text_chunks_and_invalidates_guide(self):
+        service = ProposalDraftService()
+        draft = service.create_draft("owner@shimin.cl", "Barrio Cívico")
+        document = Document()
+        document.add_paragraph("Informe de revisión de ingeniería de detalles.")
+        buffer = BytesIO()
+        document.save(buffer)
+        service.add_file("owner@shimin.cl", draft["slug"], "Bases.docx", buffer.getvalue())
+        service.save_guide("owner@shimin.cl", draft["slug"], "# Guía")
+
+        result = service.delete_file("owner@shimin.cl", draft["slug"], "Bases.docx")
+
+        self.assertTrue(result["deleted"])
+        self.assertEqual(service.list_files(draft["slug"]), [])
+        self.assertFalse(service.file_path("owner@shimin.cl", draft["slug"], "Bases.docx").exists())
+        self.assertFalse(service.search_chunks(draft["slug"], "ingeniería detalles"))
+        self.assertFalse(service.get_draft("owner@shimin.cl", draft["slug"])["guide_exists"])
+
     def test_document_intelligence_ocr_preserves_page_evidence(self):
         service = ProposalDraftService()
         submit = Mock(status_code=202, headers={"operation-location": "https://ocr/jobs/1"})
@@ -139,6 +185,22 @@ class ProposalDraftBriefTests(unittest.TestCase):
 
 
 class ProposalDraftAgentContextTests(unittest.TestCase):
+    def test_draft_tools_are_agentic_but_expensive_costing_is_explicit(self):
+        general = {
+            schema["function"]["name"]
+            for schema in draft_tool_schemas("Ayúdame a armar la revisión de ingeniería")
+        }
+        costing = {
+            schema["function"]["name"]
+            for schema in draft_tool_schemas("Estima las HH, costo y tarifa de O-1779")
+        }
+
+        self.assertTrue({"load_skill", "search_rag", "search_master", "search_draft_chunks"} <= general)
+        self.assertNotIn("compute_economics", general)
+        self.assertIn("compute_economics", costing)
+        self.assertIn("get_hh_licitadas", costing)
+        self.assertIn("get_proposal_detail", costing)
+
     def test_active_draft_is_preloaded_before_the_model_answers(self):
         loop = AgentLoop.__new__(AgentLoop)
         loop.max_iterations = 1
@@ -208,6 +270,51 @@ class ProposalDraftAgentContextTests(unittest.TestCase):
         self.assertIn("contexto_draft", payload)
         self.assertIn("/api/drafts/restitucion-abc123/files/", result.answer)
         self.assertTrue(any(source.url for source in result.sources))
+
+    def test_active_draft_times_out_slow_tool_and_still_closes_answer(self):
+        loop = AgentLoop.__new__(AgentLoop)
+        loop.max_iterations = 1
+        loop.skill_registry = Mock()
+        loop.skill_registry.catalog.return_value = ""
+        tool_call = SimpleNamespace(
+            id="call-1",
+            function=SimpleNamespace(
+                name="compute_proposal_support",
+                arguments=json.dumps({"query": "revisión ingeniería", "limit": 5}),
+            ),
+        )
+        loop.llm = Mock(client=object(), azure=False)
+        loop.llm.chat_with_tools = AsyncMock(
+            side_effect=[
+                SimpleNamespace(tool_calls=[tool_call], content=""),
+                SimpleNamespace(tool_calls=[], content="Propuesta accionable cerrada."),
+            ]
+        )
+        dispatcher = Mock()
+
+        async def dispatch(name, args):
+            if name in {"get_draft_context", "search_draft_chunks"}:
+                return {"slug": "revision-id", "count": 0}
+            if name == "compute_proposal_support":
+                await asyncio.sleep(0.1)
+                return {"referencias_directas": []}
+            raise AssertionError(name)
+
+        dispatcher.dispatch = AsyncMock(side_effect=dispatch)
+        with patch("app.agents.agent_loop.ToolContext.build", return_value=object()), patch(
+            "app.agents.agent_loop.ToolDispatcher", return_value=dispatcher
+        ), patch("app.agents.agent_loop.DRAFT_TOOL_TIMEOUT_SECONDS", 0.01):
+            result = asyncio.run(
+                loop.run(
+                    "Ayúdame a armar esta propuesta",
+                    active_draft={"slug": "revision-id", "title": "Revisión", "brief_text": "Alcance"},
+                )
+            )
+
+        self.assertEqual(result.answer, "Propuesta accionable cerrada.")
+        self.assertTrue(
+            any(t.tool == "agent.compute_proposal_support" and t.status == "error" for t in result.trace)
+        )
 
 
 if __name__ == "__main__":

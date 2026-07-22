@@ -6,15 +6,18 @@ import {
   listDrafts,
   createDraft,
   getDraft,
+  getDraftSession,
   updateDraft,
   deleteDraft,
   uploadDraftFile,
   buildDraftGuide,
   getDraftFileUrl,
   reprocessDraftFile,
+  deleteDraftFile,
   previewSharepointAntecedentes,
   importDraftFromSharepoint,
   sendChat,
+  createSession,
   getSession,
 } from "../../lib/api.js";
 import { Button } from "../shared/Button.jsx";
@@ -87,12 +90,23 @@ export function DraftsView() {
 
     const storageKey = draftSessionKey(activeSlug);
     const storedSession = localStorage.getItem(storageKey);
-    if (!storedSession) return () => { cancelled = true; };
+    const restore = async () => {
+      if (storedSession) {
+        try {
+          return await getSession(storedSession);
+        } catch {
+          localStorage.removeItem(storageKey);
+        }
+      }
+      const result = await getDraftSession(activeSlug);
+      return result.session;
+    };
 
-    getSession(storedSession)
+    restore()
       .then((session) => {
-        if (cancelled) return;
-        setConsultSessionId(storedSession);
+        if (cancelled || !session) return;
+        setConsultSessionId(session.id);
+        localStorage.setItem(storageKey, session.id);
         setConsultContext(session.working_context || {});
         setConsultMessages(
           (session.messages || []).map((message) => ({
@@ -102,7 +116,7 @@ export function DraftsView() {
           })),
         );
       })
-      .catch(() => localStorage.removeItem(storageKey));
+      .catch(() => {});
     return () => { cancelled = true; };
   }, [activeSlug]);
 
@@ -132,6 +146,8 @@ export function DraftsView() {
         setActive(null);
       }
       await reload();
+    } catch (exc) {
+      alert(`Error eliminando el draft: ${exc.message}`);
     } finally {
       setBusy(null);
     }
@@ -167,6 +183,19 @@ export function DraftsView() {
       if (result.extraction_warning) alert(result.extraction_warning);
     } catch (exc) {
       alert(`Error reprocesando: ${exc.message}`);
+    } finally {
+      setBusy(null);
+    }
+  };
+
+  const handleDeleteFile = async (file) => {
+    if (!activeSlug || !confirm(`¿Eliminar ${file.filename} y su índice de este draft?`)) return;
+    setBusy(`delete-file-${file.id || file.filename}`);
+    try {
+      await deleteDraftFile(activeSlug, file.filename);
+      await reload();
+    } catch (exc) {
+      alert(`Error eliminando el archivo: ${exc.message}`);
     } finally {
       setBusy(null);
     }
@@ -272,6 +301,13 @@ export function DraftsView() {
         cliente: active.cliente || "",
         brief_text: briefText,
       };
+      let sessionId = consultSessionId;
+      if (!sessionId) {
+        const session = await createSession(`Consulta · ${active.title}`);
+        sessionId = session.id;
+        setConsultSessionId(sessionId);
+        localStorage.setItem(draftSessionKey(activeSlug), sessionId);
+      }
       const response = await sendChat({
         message: text,
         history: previousMessages.slice(-12).map(({ role, content }) => ({ role, content })),
@@ -279,8 +315,8 @@ export function DraftsView() {
         deep_pdf_read: true,
         working_context: { ...consultContext, active_draft: activeDraftContext },
         filters: {},
-        session_id: consultSessionId,
-        create_session_if_missing: true,
+        session_id: sessionId,
+        create_session_if_missing: false,
       });
       setConsultMessages((current) => [
         ...current,
@@ -567,6 +603,14 @@ export function DraftsView() {
                                 Reprocesar
                               </Button>
                             )}
+                            <Button
+                              variant="ghost"
+                              icon={Trash2}
+                              onClick={() => handleDeleteFile(f)}
+                              disabled={busy === `delete-file-${f.id || f.filename}`}
+                            >
+                              Eliminar
+                            </Button>
                           </div>
                         );
                       })}

@@ -103,6 +103,39 @@ class IdentityTests(unittest.TestCase):
 
 
 class ChatIsolationTests(unittest.TestCase):
+    def test_latest_session_for_draft_is_recovered_for_same_user_only(self):
+        with tempfile.TemporaryDirectory() as temp_dir, patch.object(
+            settings, "database_dir", str(Path(temp_dir) / "draft-session.sqlite")
+        ):
+            service = ChatSessionService()
+            older = service.create_session("owner@shimin.cl", "Anterior")
+            latest = service.create_session("owner@shimin.cl", "Última")
+            foreign = service.create_session("other@shimin.cl", "Ajena")
+            service.update_working_context(
+                "owner@shimin.cl", older["id"], {"active_draft": {"slug": "draft-1"}}
+            )
+            service.update_working_context(
+                "owner@shimin.cl", latest["id"], {"active_draft": {"slug": "draft-1"}}
+            )
+            service.update_working_context(
+                "other@shimin.cl", foreign["id"], {"active_draft": {"slug": "draft-1"}}
+            )
+            service.append_message("owner@shimin.cl", latest["id"], "assistant", "respuesta")
+            with closing(sqlite3.connect(settings.sqlite_path)) as conn, conn:
+                conn.execute(
+                    "update chat_sessions set last_message_at = '2026-02-01T00:00:00' where id = ?",
+                    (latest["id"],),
+                )
+                conn.execute(
+                    "update chat_sessions set last_message_at = '2026-01-01T00:00:00' where id = ?",
+                    (older["id"],),
+                )
+
+            recovered = service.find_latest_for_draft("owner@shimin.cl", "draft-1")
+
+            self.assertEqual(recovered["id"], latest["id"])
+            self.assertIsNone(service.find_latest_for_draft("owner@shimin.cl", "draft-ajeno"))
+
     def test_verified_legacy_alias_restores_sessions_and_messages(self):
         with tempfile.TemporaryDirectory() as temp_dir, patch.object(
             settings, "database_dir", str(Path(temp_dir) / "aliases.sqlite")

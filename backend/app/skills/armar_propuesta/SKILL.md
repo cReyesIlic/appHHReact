@@ -19,6 +19,20 @@ Antes de buscar referencias internas, **revisa si el usuario está trabajando en
 2. Para citas específicas del RFP/antecedentes: `search_draft_chunks(slug, query="<concepto>")`.
 3. **Combina**: usa la guía del draft para entender qué pide el cliente + tu búsqueda en master/RAG/staffing para traer experiencia SHIMIN relevante.
 
+### Modo interactivo con draft activo
+
+Cuando `draft_activo` y `contexto_draft` ya vienen precargados, no vuelvas a listar ni a abrir el
+draft de forma genérica. Para una petición como “ayúdame a armarla”:
+
+- usa los antecedentes del cliente como fuente principal;
+- selecciona solo 2–4 consultas históricas que realmente aporten;
+- entrega en este turno un primer armado accionable (alcance, metodología, entregables, plan,
+  equipo preliminar, supuestos/exclusiones y preguntas pendientes);
+- no ejecutes economía, staffing ni desglose HH salvo que el usuario los pida explícitamente.
+
+La profundidad adicional se trabaja en las siguientes preguntas del mismo chat; no bloquees el
+primer armado intentando completar todo el dossier de ocho secciones en una sola respuesta.
+
 ## REGLA DE ORO — jerarquía de búsqueda
 
 Las propuestas no son todas iguales. Para una nueva propuesta:

@@ -369,6 +369,10 @@ export function getDraft(slug) {
   return jsonFetch(`/api/drafts/${encodeURIComponent(slug)}`);
 }
 
+export function getDraftSession(slug) {
+  return jsonFetch(`/api/drafts/${encodeURIComponent(slug)}/session`);
+}
+
 export function updateDraft(slug, payload) {
   return jsonFetch(`/api/drafts/${encodeURIComponent(slug)}`, {
     method: "PATCH",
@@ -404,6 +408,13 @@ export function reprocessDraftFile(slug, filename) {
   return jsonFetch(
     `/api/drafts/${encodeURIComponent(slug)}/files/${encodeURIComponent(filename)}/reprocess`,
     { method: "POST" },
+  );
+}
+
+export function deleteDraftFile(slug, filename) {
+  return jsonFetch(
+    `/api/drafts/${encodeURIComponent(slug)}/files/${encodeURIComponent(filename)}`,
+    { method: "DELETE" },
   );
 }
 

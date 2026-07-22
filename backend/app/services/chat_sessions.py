@@ -88,6 +88,23 @@ class ChatSessionService:
             "working_context": json.loads(row[6] or "{}"),
         }
 
+    def find_latest_for_draft(self, user_id: str, draft_slug: str) -> dict | None:
+        """Recupera la última conversación que terminó asociada a un draft."""
+        with closing(sqlite3.connect(settings.sqlite_path, timeout=5)) as conn:
+            row = conn.execute(
+                """
+                select id
+                from chat_sessions
+                where user_id = ?
+                  and json_valid(working_context)
+                  and json_extract(working_context, '$.active_draft.slug') = ?
+                order by coalesce(last_message_at, updated_at) desc
+                limit 1
+                """,
+                (user_id, draft_slug),
+            ).fetchone()
+        return self.get_session(user_id, row[0]) if row else None
+
     def create_session(self, user_id: str, title: str = "Nueva conversación") -> dict:
         now = datetime.now().isoformat(timespec="seconds")
         session_id = uuid4().hex

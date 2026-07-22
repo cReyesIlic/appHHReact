@@ -952,6 +952,21 @@ def drafts_update(slug: str, payload: dict, http_request: Request) -> dict:
         raise HTTPException(status_code=404, detail="Draft no encontrado") from exc
 
 
+@router.get("/drafts/{slug}/session")
+def drafts_latest_session(slug: str, http_request: Request) -> dict:
+    user = user_from_request(http_request)
+    try:
+        ProposalDraftService().get_draft(user.id, slug)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="Draft no encontrado") from exc
+    service = ChatSessionService()
+    session = service.find_latest_for_draft(user.id, slug)
+    if not session:
+        return {"session": None}
+    session["messages"] = service.list_messages(user.id, session["id"])
+    return {"session": session}
+
+
 @router.delete("/drafts/{slug}")
 def drafts_delete(slug: str, http_request: Request) -> dict:
     user = user_from_request(http_request)
@@ -986,6 +1001,19 @@ def drafts_download_file(slug: str, filename: str, http_request: Request) -> Fil
     if not path.exists():
         raise HTTPException(status_code=404, detail="archivo no encontrado")
     return FileResponse(path, filename=path.name)
+
+
+@router.delete("/drafts/{slug}/files/{filename}")
+def drafts_delete_file(slug: str, filename: str, http_request: Request) -> dict:
+    user = user_from_request(http_request)
+    try:
+        return ProposalDraftService().delete_file(user.id, slug, filename)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="Draft no encontrado") from exc
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail="Archivo no encontrado") from exc
+    except OSError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
 
 
 @router.post("/drafts/{slug}/files/{filename}/reprocess")

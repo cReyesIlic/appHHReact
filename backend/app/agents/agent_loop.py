@@ -66,6 +66,7 @@ Si ninguna skill aplica claramente, procede con tu juicio usando los principios 
 9. **Desglose HH obligatorio**: nunca respondas que no existe un desglose de HH estimadas de una `O-XXXX` mirando sólo el total de Master, Wiki o RAG. Primero usa `get_hh_licitadas` con la vista pedida. Si devuelve cero filas o el detalle no responde la pregunta, busca dentro del PDF con `search_rag` y `read_pdf_deep` en el mismo turno.
 10. **Ficha completa de propuesta**: si piden “detalle de la propuesta/oferta O-XXXX”, combina en una sola respuesta `get_proposal_detail` y `get_hh_licitadas(view="entregable")`. Incluye ficha comercial, alcance y entregables documentales, tabla HH por partida/rol, vacíos y enlaces PDF/Excel/Wiki. No fragmentes la ficha ni respondas sólo columnas del Master.
 11. **Propuesta en armado activa**: si el payload trae `draft_activo`, trabaja siempre sobre ese draft sin pedir el slug ni volver a listarlo. Usa el brief, la guía y los chunks precargados como contexto primario. Para preguntas de cómo armarla, carga la skill `armar_propuesta` y combina los antecedentes del cliente con propuestas históricas comparables, priorizando PG. Distingue claramente: requisito del archivo, sugerencia SHIMIN e inferencia. Cita el archivo cargado mediante su URL cuando esté disponible.
+12. **Respuesta útil para un draft activo**: no conviertas una petición general de ayuda en una auditoría económica exhaustiva. Primero entrega una propuesta accionable: entendimiento, alcance, metodología, entregables, plan/plazo, equipo preliminar, supuestos/exclusiones y preguntas por cerrar. Consulta economía, staffing o HH solo cuando el usuario los pida explícitamente. El contexto del draft ya viene precargado: no repitas esas consultas salvo que necesites una cita más específica.
 
 # JERARQUÍA GANADA / PERDIDA (regla de negocio crítica)
 
@@ -151,6 +152,39 @@ def build_system_prompt(skill_registry: SkillRegistry) -> str:
     return BASE_SYSTEM_PROMPT.format(skills_catalog=catalog)
 
 
+_DRAFT_CORE_TOOLS = {
+    "load_skill",
+    "search_wiki_entries",
+    "search_master",
+    "search_rag",
+    "search_proposal_index",
+    "compute_proposal_support",
+    "get_draft_context",
+    "search_draft_chunks",
+    "import_draft_from_sharepoint",
+}
+_DRAFT_COST_TOOLS = {
+    "compute_economics",
+    "get_hh_licitadas",
+    "search_entregables_hh",
+    "get_proyecto_staffing",
+}
+DRAFT_TOOL_TIMEOUT_SECONDS = 10
+DRAFT_LLM_TIMEOUT_SECONDS = 15
+DRAFT_MAX_ITERATIONS = 3
+
+
+def draft_tool_schemas(question: str) -> list[dict]:
+    """Expone al draft solo herramientas pertinentes y evita ramas costosas accidentales."""
+    allowed = set(_DRAFT_CORE_TOOLS)
+    normalized = str(question or "").casefold()
+    if re.search(r"\b(hh|horas|costo|costos|costear|monto|tarifa|presupuesto)\b", normalized):
+        allowed.update(_DRAFT_COST_TOOLS)
+    if re.search(r"\b(?:o|sh)-\d{2,6}\b", normalized):
+        allowed.add("get_proposal_detail")
+    return [schema for schema in TOOL_SCHEMAS if schema.get("function", {}).get("name") in allowed]
+
+
 @dataclass
 class AgentRunResult:
     answer: str
@@ -197,6 +231,9 @@ class AgentLoop:
             user_payload["candidatos_de_contexto"] = candidate_codes[:8]
 
         draft_slug = str((active_draft or {}).get("slug") or "").strip()
+        available_tools = draft_tool_schemas(question) if draft_slug else TOOL_SCHEMAS
+        iteration_limit = min(self.max_iterations, DRAFT_MAX_ITERATIONS) if draft_slug else self.max_iterations
+        llm_timeout = DRAFT_LLM_TIMEOUT_SECONDS if draft_slug else 45
         if draft_slug:
             user_payload["draft_activo"] = {
                 "slug": draft_slug,
@@ -272,18 +309,18 @@ class AgentLoop:
 
         deployment = settings.answer_deployment if self.llm.azure else "gpt-4o-mini"
 
-        for iteration in range(self.max_iterations):
+        for iteration in range(iteration_limit):
             t0 = time.time()
             try:
                 message = await asyncio.wait_for(
                     self.llm.chat_with_tools(
                         deployment=deployment,
                         messages=messages,
-                        tools=TOOL_SCHEMAS,
+                        tools=available_tools,
                         tool_choice="auto",
                         max_completion_tokens=3072,
                     ),
-                    timeout=45,
+                    timeout=llm_timeout,
                 )
             except Exception as exc:  # noqa: BLE001
                 trace.append(ToolTrace(tool="agent.llm", status="error", detail=f"iter {iteration}: {exc}"))
@@ -301,6 +338,8 @@ class AgentLoop:
                 needs_licitada_lookup = self._needs_licitada_lookup(question, called_tools)
                 required_detail_call = self._required_full_detail_call(question, focus_code, called_tools)
                 if (
+                    not draft_slug
+                    and
                     evidence_followups < 3
                     and focus_code
                     and (
@@ -387,6 +426,15 @@ class AgentLoop:
                 )
 
             # Añadir el assistant message con tool_calls al historial
+            if draft_slug and len(tool_calls) > 4:
+                trace.append(
+                    ToolTrace(
+                        tool="agent.draft_budget",
+                        status="warning",
+                        detail=f"se limitaron {len(tool_calls)} llamadas propuestas a 4",
+                    )
+                )
+                tool_calls = tool_calls[:4]
             messages.append(
                 {
                     "role": "assistant",
@@ -402,6 +450,7 @@ class AgentLoop:
                 }
             )
 
+            pending_calls: list[tuple[Any, str, dict, str]] = []
             for tc in tool_calls:
                 name = tc.function.name
                 raw_args = tc.function.arguments or "{}"
@@ -423,10 +472,37 @@ class AgentLoop:
                 if seed_filters_dict and name in {"search_master", "search_rag", "search_entities"} and not args.get("filters"):
                     args["filters"] = seed_filters_dict
                 detail = ", ".join(f"{k}={self._truncate_value(v)}" for k, v in (args or {}).items())
+                pending_calls.append((tc, name, args, detail))
+
+            async def invoke_tool(call: tuple[Any, str, dict, str]) -> tuple[Any, str, dict, str, dict, int]:
+                tc, name, args, detail = call
                 t_start = time.time()
-                result = await dispatcher.dispatch(name, args)
+                try:
+                    if draft_slug:
+                        result = await asyncio.wait_for(
+                            dispatcher.dispatch(name, args),
+                            timeout=DRAFT_TOOL_TIMEOUT_SECONDS,
+                        )
+                    else:
+                        result = await dispatcher.dispatch(name, args)
+                except asyncio.TimeoutError:
+                    result = {
+                        "error": (
+                            f"{name} excedió {DRAFT_TOOL_TIMEOUT_SECONDS} segundos; "
+                            "se omitió para responder el draft a tiempo"
+                        )
+                    }
+                return tc, name, args, detail, result, int((time.time() - t_start) * 1000)
+
+            if draft_slug:
+                completed_calls = await asyncio.gather(*(invoke_tool(call) for call in pending_calls))
+            else:
+                completed_calls = []
+                for call in pending_calls:
+                    completed_calls.append(await invoke_tool(call))
+
+            for tc, name, args, detail, result, latency_ms in completed_calls:
                 called_tools.add(name)
-                latency_ms = int((time.time() - t_start) * 1000)
                 status = "error" if isinstance(result, dict) and result.get("error") else "ok"
                 trace.append(ToolTrace(tool=f"agent.{name}", status=status, detail=f"{detail} ({latency_ms}ms)"))
                 self._absorb_codes(result, seen_codes)
@@ -443,16 +519,23 @@ class AgentLoop:
         trace.append(ToolTrace(tool="agent.loop", status="warning", detail="max_iterations alcanzado"))
         # Fallback: pedir respuesta final sin tools
         try:
-            messages.append({"role": "user", "content": "Responde ahora con lo recogido. No llames más herramientas."})
+            close_instruction = (
+                "Con el draft y la evidencia ya recogida, entrega ahora una propuesta accionable: "
+                "entendimiento, alcance, metodología, entregables, plan/plazo, equipo preliminar, "
+                "supuestos/exclusiones y preguntas por cerrar. No llames más herramientas."
+                if draft_slug
+                else "Responde ahora con lo recogido. No llames más herramientas."
+            )
+            messages.append({"role": "user", "content": close_instruction})
             final = await asyncio.wait_for(
                 self.llm.chat_with_tools(
                     deployment=deployment,
                     messages=messages,
-                    tools=TOOL_SCHEMAS,
+                    tools=available_tools,
                     tool_choice="none",
-                    max_completion_tokens=2048,
+                    max_completion_tokens=1800 if draft_slug else 2048,
                 ),
-                timeout=30,
+                timeout=DRAFT_LLM_TIMEOUT_SECONDS if draft_slug else 30,
             )
             answer = (final.content if final else "") or "(respuesta vacía)"
         except Exception as exc:  # noqa: BLE001

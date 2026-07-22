@@ -643,6 +643,11 @@
   border-color: var(--accent);
   background: var(--bg-alt);
 }
+.draft-file > a {
+  flex: 1;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
 .draft-brief-panel {
   display: flex;
   flex-direction: column;

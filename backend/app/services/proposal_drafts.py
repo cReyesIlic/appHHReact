@@ -269,6 +269,11 @@ class ProposalDraftService:
                 """
                 insert into proposal_draft_files (slug, filename, kind, size, chars_extracted, uploaded_at)
                 values (?, ?, ?, ?, ?, ?)
+                on conflict(slug, filename) do update set
+                    kind = excluded.kind,
+                    size = excluded.size,
+                    chars_extracted = excluded.chars_extracted,
+                    uploaded_at = excluded.uploaded_at
                 """,
                 (slug, clean_name, kind, len(content), len(text), datetime.now().isoformat(timespec="seconds")),
             )
@@ -301,6 +306,43 @@ class ProposalDraftService:
             "extraction_method": self._last_extraction_method,
             "extraction_warning": None if chunks else self._extraction_warning(),
         }
+
+    def delete_file(self, owner_id: str, slug: str, filename: str) -> dict:
+        """Elimina un antecedente y todo su texto/chunks, validando ownership."""
+        self.get_draft(owner_id, slug)
+        clean_name = re.sub(r"[^A-Za-z0-9._-]+", "_", filename)
+        with closing(sqlite3.connect(settings.sqlite_path, timeout=30)) as conn:
+            exists = conn.execute(
+                "select 1 from proposal_draft_files where slug = ? and filename = ?",
+                (slug, clean_name),
+            ).fetchone()
+        if not exists:
+            raise FileNotFoundError(clean_name)
+
+        antecedent = self.file_path(owner_id, slug, clean_name)
+        extracted = self._texts_dir(owner_id, slug) / f"{Path(clean_name).stem}.txt"
+        try:
+            antecedent.unlink(missing_ok=True)
+            extracted.unlink(missing_ok=True)
+        except OSError as exc:
+            raise OSError(f"No se pudo eliminar {clean_name} del almacenamiento: {exc}") from exc
+
+        now = datetime.now().isoformat(timespec="seconds")
+        with closing(sqlite3.connect(settings.sqlite_path, timeout=30)) as conn, conn:
+            files = conn.execute(
+                "delete from proposal_draft_files where slug = ? and filename = ?",
+                (slug, clean_name),
+            ).rowcount
+            chunks = conn.execute(
+                "delete from proposal_draft_chunks where slug = ? and source_file = ?",
+                (slug, clean_name),
+            ).rowcount
+            conn.execute(
+                "update proposal_drafts set status = 'draft', updated_at = ? where slug = ? and owner_id = ?",
+                (now, slug, owner_id),
+            )
+        self._invalidate_guide(owner_id, slug)
+        return {"deleted": True, "filename": clean_name, "file_rows": files, "chunks": chunks}
 
     def reprocess_file(self, owner_id: str, slug: str, filename: str) -> dict:
         """Reextrae e indexa un archivo ya guardado, incluido OCR si corresponde."""
@@ -717,6 +759,16 @@ class ProposalDraftService:
                 )
                 """
             )
+            # Versiones anteriores insertaban una fila nueva al volver a subir
+            # el mismo nombre. Conservamos la más reciente y prevenimos dobles.
+            conn.execute(
+                """
+                delete from proposal_draft_files
+                where id not in (
+                    select max(id) from proposal_draft_files group by slug, filename
+                )
+                """
+            )
             conn.execute(
                 """
                 create table if not exists proposal_draft_chunks (
@@ -731,4 +783,8 @@ class ProposalDraftService:
             )
             conn.execute("create index if not exists idx_drafts_owner on proposal_drafts(owner_id, updated_at)")
             conn.execute("create index if not exists idx_draft_files_slug on proposal_draft_files(slug)")
+            conn.execute(
+                "create unique index if not exists idx_draft_files_unique "
+                "on proposal_draft_files(slug, filename)"
+            )
             conn.execute("create index if not exists idx_draft_chunks_slug on proposal_draft_chunks(slug, source_file)")
