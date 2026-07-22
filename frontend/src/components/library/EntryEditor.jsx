@@ -1,8 +1,9 @@
 import { useEffect, useState } from "react";
-import { Save, Trash2, ShieldCheck, Plus } from "lucide-react";
+import { Eye, Pencil, Plus, Save, ShieldCheck, Trash2 } from "lucide-react";
 import { Button } from "../shared/Button.jsx";
 import { Field, Input, Textarea } from "../shared/Field.jsx";
 import { Chip } from "../shared/Chip.jsx";
+import { MarkdownView } from "../shared/MarkdownView.jsx";
 import { ValidationBadge } from "./ValidationBadge.jsx";
 
 const EMPTY = {
@@ -16,11 +17,13 @@ const EMPTY = {
 
 export function EntryEditor({ entry, onSave, onDelete, onValidate, busy }) {
   const [draft, setDraft] = useState(entry || EMPTY);
+  const [editing, setEditing] = useState(!entry);
   const [tagInput, setTagInput] = useState("");
   const [codeInput, setCodeInput] = useState("");
 
   useEffect(() => {
     setDraft(entry || EMPTY);
+    setEditing(!entry);
     setTagInput("");
     setCodeInput("");
   }, [entry?.id]);
@@ -39,7 +42,61 @@ export function EntryEditor({ entry, onSave, onDelete, onValidate, busy }) {
     setCodeInput("");
   };
 
-  const save = () => onSave(draft);
+  const save = async () => {
+    await onSave(draft);
+    setEditing(false);
+  };
+
+  const cancelEdit = () => {
+    setDraft(entry);
+    setEditing(false);
+  };
+
+  if (entry && !editing) {
+    return (
+      <article className="wiki-entry-view">
+        <header className="wiki-entry-header">
+          <div className="flex-col" style={{ gap: 6 }}>
+            <h1>{entry.title}</h1>
+            <div className="wiki-entry-meta">
+              <Chip>{entry.category || "general"}</Chip>
+              <ValidationBadge status={entry.validation_status || "unchecked"} />
+              {entry.validated_at && (
+                <small className="dim">validada {new Date(entry.validated_at).toLocaleString()}</small>
+              )}
+              {entry.times_used > 0 && <small className="dim">· usada {entry.times_used}×</small>}
+            </div>
+          </div>
+          <div className="flex-row wiki-entry-actions">
+            <Button variant="accent" icon={Pencil} onClick={() => setEditing(true)} disabled={busy}>
+              Editar Markdown
+            </Button>
+            <Button variant="ghost" icon={ShieldCheck} onClick={() => onValidate(entry.id)} disabled={busy}>
+              Validar
+            </Button>
+            <Button variant="ghost" icon={Trash2} onClick={() => onDelete(entry.id)} disabled={busy}>
+              Borrar
+            </Button>
+          </div>
+        </header>
+
+        {((entry.tags || []).length > 0 || (entry.propuestas_referenciadas || []).length > 0) && (
+          <div className="wiki-entry-references">
+            {(entry.tags || []).map((tag, index) => <Chip key={`tag-${tag}-${index}`}>{tag}</Chip>)}
+            {(entry.propuestas_referenciadas || []).map((code, index) => (
+              <Chip key={`code-${code}-${index}`} variant="accent">{code}</Chip>
+            ))}
+          </div>
+        )}
+
+        {entry.content?.trim() ? (
+          <MarkdownView content={entry.content} className="wiki-entry-markdown" />
+        ) : (
+          <p className="dim">Esta entrada todavía no tiene contenido.</p>
+        )}
+      </article>
+    );
+  }
 
   return (
     <div className="flex-col" style={{ gap: 16 }}>
@@ -55,6 +112,11 @@ export function EntryEditor({ entry, onSave, onDelete, onValidate, busy }) {
           )}
         </div>
         <div className="flex-row" style={{ gap: 6 }}>
+          {entry && (
+            <Button variant="ghost" icon={Eye} onClick={cancelEdit} disabled={busy}>
+              Vista previa
+            </Button>
+          )}
           {entry && (
             <Button variant="ghost" icon={ShieldCheck} onClick={() => onValidate(entry.id)} disabled={busy}>
               Validar

@@ -5,6 +5,7 @@ import { getOpsCoverage, syncGanadas, syncCode, uploadCoverageAsset, getCoverage
 import { Card } from "../shared/Card.jsx";
 import { Button } from "../shared/Button.jsx";
 import { EmptyState } from "../shared/EmptyState.jsx";
+import { MarkdownView } from "../shared/MarkdownView.jsx";
 import { Modal } from "../shared/Modal.jsx";
 
 const RECENT_HIGHLIGHT = 20;
@@ -446,9 +447,7 @@ export function CoverageTable() {
           <div style={{ fontSize: 11, color: "var(--muted, #888)", marginBottom: 8, fontFamily: "Consolas, monospace" }}>
             {wikiContent.path}  ·  {Math.round((wikiContent.size_bytes || 0) / 1024)} KB
           </div>
-          <pre style={{ whiteSpace: "pre-wrap", fontFamily: "Consolas, 'SF Mono', monospace", fontSize: 12, lineHeight: 1.5, padding: 14, background: "rgba(0,0,0,0.03)", borderRadius: 6 }}>
-            {wikiContent.markdown}
-          </pre>
+          <MarkdownView content={wikiContent.markdown} stripFrontmatter />
         </div>
       )}
     </Modal>
