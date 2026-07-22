@@ -17,6 +17,7 @@ class CurrentUser:
     email: str
     name: str
     role: str = "user"
+    aliases: tuple[str, ...] = ()
 
 
 current_user_var: ContextVar[CurrentUser] = ContextVar(
@@ -123,9 +124,26 @@ def _user_from_principal(principal: dict) -> CurrentUser:
     admins = _csv(settings.auth_admin_emails)
     role = "admin" if email in admins or "admin" in roles else "user"
 
-    # El email verificado conserva las sesiones existentes y es unico dentro
-    # del tenant/dominio permitido.
-    return CurrentUser(id=email, email=email, name=name, role=role)
+    # El email verificado es la identidad canonica. SWA historicamente expuso
+    # `userId` (GUID de Entra) y versiones anteriores de la app lo usaron como
+    # owner_id; se conserva exclusivamente como alias verificado para adoptar
+    # esos datos, nunca como identidad aportada por el cliente.
+    alias_candidates = [
+        principal.get("userId"),
+        _claim(
+            claims,
+            "oid",
+            "http://schemas.microsoft.com/identity/claims/objectidentifier",
+        ),
+    ]
+    aliases = tuple(
+        dict.fromkeys(
+            str(value).strip()
+            for value in alias_candidates
+            if str(value or "").strip() and str(value).strip().casefold() != email.casefold()
+        )
+    )
+    return CurrentUser(id=email, email=email, name=name, role=role, aliases=aliases)
 
 
 def _claim(claims: dict[str, str], *names: str) -> str:

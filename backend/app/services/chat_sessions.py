@@ -21,6 +21,27 @@ class ChatSessionService:
 
     # ---- Sessions ----
 
+    def adopt_aliases(self, canonical_user_id: str, aliases: tuple[str, ...] | list[str]) -> dict:
+        """Restaura sesiones creadas con IDs antiguos de la misma identidad verificada."""
+        legacy = [
+            str(value).strip()
+            for value in aliases
+            if str(value or "").strip() and str(value).strip() != canonical_user_id
+        ]
+        if not legacy:
+            return {"sessions": 0, "messages": 0}
+        placeholders = ",".join("?" for _ in legacy)
+        with closing(sqlite3.connect(settings.sqlite_path, timeout=30)) as conn, conn:
+            sessions = conn.execute(
+                f"update chat_sessions set user_id = ? where user_id in ({placeholders})",
+                (canonical_user_id, *legacy),
+            ).rowcount
+            messages = conn.execute(
+                f"update chat_messages set user_id = ? where user_id in ({placeholders})",
+                (canonical_user_id, *legacy),
+            ).rowcount
+        return {"sessions": sessions, "messages": messages}
+
     def list_sessions(self, user_id: str, limit: int = 50) -> list[dict]:
         with closing(sqlite3.connect(settings.sqlite_path, timeout=5)) as conn:
             rows = conn.execute(

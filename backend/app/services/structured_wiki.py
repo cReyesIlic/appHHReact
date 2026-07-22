@@ -71,6 +71,57 @@ class StructuredWikiService:
         "propuestas_referenciadas, filtros_aplicables, times_used, validated_at, validation_status"
     )
 
+    _ENTRY_SUMMARY_COLUMNS = (
+        "id, title, category, tags, source, pinned, created_at, updated_at, "
+        "propuestas_referenciadas, filtros_aplicables, times_used, validated_at, "
+        "validation_status, length(coalesce(content, ''))"
+    )
+
+    def list_entry_summaries(
+        self,
+        query: str | None = None,
+        limit: int = 50,
+        offset: int = 0,
+    ) -> dict:
+        """Lista metadata paginada; el Markdown se obtiene solo con get_entry()."""
+        self._sync_entries_from_files()
+        limit = max(1, min(int(limit), 100))
+        offset = max(0, int(offset))
+        term = str(query or "").strip()
+        where = ""
+        params: list[object] = []
+        if term:
+            where = (
+                "where title like ? collate nocase or category like ? collate nocase "
+                "or tags like ? collate nocase or propuestas_referenciadas like ? collate nocase "
+                "or source like ? collate nocase"
+            )
+            like = f"%{term}%"
+            params = [like] * 5
+        with closing(sqlite3.connect(settings.sqlite_path, timeout=30)) as conn:
+            total = int(
+                conn.execute(f"select count(*) from wiki_entries {where}", params).fetchone()[0]
+            )
+            rows = conn.execute(
+                f"""
+                select {self._ENTRY_SUMMARY_COLUMNS}
+                from wiki_entries
+                {where}
+                order by pinned desc, updated_at desc, title
+                limit ? offset ?
+                """,
+                (*params, limit, offset),
+            ).fetchall()
+        entries = [self._entry_summary_row(row) for row in rows]
+        return {
+            "entries": entries,
+            "count": len(entries),
+            "total": total,
+            "limit": limit,
+            "offset": offset,
+            "has_more": offset + len(entries) < total,
+        }
+
     def list_entries(self) -> list[dict]:
         self._sync_entries_from_files()
         with closing(sqlite3.connect(settings.sqlite_path, timeout=30)) as conn:
@@ -270,15 +321,23 @@ class StructuredWikiService:
         return self.build("\n".join(lines))
 
     def quick_access(self) -> dict:
-        entries = self.list_entries()
-        pinned = [entry for entry in entries if entry.get("pinned")][:12]
-        categories: dict[str, int] = {}
-        for entry in entries:
-            categories[entry["category"]] = categories.get(entry["category"], 0) + 1
+        self._sync_entries_from_files()
+        with closing(sqlite3.connect(settings.sqlite_path, timeout=30)) as conn:
+            pinned_rows = conn.execute(
+                f"select {self._ENTRY_SUMMARY_COLUMNS} from wiki_entries "
+                "where pinned = 1 order by updated_at desc limit 12"
+            ).fetchall()
+            recent_rows = conn.execute(
+                f"select {self._ENTRY_SUMMARY_COLUMNS} from wiki_entries "
+                "order by updated_at desc limit 10"
+            ).fetchall()
+            categories = conn.execute(
+                "select category, count(*) from wiki_entries group by category order by category"
+            ).fetchall()
         return {
-            "pinned": pinned,
-            "categories": [{"category": key, "count": value} for key, value in sorted(categories.items())],
-            "recent": entries[:10],
+            "pinned": [self._entry_summary_row(row) for row in pinned_rows],
+            "categories": [{"category": row[0], "count": int(row[1])} for row in categories],
+            "recent": [self._entry_summary_row(row) for row in recent_rows],
         }
 
     def append_proposal_knowledge(self, codigo: str, title: str, markdown: str) -> dict:
@@ -446,12 +505,18 @@ class StructuredWikiService:
 
     def status(self) -> dict:
         sections = self.list_sections()
+        self._sync_entries_from_files()
+        with closing(sqlite3.connect(settings.sqlite_path, timeout=30)) as conn:
+            entries, pinned = conn.execute(
+                "select count(*), coalesce(sum(case when pinned = 1 then 1 else 0 end), 0) "
+                "from wiki_entries"
+            ).fetchone()
         wiki_path = settings.resolve_path("storage/llm_wiki.md")
         proposal_pages = list(settings.resolve_path("storage/llm_wiki/proposals").glob("O-*.md"))
         return {
             "sections": len(sections),
-            "entries": len(self.list_entries()),
-            "pinned": len([entry for entry in self.list_entries() if entry.get("pinned")]),
+            "entries": int(entries),
+            "pinned": int(pinned),
             "proposal_pages": len(proposal_pages),
             "has_markdown": wiki_path.exists(),
             "path": str(wiki_path),
@@ -558,6 +623,36 @@ class StructuredWikiService:
             "times_used": int(row[12] or 0) if len(row) > 12 else 0,
             "validated_at": (row[13] if len(row) > 13 else None) or None,
             "validation_status": (row[14] if len(row) > 14 else "unchecked") or "unchecked",
+        }
+
+    def _entry_summary_row(self, row: tuple) -> dict:
+        try:
+            tags = json.loads(row[3] or "[]")
+        except (json.JSONDecodeError, TypeError):
+            tags = []
+        try:
+            propuestas = json.loads(row[8] or "[]")
+        except (json.JSONDecodeError, TypeError):
+            propuestas = []
+        try:
+            filtros = json.loads(row[9] or "{}")
+        except (json.JSONDecodeError, TypeError):
+            filtros = {}
+        return {
+            "id": row[0],
+            "title": row[1],
+            "category": row[2],
+            "tags": tags,
+            "source": row[4] or "",
+            "pinned": bool(row[5]),
+            "created_at": row[6] or "",
+            "updated_at": row[7] or "",
+            "propuestas_referenciadas": propuestas,
+            "filtros_aplicables": filtros,
+            "times_used": int(row[10] or 0),
+            "validated_at": row[11] or None,
+            "validation_status": row[12] or "unchecked",
+            "content_chars": int(row[13] or 0),
         }
 
     def _entry_markdown(self, entry: dict) -> str:

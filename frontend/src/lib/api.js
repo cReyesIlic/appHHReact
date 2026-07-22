@@ -151,8 +151,10 @@ export function getWikiMarkdown() {
   return jsonFetch("/api/wiki/markdown");
 }
 
-export function getWikiEntries() {
-  return jsonFetch("/api/wiki/entries");
+export function getWikiEntries({ query = "", limit = 50, offset = 0 } = {}) {
+  const params = new URLSearchParams({ limit: String(limit), offset: String(offset) });
+  if (query.trim()) params.set("query", query.trim());
+  return jsonFetch(`/api/wiki/entries?${params.toString()}`);
 }
 
 export function getWikiEntry(id) {
@@ -396,6 +398,13 @@ export function buildDraftGuide(slug) {
 
 export function getDraftFileUrl(slug, filename) {
   return `${API_BASE}/api/drafts/${encodeURIComponent(slug)}/files/${encodeURIComponent(filename)}`;
+}
+
+export function reprocessDraftFile(slug, filename) {
+  return jsonFetch(
+    `/api/drafts/${encodeURIComponent(slug)}/files/${encodeURIComponent(filename)}/reprocess`,
+    { method: "POST" },
+  );
 }
 
 export function previewSharepointAntecedentes(codigo) {

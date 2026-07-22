@@ -1,7 +1,8 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useState } from "react";
 import { Plus, RefreshCw, Search } from "lucide-react";
 import {
   getWikiEntries,
+  getWikiEntry,
   saveWikiEntry,
   deleteWikiEntry,
   validateLibraryEntry,
@@ -16,47 +17,50 @@ import { EntryEditor } from "./EntryEditor.jsx";
 
 export function LibraryView() {
   const [entries, setEntries] = useState([]);
+  const [active, setActive] = useState(null);
   const [activeId, setActiveId] = useState(null);
   const [filter, setFilter] = useState("");
   const [creating, setCreating] = useState(false);
   const [busy, setBusy] = useState(false);
   const [loading, setLoading] = useState(true);
+  const [total, setTotal] = useState(0);
+  const [hasMore, setHasMore] = useState(false);
 
-  const load = async () => {
+  const load = async ({ query = filter, offset = 0, append = false } = {}) => {
     setLoading(true);
     try {
-      const result = await getWikiEntries();
-      setEntries(result.entries || []);
+      const result = await getWikiEntries({ query, limit: 50, offset });
+      setEntries((current) => append ? [...current, ...(result.entries || [])] : (result.entries || []));
+      setTotal(result.total || 0);
+      setHasMore(Boolean(result.has_more));
     } finally {
       setLoading(false);
     }
   };
 
   useEffect(() => {
-    load();
-  }, []);
+    const timer = setTimeout(() => load({ query: filter, offset: 0 }), 250);
+    return () => clearTimeout(timer);
+  }, [filter]);
 
-  const filtered = useMemo(() => {
-    if (!filter.trim()) return entries;
-    const q = filter.toLowerCase();
-    return entries.filter((e) =>
-      [e.title, e.category, ...(e.tags || []), ...(e.propuestas_referenciadas || [])]
-        .join(" ")
-        .toLowerCase()
-        .includes(q)
-    );
-  }, [entries, filter]);
-
-  const active = creating
-    ? null
-    : entries.find((e) => e.id === activeId) || null;
+  const selectEntry = async (id) => {
+    setCreating(false);
+    setActiveId(id);
+    setActive(null);
+    try {
+      setActive(await getWikiEntry(id));
+    } catch {
+      setActiveId(null);
+    }
+  };
 
   const handleSave = async (draft) => {
     setBusy(true);
     try {
       const saved = await saveWikiEntry(draft, active?.id);
-      await load();
+      await load({ query: filter, offset: 0 });
       setActiveId(saved.id || active?.id);
+      setActive(saved);
       setCreating(false);
     } finally {
       setBusy(false);
@@ -70,6 +74,7 @@ export function LibraryView() {
       await deleteWikiEntry(id);
       await load();
       setActiveId(null);
+      setActive(null);
     } finally {
       setBusy(false);
     }
@@ -79,7 +84,8 @@ export function LibraryView() {
     setBusy(true);
     try {
       await validateLibraryEntry(id);
-      await load();
+      await load({ query: filter, offset: 0 });
+      setActive(await getWikiEntry(id));
     } finally {
       setBusy(false);
     }
@@ -89,7 +95,7 @@ export function LibraryView() {
     setBusy(true);
     try {
       await reindexWiki();
-      await load();
+      await load({ query: filter, offset: 0 });
     } finally {
       setBusy(false);
     }
@@ -110,6 +116,7 @@ export function LibraryView() {
               icon={Plus}
               onClick={() => {
                 setActiveId(null);
+                setActive(null);
                 setCreating(true);
               }}
             >
@@ -120,17 +127,23 @@ export function LibraryView() {
             <Button variant="ghost" icon={RefreshCw} onClick={handleReindex} disabled={busy}>
               Reindexar
             </Button>
-            <small className="dim">{entries.length} entradas</small>
+            <small className="dim">{entries.length} de {total} entradas</small>
           </div>
           <div style={{ flex: 1, overflow: "auto", marginTop: 8 }}>
             <EntryList
-              entries={filtered}
+              entries={entries}
               activeId={creating ? null : activeId}
-              onSelect={(id) => {
-                setCreating(false);
-                setActiveId(id);
-              }}
+              onSelect={selectEntry}
             />
+            {hasMore && (
+              <Button
+                variant="ghost"
+                onClick={() => load({ query: filter, offset: entries.length, append: true })}
+                disabled={loading}
+              >
+                {loading ? "Cargando…" : "Cargar 50 más"}
+              </Button>
+            )}
           </div>
         </div>
 
@@ -144,6 +157,8 @@ export function LibraryView() {
               onValidate={handleValidate}
               busy={busy}
             />
+          ) : activeId ? (
+            <EmptyState icon={RefreshCw} title="Cargando entrada" description="Obteniendo su contenido Markdown…" />
           ) : (
             <EmptyState
               icon={Search}

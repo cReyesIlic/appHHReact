@@ -11,6 +11,7 @@ import {
   uploadDraftFile,
   buildDraftGuide,
   getDraftFileUrl,
+  reprocessDraftFile,
   previewSharepointAntecedentes,
   importDraftFromSharepoint,
   sendChat,
@@ -154,6 +155,20 @@ export function DraftsView() {
     } finally {
       setBusy(null);
       if (fileInputRef.current) fileInputRef.current.value = "";
+    }
+  };
+
+  const handleReprocess = async (file) => {
+    if (!activeSlug) return;
+    setBusy(`reprocess-${file.id || file.filename}`);
+    try {
+      const result = await reprocessDraftFile(activeSlug, file.filename);
+      await reload();
+      if (result.extraction_warning) alert(result.extraction_warning);
+    } catch (exc) {
+      alert(`Error reprocesando: ${exc.message}`);
+    } finally {
+      setBusy(null);
     }
   };
 
@@ -526,19 +541,33 @@ export function DraftsView() {
                       {active.files.map((f) => {
                         const Icon = f.kind === "pdf" ? FileIcon : FileText;
                         return (
-                          <a
+                          <div
                             key={f.id || f.filename}
                             className="draft-file"
-                            href={getDraftFileUrl(active.slug, f.filename)}
-                            target="_blank"
-                            rel="noreferrer"
                           >
                             <Icon size={14} style={{ color: "var(--accent)" }} />
-                            <span>{f.filename}</span>
+                            <a
+                              href={getDraftFileUrl(active.slug, f.filename)}
+                              target="_blank"
+                              rel="noreferrer"
+                              style={{ color: "inherit", textDecoration: "none" }}
+                            >
+                              {f.filename}
+                            </a>
                             <small className="dim">
                               {f.kind.toUpperCase()} · {formatBytes(f.size)} · {f.chars_extracted} chars
                             </small>
-                          </a>
+                            {Number(f.chars_extracted || 0) === 0 && (
+                              <Button
+                                variant="ghost"
+                                icon={RotateCcw}
+                                onClick={() => handleReprocess(f)}
+                                disabled={busy === `reprocess-${f.id || f.filename}`}
+                              >
+                                Reprocesar
+                              </Button>
+                            )}
+                          </div>
                         );
                       })}
                     </div>

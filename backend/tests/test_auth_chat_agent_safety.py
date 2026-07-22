@@ -73,6 +73,7 @@ class IdentityTests(unittest.TestCase):
         self.assertEqual(user.id, "cristian.reyes@shimin.cl")
         self.assertEqual(user.email, "cristian.reyes@shimin.cl")
         self.assertEqual(user.role, "admin")
+        self.assertEqual(user.aliases, ("entra-object-id",))
 
     def test_non_company_domain_is_rejected(self):
         principal = {
@@ -102,6 +103,25 @@ class IdentityTests(unittest.TestCase):
 
 
 class ChatIsolationTests(unittest.TestCase):
+    def test_verified_legacy_alias_restores_sessions_and_messages(self):
+        with tempfile.TemporaryDirectory() as temp_dir, patch.object(
+            settings, "database_dir", str(Path(temp_dir) / "aliases.sqlite")
+        ):
+            service = ChatSessionService()
+            session = service.create_session("entra-object-id", "Conversacion anterior")
+            service.append_message("entra-object-id", session["id"], "user", "mensaje conservado")
+
+            result = service.adopt_aliases("owner@shimin.cl", ("entra-object-id",))
+
+            self.assertEqual(result, {"sessions": 1, "messages": 1})
+            self.assertEqual(service.list_sessions("entra-object-id"), [])
+            restored = service.list_sessions("owner@shimin.cl")
+            self.assertEqual(restored[0]["id"], session["id"])
+            self.assertEqual(
+                service.list_messages("owner@shimin.cl", session["id"])[0]["content"],
+                "mensaje conservado",
+            )
+
     def test_sessions_and_messages_are_isolated_by_verified_user(self):
         with tempfile.TemporaryDirectory() as temp_dir, patch.object(
             settings, "database_dir", str(Path(temp_dir) / "chat.sqlite")

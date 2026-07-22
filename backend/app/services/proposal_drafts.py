@@ -17,9 +17,11 @@ from __future__ import annotations
 
 import json
 import re
+import shutil
 import sqlite3
 import time
 import unicodedata
+import zipfile
 from contextlib import closing
 from dataclasses import dataclass
 from datetime import datetime
@@ -74,6 +76,58 @@ class ProposalDraftService:
         return row[0] if row else None
 
     # ---- CRUD ----
+
+    def adopt_aliases(self, canonical_owner_id: str, aliases: tuple[str, ...] | list[str]) -> dict:
+        """Mueve borradores de IDs historicos al owner canonico sin perder archivos."""
+        legacy = [
+            str(value).strip()
+            for value in aliases
+            if str(value or "").strip() and str(value).strip() != canonical_owner_id
+        ]
+        if not legacy:
+            return {"drafts": 0, "directories": 0, "errors": []}
+
+        placeholders = ",".join("?" for _ in legacy)
+        with closing(sqlite3.connect(settings.sqlite_path, timeout=30)) as conn:
+            rows = conn.execute(
+                f"select slug, owner_id from proposal_drafts where owner_id in ({placeholders})",
+                legacy,
+            ).fetchall()
+
+        migrated: list[str] = []
+        moved = 0
+        errors: list[dict] = []
+        for slug, old_owner_id in rows:
+            source = self._draft_dir(old_owner_id, slug)
+            destination = self._draft_dir(canonical_owner_id, slug)
+            try:
+                if source.exists() and not destination.exists():
+                    destination.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.move(str(source), str(destination))
+                    moved += 1
+                elif source.exists() and destination.exists():
+                    # Una ejecucion previa pudo quedar a medias. Solo copiamos
+                    # archivos ausentes; nunca sobrescribimos una version nueva.
+                    for path in source.rglob("*"):
+                        relative = path.relative_to(source)
+                        target = destination / relative
+                        if path.is_dir():
+                            target.mkdir(parents=True, exist_ok=True)
+                        elif not target.exists():
+                            target.parent.mkdir(parents=True, exist_ok=True)
+                            shutil.copy2(path, target)
+                migrated.append(slug)
+            except OSError as exc:
+                errors.append({"slug": slug, "error": str(exc)})
+
+        if migrated:
+            placeholders = ",".join("?" for _ in migrated)
+            with closing(sqlite3.connect(settings.sqlite_path, timeout=30)) as conn, conn:
+                conn.execute(
+                    f"update proposal_drafts set owner_id = ? where slug in ({placeholders})",
+                    (canonical_owner_id, *migrated),
+                )
+        return {"drafts": len(migrated), "directories": moved, "errors": errors}
 
     def create_draft(self, owner_id: str, title: str, cliente: str | None = None) -> dict:
         slug = self._slug(title, owner_id)
@@ -195,6 +249,7 @@ class ProposalDraftService:
         kind = self._detect_kind(clean_name)
         if kind not in {"pdf", "docx"}:
             raise ValueError("Solo se aceptan archivos PDF y DOCX")
+        self._validate_file_content(content, kind)
 
         target = self._antecedentes_dir(owner_id, slug) / clean_name
         target.parent.mkdir(parents=True, exist_ok=True)
@@ -244,12 +299,95 @@ class ProposalDraftService:
             "chars_extracted": len(text),
             "chunks_created": len(chunks),
             "extraction_method": self._last_extraction_method,
-            "extraction_warning": (
-                None
-                if chunks
-                else "No se pudo extraer texto. Si el archivo está escaneado, verifica OCR/Document Intelligence."
-            ),
+            "extraction_warning": None if chunks else self._extraction_warning(),
         }
+
+    def reprocess_file(self, owner_id: str, slug: str, filename: str) -> dict:
+        """Reextrae e indexa un archivo ya guardado, incluido OCR si corresponde."""
+        self.get_draft(owner_id, slug)
+        clean_name = re.sub(r"[^A-Za-z0-9._-]+", "_", filename)
+        kind = self._detect_kind(clean_name)
+        if kind not in {"pdf", "docx"}:
+            raise ValueError("Solo se pueden reprocesar archivos PDF y DOCX")
+        path = self.file_path(owner_id, slug, clean_name)
+        if not path.exists():
+            raise FileNotFoundError(clean_name)
+        content = path.read_bytes()
+        self._validate_file_content(content, kind)
+        text = self._extract_text(content, kind, clean_name)
+        chunks = self._chunkify(text, max_chars=1600, overlap=200)
+
+        text_dir = self._texts_dir(owner_id, slug)
+        text_dir.mkdir(parents=True, exist_ok=True)
+        (text_dir / f"{Path(clean_name).stem}.txt").write_text(text, encoding="utf-8")
+        now = datetime.now().isoformat(timespec="seconds")
+        with closing(sqlite3.connect(settings.sqlite_path, timeout=30)) as conn, conn:
+            conn.execute(
+                "delete from proposal_draft_chunks where slug = ? and source_file = ?",
+                (slug, clean_name),
+            )
+            for idx, chunk_text in enumerate(chunks):
+                conn.execute(
+                    """
+                    insert into proposal_draft_chunks (slug, source_file, text, char_start, chunk_index)
+                    values (?, ?, ?, ?, ?)
+                    """,
+                    (slug, clean_name, chunk_text, idx * 1400, idx),
+                )
+            updated = conn.execute(
+                """
+                update proposal_draft_files
+                set kind = ?, size = ?, chars_extracted = ?
+                where slug = ? and filename = ?
+                """,
+                (kind, len(content), len(text), slug, clean_name),
+            ).rowcount
+            if not updated:
+                conn.execute(
+                    """
+                    insert into proposal_draft_files
+                    (slug, filename, kind, size, chars_extracted, uploaded_at)
+                    values (?, ?, ?, ?, ?, ?)
+                    """,
+                    (slug, clean_name, kind, len(content), len(text), now),
+                )
+            conn.execute(
+                "update proposal_drafts set status = 'draft', updated_at = ? where slug = ? and owner_id = ?",
+                (now, slug, owner_id),
+            )
+        self._invalidate_guide(owner_id, slug)
+        return {
+            "filename": clean_name,
+            "kind": kind,
+            "size": len(content),
+            "chars_extracted": len(text),
+            "chunks_created": len(chunks),
+            "extraction_method": self._last_extraction_method,
+            "extraction_warning": None if chunks else self._extraction_warning(),
+        }
+
+    def reprocess_pending(self, owner_id: str, limit: int = 20) -> dict:
+        """Reintenta archivos sin texto para corregir fallos transitorios de OCR/indexacion."""
+        with closing(sqlite3.connect(settings.sqlite_path, timeout=30)) as conn:
+            rows = conn.execute(
+                """
+                select distinct f.slug, f.filename
+                from proposal_draft_files f
+                join proposal_drafts d on d.slug = f.slug
+                where d.owner_id = ? and coalesce(f.chars_extracted, 0) = 0
+                order by f.uploaded_at desc
+                limit ?
+                """,
+                (owner_id, max(1, min(int(limit), 50))),
+            ).fetchall()
+        repaired: list[dict] = []
+        errors: list[dict] = []
+        for slug, filename in rows:
+            try:
+                repaired.append({"slug": slug, **self.reprocess_file(owner_id, slug, filename)})
+            except (FileNotFoundError, OSError, ValueError) as exc:
+                errors.append({"slug": slug, "filename": filename, "error": str(exc)})
+        return {"checked": len(rows), "repaired": repaired, "errors": errors}
 
     def file_path(self, owner_id: str, slug: str, filename: str) -> Path:
         return self._antecedentes_dir(owner_id, slug) / re.sub(r"[^A-Za-z0-9._-]+", "_", filename)
@@ -386,11 +524,35 @@ class ProposalDraftService:
             return "docx"
         return "unknown"
 
+    def _validate_file_content(self, content: bytes, kind: str) -> None:
+        if not content:
+            raise ValueError("El archivo está vacío; vuelve a descargarlo y súbelo nuevamente")
+        if kind == "pdf":
+            if content[:1024].find(b"%PDF-") < 0:
+                if not content.strip(b"\x00"):
+                    raise ValueError(
+                        "El PDF recibido contiene solo bytes nulos y está corrupto; "
+                        "vuelve a descargar el original y súbelo nuevamente"
+                    )
+                raise ValueError("El archivo recibido no es un PDF válido (falta la cabecera %PDF-)")
+            return
+        if kind == "docx":
+            try:
+                with zipfile.ZipFile(BytesIO(content)) as archive:
+                    names = set(archive.namelist())
+            except (zipfile.BadZipFile, OSError) as exc:
+                raise ValueError("El archivo recibido no es un DOCX válido") from exc
+            if "word/document.xml" not in names:
+                raise ValueError("El archivo recibido no contiene un documento Word válido")
+
     def _extract_text(self, content: bytes, kind: str, filename: str) -> str:
-        try:
-            if kind == "pdf":
+        if kind == "pdf":
+            local_text = ""
+            page_count = 0
+            try:
                 from PyPDF2 import PdfReader
                 reader = PdfReader(BytesIO(content))
+                page_count = len(reader.pages)
                 pages = []
                 for idx, page in enumerate(reader.pages, start=1):
                     try:
@@ -400,16 +562,21 @@ class ProposalDraftService:
                     except Exception:
                         continue
                 local_text = "\n\n".join(pages)
-                minimum_useful_chars = max(120, len(reader.pages) * 35)
+                minimum_useful_chars = max(120, page_count * 35)
                 if len(local_text) >= minimum_useful_chars:
                     self._last_extraction_method = "pypdf2"
                     return local_text
-                ocr_text = self._extract_pdf_with_document_intelligence(content)
-                if ocr_text:
-                    self._last_extraction_method = "document_intelligence"
-                    return ocr_text
-                self._last_extraction_method = "pypdf2_low_text" if local_text else "no_text"
-                return local_text
+            except Exception:
+                # Un parser local puede fallar en un PDF que Document
+                # Intelligence si logra leer. El OCR debe seguir ejecutandose.
+                local_text = ""
+            ocr_text = self._extract_pdf_with_document_intelligence(content)
+            if ocr_text:
+                self._last_extraction_method = "document_intelligence"
+                return ocr_text
+            self._last_extraction_method = "pypdf2_low_text" if local_text else "no_text"
+            return local_text
+        try:
             if kind == "docx":
                 from docx import Document
                 doc = Document(BytesIO(content))
@@ -430,6 +597,12 @@ class ProposalDraftService:
             return ""
         self._last_extraction_method = "unsupported"
         return ""
+
+    def _extraction_warning(self) -> str:
+        return (
+            "El archivo es válido, pero no se pudo extraer texto. "
+            "Si está escaneado, revisa la configuración de OCR/Document Intelligence."
+        )
 
     def _extract_pdf_with_document_intelligence(self, content: bytes) -> str:
         endpoint = str(settings.document_intelligence_endpoint or "").strip().rstrip("/")

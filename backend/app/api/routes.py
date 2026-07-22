@@ -740,9 +740,12 @@ def wiki_quick_access() -> dict:
 
 
 @router.get("/wiki/entries")
-def wiki_entries() -> dict:
-    rows = StructuredWikiService().list_entries()
-    return {"entries": rows, "count": len(rows)}
+def wiki_entries(query: str | None = None, limit: int = 50, offset: int = 0) -> dict:
+    return StructuredWikiService().list_entry_summaries(
+        query=query,
+        limit=max(1, min(limit, 100)),
+        offset=max(0, offset),
+    )
 
 
 @router.get("/wiki/entries/{entry_id}")
@@ -983,6 +986,19 @@ def drafts_download_file(slug: str, filename: str, http_request: Request) -> Fil
     if not path.exists():
         raise HTTPException(status_code=404, detail="archivo no encontrado")
     return FileResponse(path, filename=path.name)
+
+
+@router.post("/drafts/{slug}/files/{filename}/reprocess")
+def drafts_reprocess_file(slug: str, filename: str, http_request: Request) -> dict:
+    user = user_from_request(http_request)
+    try:
+        return ProposalDraftService().reprocess_file(user.id, slug, filename)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="Draft no encontrado") from exc
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail="Archivo no encontrado") from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 @router.get("/drafts/sharepoint-preview/{codigo}")
