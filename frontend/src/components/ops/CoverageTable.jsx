@@ -341,7 +341,7 @@ export function CoverageTable() {
                 const isNew = idx < RECENT_HIGHLIGHT && row.is_recent;
                 return (
                   <tr
-                    key={row.codigo}
+                    key={`${row.codigo}-${row.cod_proy || "sin-proyecto"}-${row.fecha_recep || "sin-fecha"}-${idx}`}
                     style={
                       isNew
                         ? { background: "rgba(220, 170, 60, 0.10)" }
