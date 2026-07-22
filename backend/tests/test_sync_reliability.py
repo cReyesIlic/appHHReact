@@ -15,7 +15,7 @@ from openpyxl import Workbook
 from app.agents.tools import TOOL_SCHEMAS, ToolDispatcher
 from app.core.config import settings
 from app.rag.parent_child import ParentChildIndexer
-from app.services.database_runtime import prepare_runtime_database
+from app.services.database_runtime import prepare_runtime_database, runtime_database_status
 from app.services.master_repository import MasterRepository
 from app.services.pipeline_registry import PIPELINE_VERSION, PipelineRegistry, source_signature
 from app.services.proposal_sync_service import ProposalSyncService
@@ -90,6 +90,9 @@ class DatabaseRuntimeTests(SettingsPathsMixin, unittest.TestCase):
             self.assertEqual(result["journal_mode"], "delete")
             self.assertEqual(journal, "delete")
             self.assertEqual(table, 1)
+            status = runtime_database_status()
+            self.assertTrue(status["network_safe"])
+            self.assertGreater(status["size_bytes"], 0)
 
 
 class QueueReliabilityTests(unittest.TestCase):

@@ -5,11 +5,25 @@ from __future__ import annotations
 import logging
 import sqlite3
 import time
+from contextlib import closing
 
 from app.core.config import settings
 
 
 logger = logging.getLogger("shimin.database")
+
+
+def runtime_database_status() -> dict:
+    path = settings.sqlite_path
+    with closing(sqlite3.connect(path, timeout=10)) as conn:
+        journal_mode = str(conn.execute("pragma journal_mode").fetchone()[0]).lower()
+    return {
+        "path": str(path),
+        "exists": path.exists(),
+        "size_bytes": path.stat().st_size if path.exists() else 0,
+        "journal_mode": journal_mode,
+        "network_safe": journal_mode != "wal",
+    }
 
 
 def prepare_runtime_database(attempts: int = 5) -> dict:

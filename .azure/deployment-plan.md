@@ -196,7 +196,7 @@ locally.
 | `backend/app/services/structured_wiki.py` | Reuse the existing Wiki file during upsert |
 | `backend/app/services/ops_dashboard.py` | Coverage/quality/version API rows |
 | `backend/app/services/budget_extractor_client.py` | Safe SQLite mount-point initialization |
-| `backend/app/services/database_runtime.py` | WAL-to-DELETE startup migration for Azure Files |
+| `backend/app/services/database_runtime.py` | WAL-to-DELETE startup migration and runtime status for Azure Files |
 | `backend/app/main.py` | Prepare SQLite before scheduler/traffic |
 | `backend/app/services/master_repository.py` | Atomic SharePoint-first refresh with fallback |
 | `backend/app/api/routes.py` | Async/source-aware Master refresh response |

@@ -40,6 +40,7 @@ from app.services.proposal_sync_service import ProposalSyncService
 from app.rag.parent_child import ParentChildIndexer
 from app.rag.hybrid_store import HybridRagStore
 from app.services.deliverables_economics import DeliverablesEconomicsAnalyst
+from app.services.database_runtime import runtime_database_status
 from app.services.entity_index import EntityIndex
 from app.services.hh_excel_extractor import HHExcelExtractor
 from app.services.ops_dashboard import OpsDashboardService
@@ -580,6 +581,7 @@ def config_status() -> dict:
     entity_status = safe_status("Entity index", lambda: EntityIndex().status(), {"entities": 0})
     hh_status = safe_status("HH Excel", lambda: HHExcelExtractor().summary(), {"files": 0})
     master_count_status = safe_status("Master", lambda: {"count": MasterRepository().count_offers()}, {"count": 0})
+    database_status = safe_status("SQLite", runtime_database_status, {"network_safe": False})
     master_count = master_count_status.get("count", 0)
     coverage_warnings = []
     coverage_warnings.extend(status_errors)
@@ -595,6 +597,7 @@ def config_status() -> dict:
             "has_master_blob": bool(settings.master_path_blob),
             "blob_enabled": bool(settings.azure_connection_string and settings.container_name),
         },
+        "database": database_status,
         "azure_openai": {
             "has_key": bool(settings.openai_key),
             "has_endpoint": bool(settings.azure_openai_endpoint),
