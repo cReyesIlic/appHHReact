@@ -204,6 +204,46 @@ class StructuredWikiService:
         self.reindex_entries()
         return {"deleted": entry_id}
 
+    def remove_duplicate_proposal_entries(
+        self,
+        codigo: str,
+        keep_entry_id: str,
+        *,
+        protected_paths: list[Path] | None = None,
+    ) -> dict:
+        """Retira autocompilados duplicados sin borrar la página canónica protegida."""
+        codigo = codigo.strip().upper()
+        protected = {
+            Path(path).resolve(strict=False)
+            for path in protected_paths or []
+        }
+        entries_root = self.entries_dir.resolve(strict=False)
+        removed_ids: list[str] = []
+        removed_files: list[str] = []
+        with closing(sqlite3.connect(settings.sqlite_path, timeout=30)) as conn, conn:
+            rows = conn.execute(
+                """
+                select id, file_path, propuestas_referenciadas
+                from wiki_entries
+                where source = 'rag_autocompile' and id != ?
+                """,
+                (keep_entry_id,),
+            ).fetchall()
+            for entry_id, file_path, refs_raw in rows:
+                try:
+                    refs = [str(value).strip().upper() for value in json.loads(refs_raw or "[]")]
+                except (json.JSONDecodeError, TypeError):
+                    refs = []
+                if codigo not in refs:
+                    continue
+                path = Path(file_path or "").resolve(strict=False) if file_path else None
+                if path and path not in protected and path.is_relative_to(entries_root) and path.is_file():
+                    path.unlink()
+                    removed_files.append(str(path))
+                conn.execute("delete from wiki_entries where id = ?", (entry_id,))
+                removed_ids.append(str(entry_id))
+        return {"removed": len(removed_ids), "entry_ids": removed_ids, "files": removed_files}
+
     def reindex_entries(self) -> dict:
         self._sync_entries_from_files()
         entries = self.list_entries()

@@ -1,6 +1,7 @@
 import json
 import re
 import sqlite3
+from hashlib import sha1
 from pathlib import Path
 
 from app.core.config import settings
@@ -146,13 +147,14 @@ class WikiAutoCompiler:
         topic = f"{codigo_upper} — {titulo}"
         source_text = self._format_source_text(codigo_upper, titulo, cliente, estado, tipo_servicio, rag_payload)
 
-        existing_entry_id = self._page_entry_id(target_file) if target_file.exists() else None
+        # La identidad depende sólo del código. No confiamos en el frontmatter
+        # histórico: una página contaminada podría apuntar a la entrada de otra oferta.
+        existing_entry_id = sha1(f"rag_autocompile:{codigo_upper}".encode("utf-8")).hexdigest()[:12]
         existing = None
-        if existing_entry_id:
-            try:
-                existing = self.wiki.get_entry(existing_entry_id)
-            except KeyError:
-                existing_entry_id = None
+        try:
+            existing = self.wiki.get_entry(existing_entry_id)
+        except KeyError:
+            existing = None
         draft = await self._draft(topic, source_text, "rag_autocompile", [codigo_upper], existing=existing)
         filtros = {}
         if estado:
@@ -177,6 +179,11 @@ class WikiAutoCompiler:
 
         page_md = self._page_markdown(codigo_upper, titulo, cliente, estado, tipo_servicio, entry)
         target_file.write_text(page_md, encoding="utf-8")
+        duplicate_cleanup = self.wiki.remove_duplicate_proposal_entries(
+            codigo_upper,
+            str(entry.get("id") or ""),
+            protected_paths=[target_file],
+        )
 
         return {
             "codigo": codigo_upper,
@@ -184,6 +191,7 @@ class WikiAutoCompiler:
             "entry_id": entry.get("id"),
             "path": str(target_file),
             "title": titulo,
+            "duplicate_cleanup": duplicate_cleanup,
             "quality": {
                 "mode": draft.get("quality_mode") or "heuristic",
                 "rag_score": draft.get("rag_quality_score"),
@@ -325,15 +333,6 @@ class WikiAutoCompiler:
             "quality_issues": ["Revisar manualmente fidelidad y cobertura de la Wiki."],
             "quality_mode": "heuristic",
         }
-
-    def _page_entry_id(self, path: Path) -> str | None:
-        try:
-            for line in path.read_text(encoding="utf-8").splitlines()[:20]:
-                if line.lower().startswith("entry_id:"):
-                    return line.split(":", 1)[1].strip() or None
-        except OSError:
-            return None
-        return None
 
     def _score(self, value: object, fallback: object) -> float:
         try:

@@ -473,6 +473,55 @@ class WikiReprocessTests(SettingsPathsMixin, unittest.IsolatedAsyncioTestCase):
                 del compiler
                 gc.collect()
 
+    async def test_forced_reprocess_removes_contaminated_duplicate_entries(self):
+        with tempfile.TemporaryDirectory() as temp_dir, self.patch_settings(temp_dir):
+            base = Path(temp_dir)
+
+            with patch.object(type(settings), "resolve_path", lambda _self, value: base / value):
+                ParentChildIndexer().index_parse_result(
+                    "O-9999",
+                    {"text": "## Alcance\nIngeniería de detalle válida para O-9999.", "pages": []},
+                    {"document_title": "Oferta válida"},
+                )
+                wiki = StructuredWikiService()
+                wiki.upsert_entry(
+                    entry_id="legacy-good",
+                    title="O-9999 legado",
+                    content="Contenido anterior O-9999",
+                    source="rag_autocompile",
+                    propuestas_referenciadas=["O-9999"],
+                    skip_reindex=True,
+                )
+                wiki.upsert_entry(
+                    entry_id="legacy-bad",
+                    title="O-9999 contaminado",
+                    content="En realidad corresponde a O-8888",
+                    source="rag_autocompile",
+                    propuestas_referenciadas=["O-9999"],
+                    skip_reindex=True,
+                )
+                proposal_page = base / "storage/llm_wiki/proposals/O-9999.md"
+                proposal_page.parent.mkdir(parents=True, exist_ok=True)
+                proposal_page.write_text("---\nentry_id: legacy-bad\n---\ncontenido contaminado", encoding="utf-8")
+
+                compiler = WikiAutoCompiler()
+                compiler.llm.client = None
+                result = await compiler.compile_for_proposal("O-9999", force=True)
+                entries = [
+                    row for row in wiki.list_entries()
+                    if "O-9999" in (row.get("propuestas_referenciadas") or [])
+                    and row.get("source") == "rag_autocompile"
+                ]
+
+                self.assertEqual(result["status"], "ok")
+                self.assertEqual(result["duplicate_cleanup"]["removed"], 2)
+                self.assertEqual(len(entries), 1)
+                self.assertEqual(entries[0]["id"], result["entry_id"])
+                self.assertNotIn("O-8888", entries[0]["content"])
+                self.assertTrue(proposal_page.exists())
+                del compiler, wiki
+                gc.collect()
+
 
 class ChatToolRegistryTests(unittest.TestCase):
     def test_every_exposed_tool_has_exactly_one_dispatch_handler(self):
