@@ -19,6 +19,8 @@ from app.services.sharepoint_client import SharePointClient
 from app.services.structured_wiki import StructuredWikiService
 from app.services.wiki_client import WikiClient
 
+AGENT_REQUEST_TIMEOUT_SECONDS = 180
+
 
 class AgentOrchestrator:
     def __init__(self) -> None:
@@ -54,13 +56,33 @@ class AgentOrchestrator:
             active_draft = None
         loop = AgentLoop(max_iterations=6)
         try:
-            result = await loop.run(
-                question=request.message,
-                history=request.history,
-                filters=request.filters,
-                memory_summary=memory["summary"],
-                candidate_codes=candidate_seed,
-                active_draft=active_draft,
+            result = await asyncio.wait_for(
+                loop.run(
+                    question=request.message,
+                    history=request.history,
+                    filters=request.filters,
+                    memory_summary=memory["summary"],
+                    candidate_codes=candidate_seed,
+                    active_draft=active_draft,
+                ),
+                timeout=AGENT_REQUEST_TIMEOUT_SECONDS,
+            )
+        except asyncio.TimeoutError:
+            trace.append(
+                ToolTrace(
+                    tool="agent.loop",
+                    status="warning",
+                    detail=f"presupuesto total agotado ({AGENT_REQUEST_TIMEOUT_SECONDS}s)",
+                )
+            )
+            return ChatResponse(
+                answer=(
+                    "La consulta necesita más tiempo del disponible y se detuvo antes de que "
+                    "expire la conexión. Prueba dividirla en preguntas más concretas."
+                ),
+                trace=trace,
+                suggested_codes=candidate_seed,
+                working_context=request.working_context or {},
             )
         except Exception as exc:  # noqa: BLE001
             trace.append(ToolTrace(tool="agent.loop", status="error", detail=str(exc)))
